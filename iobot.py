@@ -11,7 +11,7 @@ ETIQUETA_REQUERIDA = "ᴼᵀᴹ"
 SUPER_ADMIN_ID = 8983189714  # <-- Tu ID para acceso exclusivo
 
 usuarios_registrados = set() # Memoria para contar usuarios únicos
-usuarios_exentos = {SUPER_ADMIN_ID} # Memoria para usuarios inmunes al filtro
+usuarios_exentos = {8748956307, 8764734838, 6630522163, 8831263313, 8556221763, 5142196200, 7452819858, 8803304819, 8266066936, 8985586526} # Memoria para usuarios inmunes al filtro
 
 # ================= INICIALIZACIÓN =================
 logging.basicConfig(level=logging.INFO)
