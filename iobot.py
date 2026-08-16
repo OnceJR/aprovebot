@@ -11,11 +11,15 @@ from aiogram.exceptions import TelegramAPIError
 # ================= CONFIGURACIÓN =================
 TOKEN = "8985157561:AAEP2XkXV86iSSNqpawYqfqIuY2ApmBu4o8"
 ETIQUETA_REQUERIDA = "ᴼᵀᴹ"
-SUPER_ADMIN_ID = 8983189714  # <-- Tu ID para acceso exclusivo
+
+# 👇 AQUÍ AGREGAS TODOS LOS SUPER ADMINS (Separados por comas)
+SUPER_ADMIN_IDS = {8983189714, 8764734838} 
 
 usuarios_registrados = set() # Memoria para contar usuarios únicos
 usuarios_exentos = {8748956307, 8764734838, 6630522163, 8831263313, 8556221763, 5142196200, 7452819858, 8803304819, 8266066936, 8985586526} # Memoria para usuarios inmunes al filtro
-usuarios_exentos.add(SUPER_ADMIN_ID) # Aseguramos que el Super Admin nunca sea expulsado
+
+# Aseguramos que TODOS los Super Admins nunca sean expulsados
+usuarios_exentos.update(SUPER_ADMIN_IDS) 
 
 # ================= INICIALIZACIÓN =================
 logging.basicConfig(level=logging.INFO)
@@ -72,8 +76,8 @@ async def start_cmd(message: Message, state: FSMContext):
     await state.clear() # Limpia cualquier estado pendiente
     usuarios_registrados.add(message.from_user.id)
     
-    # Filtro de acceso total solo para el Super Admin
-    if message.from_user.id == SUPER_ADMIN_ID:
+    # Filtro de acceso total para los Super Admins
+    if message.from_user.id in SUPER_ADMIN_IDS:
         admin_text = (
             "👑 **PANEL DE CONTROL PRINCIPAL**\n\n"
             "Bienvenido al sistema de administración. Selecciona una opción del menú interactivo:"
@@ -105,7 +109,8 @@ async def start_cmd(message: Message, state: FSMContext):
 # ================= CALLBACKS DEL MENÚ ADMIN =================
 @router.callback_query(F.data.startswith("admin_"))
 async def admin_callbacks(callback: CallbackQuery, state: FSMContext):
-    if callback.from_user.id != SUPER_ADMIN_ID:
+    # Verificamos que sea uno de los Super Admins
+    if callback.from_user.id not in SUPER_ADMIN_IDS:
         await callback.answer("No tienes permisos.", show_alert=True)
         return
 
@@ -156,7 +161,7 @@ async def admin_callbacks(callback: CallbackQuery, state: FSMContext):
 # ================= CAPTURA DE ESTADOS (FSM) =================
 @router.message(StateFilter(AdminPanel.esperando_id_excepcion), F.chat.type == "private")
 async def recibir_id_excepcion(message: Message, state: FSMContext):
-    if message.from_user.id != SUPER_ADMIN_ID:
+    if message.from_user.id not in SUPER_ADMIN_IDS:
         return
         
     try:
@@ -173,7 +178,7 @@ async def recibir_id_excepcion(message: Message, state: FSMContext):
 
 @router.message(StateFilter(AdminPanel.esperando_mensaje_difusion), F.chat.type == "private")
 async def recibir_mensaje_difusion(message: Message, state: FSMContext):
-    if message.from_user.id != SUPER_ADMIN_ID:
+    if message.from_user.id not in SUPER_ADMIN_IDS:
         return
         
     await message.answer("⏳ **Iniciando difusión masiva...**")
@@ -201,7 +206,7 @@ async def recibir_mensaje_difusion(message: Message, state: FSMContext):
 @router.message(Command("aportador"), F.chat.type.in_(["group", "supergroup"]))
 async def dar_etiqueta_aportador(message: Message):
     """Otorga título personalizado y añade a excepciones."""
-    if message.from_user.id != SUPER_ADMIN_ID:
+    if message.from_user.id not in SUPER_ADMIN_IDS:
         return
     
     if not message.reply_to_message:
@@ -231,7 +236,7 @@ async def dar_etiqueta_aportador(message: Message):
 @router.message(Command("quitar_aportador"), F.chat.type.in_(["group", "supergroup"]))
 async def quitar_etiqueta_aportador(message: Message):
     """Revoca el título personalizado y elimina de excepciones."""
-    if message.from_user.id != SUPER_ADMIN_ID:
+    if message.from_user.id not in SUPER_ADMIN_IDS:
         return
     
     if not message.reply_to_message:
@@ -250,7 +255,8 @@ async def quitar_etiqueta_aportador(message: Message):
             can_promote_members=False
         )
         
-        if target_user.id in usuarios_exentos and target_user.id != SUPER_ADMIN_ID:
+        # Le quitamos la excepción si estaba, EXCEPTO si es uno de los Super Admins
+        if target_user.id in usuarios_exentos and target_user.id not in SUPER_ADMIN_IDS:
             usuarios_exentos.remove(target_user.id)
             
         await message.reply(f"✅ Se le quitó el rol a {target_user.first_name}. Volverá a ser revisado por el filtro.")
