@@ -114,7 +114,8 @@ async def admin_callbacks(callback: CallbackQuery, state: FSMContext):
         await callback.answer("No tienes permisos.", show_alert=True)
         return
 
-    action = callback.data.split("_")[1]
+    # Usamos replace para obtener la acción exacta (ej. "add_exempt")
+    action = callback.data.replace("admin_", "")
 
     if action == "close":
         await callback.message.delete()
