@@ -2,8 +2,11 @@ import asyncio
 import logging
 from aiohttp import web
 from aiogram import Bot, Dispatcher, F, Router
-from aiogram.types import Message, ChatJoinRequest
-from aiogram.filters import Command, CommandStart
+from aiogram.types import Message, ChatJoinRequest, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
+from aiogram.filters import Command, CommandStart, StateFilter
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.exceptions import TelegramAPIError
 
 # ================= CONFIGURACIÓN =================
 TOKEN = "8985157561:AAEP2XkXV86iSSNqpawYqfqIuY2ApmBu4o8"
@@ -12,12 +15,34 @@ SUPER_ADMIN_ID = 8983189714  # <-- Tu ID para acceso exclusivo
 
 usuarios_registrados = set() # Memoria para contar usuarios únicos
 usuarios_exentos = {8748956307, 8764734838, 6630522163, 8831263313, 8556221763, 5142196200, 7452819858, 8803304819, 8266066936, 8985586526} # Memoria para usuarios inmunes al filtro
+usuarios_exentos.add(SUPER_ADMIN_ID) # Aseguramos que el Super Admin nunca sea expulsado
 
 # ================= INICIALIZACIÓN =================
 logging.basicConfig(level=logging.INFO)
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
 router = Router()
+
+# ================= ESTADOS PARA EL MENÚ (FSM) =================
+class AdminPanel(StatesGroup):
+    esperando_id_excepcion = State()
+    esperando_mensaje_difusion = State()
+
+# ================= TECLADOS INLINE =================
+def obtener_teclado_admin():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📊 Ver Estadísticas", callback_data="admin_stats")],
+        [
+            InlineKeyboardButton(text="🛡 Añadir Excepción", callback_data="admin_add_exempt"),
+            InlineKeyboardButton(text="📢 Difusión Global", callback_data="admin_broadcast")
+        ],
+        [InlineKeyboardButton(text="❌ Cerrar Panel", callback_data="admin_close")]
+    ])
+
+def obtener_teclado_cancelar():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔙 Cancelar Operación", callback_data="admin_cancel")]
+    ])
 
 # ================= FILTRO DE ADMISIÓN (SOLICITUDES) =================
 @router.chat_join_request()
@@ -43,24 +68,17 @@ async def process_join_request(join_request: ChatJoinRequest):
 
 # ================= CHAT PRIVADO (PANEL ADMIN VS USUARIOS) =================
 @router.message(CommandStart(), F.chat.type == "private")
-async def start_cmd(message: Message):
+async def start_cmd(message: Message, state: FSMContext):
+    await state.clear() # Limpia cualquier estado pendiente
     usuarios_registrados.add(message.from_user.id)
     
     # Filtro de acceso total solo para el Super Admin
     if message.from_user.id == SUPER_ADMIN_ID:
-        total = len(usuarios_registrados)
-        exentos_total = len(usuarios_exentos)
         admin_text = (
-            "⚙️ **Panel de Configuración Principal**\n\n"
-            "Eres el único administrador con acceso a este panel.\n\n"
-            f"📊 **Usuarios únicos detectados:** `{total}`\n"
-            f"🛡 **Usuarios con excepciones:** `{exentos_total}`\n"
-            f"*(Desde el último reinicio del servidor)*\n\n"
-            "El bot está configurado para patrullar de forma estricta "
-            "y expulsar a cualquier miembro que no tenga la etiqueta "
-            f"`{ETIQUETA_REQUERIDA}` en su nombre."
+            "👑 **PANEL DE CONTROL PRINCIPAL**\n\n"
+            "Bienvenido al sistema de administración. Selecciona una opción del menú interactivo:"
         )
-        await message.answer(admin_text, parse_mode="Markdown")
+        await message.answer(admin_text, parse_mode="Markdown", reply_markup=obtener_teclado_admin())
     else:
         # Vista para los usuarios comunes (Mensaje oficial de admisión)
         welcome_text = (
@@ -70,30 +88,114 @@ async def start_cmd(message: Message):
             f"⚠️ **REQUISITO OBLIGATORIO:**\n"
             f"Para que su solicitud de ingreso al Grupo de Aportes sea aprobada, es indispensable que agregue la etiqueta `{ETIQUETA_REQUERIDA}` a su nombre de Telegram.\n\n"
             "📌 **Instrucciones:**\n"
-            "1. Vaya a los Ajustes de Telegram > Editar perfil.\n"
-            f"2. Añada `{ETIQUETA_REQUERIDA}` a su nombre o apellido.\n"
-            "3. Solicite unirse mediante el enlace de invitación.\n\n"
+            "1. Copie la etiqueta del mensaje inferior.\n"
+            "2. Vaya a los Ajustes de Telegram > Editar perfil.\n"
+            "3. Péguela en su nombre o apellido.\n"
+            "4. Solicite unirse mediante el enlace de invitación.\n\n"
             "⛔️ *Nota:* El sistema monitorea constantemente a los usuarios. Si usted retira esta etiqueta de su nombre una vez dentro de la comunidad, será expulsado automáticamente de forma irrevocable."
         )
         await message.answer(welcome_text, parse_mode="Markdown")
+        
+        # Mensaje separado para copiar fácilmente con un toque
+        await message.answer(
+            f"👇 **Toque la etiqueta para copiarla:**\n\n`{ETIQUETA_REQUERIDA}`", 
+            parse_mode="Markdown"
+        )
 
-@router.message(Command("stats"), F.chat.type == "private")
-async def bot_stats_cmd(message: Message):
-    """Comando rápido para verificar el tráfico (Solo Super Admin)."""
-    if message.from_user.id == SUPER_ADMIN_ID:
+# ================= CALLBACKS DEL MENÚ ADMIN =================
+@router.callback_query(F.data.startswith("admin_"))
+async def admin_callbacks(callback: CallbackQuery, state: FSMContext):
+    if callback.from_user.id != SUPER_ADMIN_ID:
+        await callback.answer("No tienes permisos.", show_alert=True)
+        return
+
+    action = callback.data.split("_")[1]
+
+    if action == "close":
+        await callback.message.delete()
+        await state.clear()
+        
+    elif action == "cancel":
+        await callback.message.edit_text(
+            "✅ **Operación cancelada.**\n¿Qué deseas hacer ahora?", 
+            parse_mode="Markdown", 
+            reply_markup=obtener_teclado_admin()
+        )
+        await state.clear()
+        
+    elif action == "stats":
         total = len(usuarios_registrados)
-        await message.answer(f"📊 **Tráfico actual:** `{total}` usuarios únicos registrados.", parse_mode="Markdown")
+        exentos = len(usuarios_exentos)
+        texto_stats = (
+            "📊 **ESTADÍSTICAS DEL BOT**\n\n"
+            f"👥 **Usuarios Registrados (Tráfico):** `{total}`\n"
+            f"🛡 **Usuarios Inmunes:** `{exentos}`\n\n"
+            "*(La memoria cuenta desde el último reinicio)*"
+        )
+        await callback.message.edit_text(texto_stats, parse_mode="Markdown", reply_markup=obtener_teclado_admin())
+        
+    elif action == "add_exempt":
+        await callback.message.edit_text(
+            "🛡 **AÑADIR EXCEPCIÓN**\n\n"
+            "Envíame el **ID Numérico** del usuario que deseas volver inmune al filtro.",
+            parse_mode="Markdown",
+            reply_markup=obtener_teclado_cancelar()
+        )
+        await state.set_state(AdminPanel.esperando_id_excepcion)
+        
+    elif action == "broadcast":
+        await callback.message.edit_text(
+            "📢 **ENVIAR DIFUSIÓN GLOBAL**\n\n"
+            f"Este mensaje se enviará a los **{len(usuarios_registrados)}** usuarios registrados.\n\n"
+            "Envíame el mensaje que deseas difundir (texto, foto, video o documento).",
+            parse_mode="Markdown",
+            reply_markup=obtener_teclado_cancelar()
+        )
+        await state.set_state(AdminPanel.esperando_mensaje_difusion)
 
-@router.message(Command("exempt"), F.chat.type == "private")
-async def add_exempt_cmd(message: Message):
-    """Comando para añadir excepciones mediante el ID."""
-    if message.from_user.id == SUPER_ADMIN_ID:
+# ================= CAPTURA DE ESTADOS (FSM) =================
+@router.message(StateFilter(AdminPanel.esperando_id_excepcion), F.chat.type == "private")
+async def recibir_id_excepcion(message: Message, state: FSMContext):
+    if message.from_user.id != SUPER_ADMIN_ID:
+        return
+        
+    try:
+        target_id = int(message.text.strip())
+        usuarios_exentos.add(target_id)
+        await message.answer(
+            f"✅ **¡Listo!** El ID `{target_id}` ha sido añadido a las excepciones.", 
+            parse_mode="Markdown",
+            reply_markup=obtener_teclado_admin()
+        )
+        await state.clear()
+    except ValueError:
+        await message.answer("❌ **Error:** Debes enviar un ID numérico válido. Inténtalo de nuevo o cancela.", reply_markup=obtener_teclado_cancelar())
+
+@router.message(StateFilter(AdminPanel.esperando_mensaje_difusion), F.chat.type == "private")
+async def recibir_mensaje_difusion(message: Message, state: FSMContext):
+    if message.from_user.id != SUPER_ADMIN_ID:
+        return
+        
+    await message.answer("⏳ **Iniciando difusión masiva...**")
+    await state.clear()
+    
+    exitos = 0
+    fallos = 0
+    
+    for user_id in usuarios_registrados:
         try:
-            target_id = int(message.text.split()[1])
-            usuarios_exentos.add(target_id)
-            await message.answer(f"✅ Excepción añadida para el ID: `{target_id}`. No será expulsado.", parse_mode="Markdown")
-        except (IndexError, ValueError):
-            await message.answer("⚠️ Uso incorrecto. Formato: `/exempt 123456789`")
+            await message.copy_to(chat_id=user_id)
+            exitos += 1
+            await asyncio.sleep(0.05) # Pausa mínima para no saturar la API de Telegram
+        except TelegramAPIError:
+            fallos += 1
+            
+    resumen = (
+        "📢 **DIFUSIÓN FINALIZADA**\n\n"
+        f"✅ Entregados con éxito: `{exitos}`\n"
+        f"❌ Fallidos (Bot bloqueado): `{fallos}`"
+    )
+    await message.answer(resumen, parse_mode="Markdown", reply_markup=obtener_teclado_admin())
 
 # ================= COMANDOS DE GRUPO (APORTADOR) =================
 @router.message(Command("aportador"), F.chat.type.in_(["group", "supergroup"]))
