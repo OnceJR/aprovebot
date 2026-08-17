@@ -1,25 +1,33 @@
 import asyncio
+import re
 import logging
 from aiohttp import web
 from aiogram import Bot, Dispatcher, F, Router
-from aiogram.types import Message, ChatJoinRequest, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
-from aiogram.filters import Command, CommandStart, StateFilter
+from aiogram.types import (
+    Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, ChatPermissions,
+    InputMediaPhoto, InputMediaVideo, InputMediaDocument
+)
+from aiogram.filters import Command, CommandStart
+from aiogram.enums import ChatMemberStatus
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.exceptions import TelegramAPIError
 
 # ================= CONFIGURACIÓN =================
-TOKEN = "8985157561:AAEP2XkXV86iSSNqpawYqfqIuY2ApmBu4o8"
-ETIQUETA_REQUERIDA = "ᴼᵀᴹ"
+TOKEN = "8515941177:AAHF-I0U5EB-zidhrnGbZVQuAdw13ArQpjU"
+BACKUP_CHANNEL_ID = -1003986866749  # ID DE TU CANAL PRIVADO UNICO
 
-# 👇 AQUÍ AGREGAS TODOS LOS SUPER ADMINS (Separados por comas)
-SUPER_ADMIN_IDS = {8983189714, 8764734838} 
+# NUEVO: Lista de IDs de usuarios designados (Super Admins)
+DESIGNATED_USERS = {8983189714, 8764734838}
 
-usuarios_registrados = set() # Memoria para contar usuarios únicos
-usuarios_exentos = {8748956307, 8764734838, 6630522163, 8831263313, 8556221763, 5142196200, 7452819858, 8803304819, 8266066936, 8985586526} # Memoria para usuarios inmunes al filtro
+LINK_REGEX = re.compile(r'(https?://|www\.|t\.me/)', re.IGNORECASE)
 
-# Aseguramos que TODOS los Super Admins nunca sean expulsados
-usuarios_exentos.update(SUPER_ADMIN_IDS) 
+active_groups = {}          
+authorized_users = {}       
+album_cache = {}  # Memoria temporal para agrupar álbumes multimedia
+
+# Cachés para nuevas funciones
+promoted_contributors = set()  # Guarda tuplas (chat_id, user_id)
+media_counts = {}              # Conteo de archivos por usuario {user_id: {"name": str, "count": int}}
 
 # ================= INICIALIZACIÓN =================
 logging.basicConfig(level=logging.INFO)
@@ -27,268 +35,345 @@ bot = Bot(token=TOKEN)
 dp = Dispatcher()
 router = Router()
 
-# ================= ESTADOS PARA EL MENÚ (FSM) =================
-class AdminPanel(StatesGroup):
-    esperando_id_excepcion = State()
-    esperando_mensaje_difusion = State()
+class BotStates(StatesGroup):
+    waiting_for_id = State()
 
-# ================= TECLADOS INLINE =================
-def obtener_teclado_admin():
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📊 Ver Estadísticas", callback_data="admin_stats")],
-        [
-            InlineKeyboardButton(text="🛡 Añadir Excepción", callback_data="admin_add_exempt"),
-            InlineKeyboardButton(text="📢 Difusión Global", callback_data="admin_broadcast")
-        ],
-        [InlineKeyboardButton(text="❌ Cerrar Panel", callback_data="admin_close")]
-    ])
-
-def obtener_teclado_cancelar():
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔙 Cancelar Operación", callback_data="admin_cancel")]
-    ])
-
-# ================= FILTRO DE ADMISIÓN (SOLICITUDES) =================
-@router.chat_join_request()
-async def process_join_request(join_request: ChatJoinRequest):
-    """Aprueba o rechaza automáticamente las solicitudes de ingreso."""
-    user_name = join_request.from_user.full_name or ""
-    user_id = join_request.from_user.id
-    
-    # Se registra el tráfico
-    usuarios_registrados.add(user_id)
-    
-    # Si el usuario tiene la etiqueta O ESTÁ EN LA LISTA DE EXENTOS, se aprueba
-    if ETIQUETA_REQUERIDA in user_name or user_id in usuarios_exentos:
-        try:
-            await join_request.approve()
-        except:
-            pass
-    else:
-        try:
-            await join_request.decline()
-        except:
-            pass
-
-# ================= CHAT PRIVADO (PANEL ADMIN VS USUARIOS) =================
-@router.message(CommandStart(), F.chat.type == "private")
-async def start_cmd(message: Message, state: FSMContext):
-    await state.clear() # Limpia cualquier estado pendiente
-    usuarios_registrados.add(message.from_user.id)
-    
-    # Filtro de acceso total para los Super Admins
-    if message.from_user.id in SUPER_ADMIN_IDS:
-        admin_text = (
-            "👑 **PANEL DE CONTROL PRINCIPAL**\n\n"
-            "Bienvenido al sistema de administración. Selecciona una opción del menú interactivo:"
-        )
-        await message.answer(admin_text, parse_mode="Markdown", reply_markup=obtener_teclado_admin())
-    else:
-        # Vista para los usuarios comunes (Mensaje oficial de admisión)
-        welcome_text = (
-            "🏛 **SISTEMA OFICIAL DE ADMISIÓN**\n\n"
-            "Estimado usuario, sea bienvenido al portal de ingreso. "
-            "Para asegurar la calidad y exclusividad de nuestra comunidad, operamos bajo un estricto filtro de seguridad.\n\n"
-            f"⚠️ **REQUISITO OBLIGATORIO:**\n"
-            f"Para que su solicitud de ingreso al Grupo de Aportes sea aprobada, es indispensable que agregue la etiqueta `{ETIQUETA_REQUERIDA}` a su nombre de Telegram.\n\n"
-            "📌 **Instrucciones:**\n"
-            "1. Copie la etiqueta del mensaje inferior.\n"
-            "2. Vaya a los Ajustes de Telegram > Editar perfil.\n"
-            "3. Péguela en su nombre o apellido.\n"
-            "4. Solicite unirse mediante el enlace de invitación.\n\n"
-            "⛔️ *Nota:* El sistema monitorea constantemente a los usuarios. Si usted retira esta etiqueta de su nombre una vez dentro de la comunidad, será expulsado automáticamente de forma irrevocable."
-        )
-        await message.answer(welcome_text, parse_mode="Markdown")
+async def is_admin(chat_id: int, user_id: int) -> bool:
+    # 1. NUEVO: Verificar si es un usuario designado (ignora si es admin en el grupo o no)
+    if user_id in DESIGNATED_USERS:
+        return True
         
-        # Mensaje separado para copiar fácilmente con un toque
-        await message.answer(
-            f"👇 **Toque la etiqueta para copiarla:**\n\n`{ETIQUETA_REQUERIDA}`", 
+    # 2. Verificar si fue autorizado por el panel temporal
+    if chat_id in authorized_users and user_id in authorized_users[chat_id]:
+        return True
+        
+    # 3. Verificar en Telegram si es administrador o creador del grupo
+    try:
+        member = await bot.get_chat_member(chat_id, user_id)
+        return member.status in [ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.CREATOR]
+    except:
+        return False
+
+# ================= TECLADOS EN LÍNEA =================
+def get_main_keyboard(group_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="🔒 Cerrar Chat", callback_data=f"close_{group_id}"),
+            InlineKeyboardButton(text="🔓 Abrir Chat", callback_data=f"open_{group_id}")
+        ],
+        [
+            InlineKeyboardButton(text="👥 Autorizar ID", callback_data=f"addid_{group_id}"),
+            InlineKeyboardButton(text="ℹ️ Ayuda", callback_data=f"help_{group_id}")
+        ]
+    ])
+
+def get_back_keyboard(group_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⬅️ Volver al Panel", callback_data=f"back_{group_id}")]
+    ])
+
+# ================= COMANDOS EN GRUPO =================
+
+@router.message(Command("panel"))
+async def link_group_panel(message: Message):
+    if message.chat.type in ["group", "supergroup"]:
+        if await is_admin(message.chat.id, message.from_user.id):
+            active_groups[message.from_user.id] = message.chat.id
+            kb = InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text="⚙️ Abrir Panel", url=f"t.me/{(await bot.me()).username}?start=panel")
+            ]])
+            await message.reply("Panel de control listo:", reply_markup=kb)
+        else:
+            await message.reply("❌ No tienes permisos.")
+
+@router.message(Command("info"))
+async def group_info_cmd(message: Message):
+    if message.chat.type in ["group", "supergroup"]:
+        if await is_admin(message.chat.id, message.from_user.id):
+            try:
+                chat = await message.bot.get_chat(message.chat.id)
+                member_count = await message.bot.get_chat_member_count(message.chat.id)
+                
+                info_text = (
+                    f"📊 **Información del Grupo**\n\n"
+                    f"🏷️ **Nombre:** {chat.title}\n"
+                    f"🆔 **ID del Grupo:** `{chat.id}`\n"
+                    f"👥 **Miembros Totales:** {member_count}\n"
+                    f"📝 **Descripción:** {chat.description or 'Sin descripción'}"
+                )
+                await message.reply(info_text, parse_mode="Markdown")
+                await message.delete()
+            except Exception as e:
+                await message.reply(f"❌ Error al obtener la información: {e}")
+
+# --- COMANDOS DE MODERACIÓN ---
+@router.message(Command("del"))
+async def delete_cmd(message: Message):
+    if message.chat.type in ["group", "supergroup"] and await is_admin(message.chat.id, message.from_user.id):
+        if message.reply_to_message:
+            try:
+                await message.reply_to_message.delete()
+                await message.delete()
+            except:
+                pass
+
+@router.message(Command("ban"))
+async def ban_cmd(message: Message):
+    if message.chat.type in ["group", "supergroup"] and await is_admin(message.chat.id, message.from_user.id):
+        if message.reply_to_message:
+            user_to_ban = message.reply_to_message.from_user.id
+            try:
+                await bot.ban_chat_member(message.chat.id, user_to_ban)
+                await message.reply_to_message.delete()
+                confirm = await message.answer(f"🔨 Usuario baneado por {message.from_user.first_name}.")
+                await message.delete()
+                await asyncio.sleep(5)
+                await confirm.delete()
+            except:
+                pass
+
+@router.message(Command("unban"))
+async def unban_cmd(message: Message):
+    if message.chat.type in ["group", "supergroup"] and await is_admin(message.chat.id, message.from_user.id):
+        user_to_unban = None
+        if message.reply_to_message:
+            user_to_unban = message.reply_to_message.from_user.id
+        else:
+            args = message.text.split()
+            if len(args) > 1 and args[1].isdigit():
+                user_to_unban = int(args[1])
+                
+        if user_to_unban:
+            try:
+                await bot.unban_chat_member(message.chat.id, user_to_unban)
+                confirm = await message.answer(f"✅ Usuario desbaneado con éxito.")
+                await message.delete()
+                await asyncio.sleep(5)
+                await confirm.delete()
+            except:
+                pass
+
+# --- COMANDO REPETIR Y BORRAR (/s O .s) ---
+@router.message(F.text.startswith("/s ") | F.text.startswith(".s "))
+async def repeat_cmd(message: Message):
+    if message.chat.type in ["group", "supergroup"]:
+        if await is_admin(message.chat.id, message.from_user.id):
+            text_to_send = message.text[3:].strip()
+            if text_to_send:
+                try:
+                    await message.answer(text_to_send)
+                    await message.delete()
+                except:
+                    pass
+
+# --- COMANDOS DE CONTEO (ESTADÍSTICAS) ---
+@router.message(Command("aportes"))
+async def check_stats_cmd(message: Message):
+    if message.chat.type in ["group", "supergroup"]:
+        target = message.reply_to_message.from_user if message.reply_to_message else message.from_user
+        data = media_counts.get(target.id, {"count": 0})
+        await message.reply(
+            f"📊 **{target.first_name}** ha aportado **{data['count']}** archivos multimedia al grupo.", 
             parse_mode="Markdown"
         )
 
-# ================= CALLBACKS DEL MENÚ ADMIN =================
-@router.callback_query(F.data.startswith("admin_"))
-async def admin_callbacks(callback: CallbackQuery, state: FSMContext):
-    # Verificamos que sea uno de los Super Admins
-    if callback.from_user.id not in SUPER_ADMIN_IDS:
-        await callback.answer("No tienes permisos.", show_alert=True)
-        return
+@router.message(Command("topaportes"))
+async def top_stats_cmd(message: Message):
+    if not media_counts:
+        return await message.reply("📉 Aún no hay aportes registrados en esta sesión.")
+    
+    sorted_counts = sorted(media_counts.values(), key=lambda x: x["count"], reverse=True)[:10]
+    text = "🏆 **Top 10 Aportadores:**\n\n"
+    for i, data in enumerate(sorted_counts, 1):
+        text += f"{i}. {data['name']} - {data['count']} aportes\n"
+    
+    await message.reply(text, parse_mode="Markdown")
 
-    # Usamos replace para obtener la acción exacta (ej. "add_exempt")
-    action = callback.data.replace("admin_", "")
-
-    if action == "close":
-        await callback.message.delete()
+# ================= CHAT PRIVADO (PANEL) =================
+@router.message(CommandStart())
+async def start_private_panel(message: Message, state: FSMContext):
+    if message.chat.type == "private":
         await state.clear()
-        
-    elif action == "cancel":
-        await callback.message.edit_text(
-            "✅ **Operación cancelada.**\n¿Qué deseas hacer ahora?", 
-            parse_mode="Markdown", 
-            reply_markup=obtener_teclado_admin()
-        )
-        await state.clear()
-        
-    elif action == "stats":
-        total = len(usuarios_registrados)
-        exentos = len(usuarios_exentos)
-        texto_stats = (
-            "📊 **ESTADÍSTICAS DEL BOT**\n\n"
-            f"👥 **Usuarios Registrados (Tráfico):** `{total}`\n"
-            f"🛡 **Usuarios Inmunes:** `{exentos}`\n\n"
-            "*(La memoria cuenta desde el último reinicio)*"
-        )
-        await callback.message.edit_text(texto_stats, parse_mode="Markdown", reply_markup=obtener_teclado_admin())
-        
-    elif action == "add_exempt":
-        await callback.message.edit_text(
-            "🛡 **AÑADIR EXCEPCIÓN**\n\n"
-            "Envíame el **ID Numérico** del usuario que deseas volver inmune al filtro.",
-            parse_mode="Markdown",
-            reply_markup=obtener_teclado_cancelar()
-        )
-        await state.set_state(AdminPanel.esperando_id_excepcion)
-        
-    elif action == "broadcast":
-        await callback.message.edit_text(
-            "📢 **ENVIAR DIFUSIÓN GLOBAL**\n\n"
-            f"Este mensaje se enviará a los **{len(usuarios_registrados)}** usuarios registrados.\n\n"
-            "Envíame el mensaje que deseas difundir (texto, foto, video o documento).",
-            parse_mode="Markdown",
-            reply_markup=obtener_teclado_cancelar()
-        )
-        await state.set_state(AdminPanel.esperando_mensaje_difusion)
+        group_id = active_groups.get(message.from_user.id)
+        if group_id:
+            chat_info = await bot.get_chat(group_id)
+            await message.answer(
+                f"⚙️ **Panel de Control:** {chat_info.title}\nElige una opción:",
+                reply_markup=get_main_keyboard(group_id),
+                parse_mode="Markdown"
+            )
+        else:
+            await message.answer("Usa /panel dentro de un grupo primero para vincularlo.")
 
-# ================= CAPTURA DE ESTADOS (FSM) =================
-@router.message(StateFilter(AdminPanel.esperando_id_excepcion), F.chat.type == "private")
-async def recibir_id_excepcion(message: Message, state: FSMContext):
-    if message.from_user.id not in SUPER_ADMIN_IDS:
-        return
-        
+@router.message(BotStates.waiting_for_id)
+async def process_new_id(message: Message, state: FSMContext):
+    data = await state.get_data()
+    group_id = data.get("group_id")
+    panel_msg_id = data.get("panel_msg_id")
+    await message.delete() 
+    
     try:
-        target_id = int(message.text.strip())
-        usuarios_exentos.add(target_id)
-        await message.answer(
-            f"✅ **¡Listo!** El ID `{target_id}` ha sido añadido a las excepciones.", 
-            parse_mode="Markdown",
-            reply_markup=obtener_teclado_admin()
+        new_id = int(message.text.strip())
+        if group_id not in authorized_users:
+            authorized_users[group_id] = set()
+        authorized_users[group_id].add(new_id)
+        
+        await bot.edit_message_text(
+            f"✅ **ID {new_id} autorizado con éxito.**",
+            chat_id=message.chat.id,
+            message_id=panel_msg_id,
+            reply_markup=get_main_keyboard(group_id),
+            parse_mode="Markdown"
         )
-        await state.clear()
     except ValueError:
-        await message.answer("❌ **Error:** Debes enviar un ID numérico válido. Inténtalo de nuevo o cancela.", reply_markup=obtener_teclado_cancelar())
+        pass
+    finally:
+        await state.clear()
 
-@router.message(StateFilter(AdminPanel.esperando_mensaje_difusion), F.chat.type == "private")
-async def recibir_mensaje_difusion(message: Message, state: FSMContext):
-    if message.from_user.id not in SUPER_ADMIN_IDS:
-        return
-        
-    await message.answer("⏳ **Iniciando difusión masiva...**")
+@router.callback_query(F.data.startswith("back_"))
+async def back_cb(callback: CallbackQuery, state: FSMContext):
     await state.clear()
-    
-    exitos = 0
-    fallos = 0
-    
-    for user_id in usuarios_registrados:
-        try:
-            await message.copy_to(chat_id=user_id)
-            exitos += 1
-            await asyncio.sleep(0.05) # Pausa mínima para no saturar la API de Telegram
-        except TelegramAPIError:
-            fallos += 1
-            
-    resumen = (
-        "📢 **DIFUSIÓN FINALIZADA**\n\n"
-        f"✅ Entregados con éxito: `{exitos}`\n"
-        f"❌ Fallidos (Bot bloqueado): `{fallos}`"
+    group_id = int(callback.data.split("_")[1])
+    await callback.message.edit_text("⚙️ **Panel Principal**", reply_markup=get_main_keyboard(group_id), parse_mode="Markdown")
+
+@router.callback_query(F.data.startswith("help_"))
+async def help_cb(callback: CallbackQuery):
+    group_id = int(callback.data.split("_")[1])
+    help_text = (
+        "📚 **Guía de Uso del Bot:**\n\n"
+        "🔸 **Anti-Links:** Borra automáticamente mensajes con enlaces.\n"
+        "🔸 **Respaldo Único:** Copia fotos, videos y archivos al canal.\n"
+        "🔸 **Conteo:** Usa `/aportes` o `/topaportes` para ver estadísticas.\n"
+        "🔸 **/s o .s [mensaje]:** El bot repite el mensaje y borra el tuyo.\n"
+        "🔸 **/info:** Muestra estadísticas del grupo.\n"
+        "🔸 **/del, /ban y /unban:** Comandos de moderación.\n"
     )
-    await message.answer(resumen, parse_mode="Markdown", reply_markup=obtener_teclado_admin())
+    await callback.message.edit_text(help_text, reply_markup=get_back_keyboard(group_id), parse_mode="Markdown")
 
-# ================= COMANDOS DE GRUPO (APORTADOR) =================
-@router.message(Command("aportador"), F.chat.type.in_(["group", "supergroup"]))
-async def dar_etiqueta_aportador(message: Message):
-    """Otorga título personalizado y añade a excepciones."""
-    if message.from_user.id not in SUPER_ADMIN_IDS:
-        return
-    
-    if not message.reply_to_message:
-        await message.reply("⚠️ Responde al mensaje del usuario que será Aportador.")
-        return
-
-    target_user = message.reply_to_message.from_user
-    
+@router.callback_query(F.data.startswith("close_"))
+async def close_chat_cb(callback: CallbackQuery):
+    group_id = int(callback.data.split("_")[1])
     try:
-        # Promover sin poderes reales para poder darle título
-        await bot.promote_chat_member(
-            chat_id=message.chat.id, user_id=target_user.id,
-            can_manage_chat=True, can_change_info=False,
-            can_delete_messages=False, can_invite_users=False,
-            can_restrict_members=False, can_pin_messages=False,
-            can_promote_members=False
-        )
-        await bot.set_chat_administrator_custom_title(
-            chat_id=message.chat.id, user_id=target_user.id,
-            custom_title="Aportador 💎"
-        )
-        usuarios_exentos.add(target_user.id) # Se vuelve inmune al filtro
-        await message.reply(f"✅ {target_user.first_name} ahora tiene la etiqueta de Aportador y está exento del filtro.")
-    except Exception as e:
-        await message.reply(f"❌ Error (Verifica que el bot tenga permisos de 'Añadir Admins'): {e}")
+        await bot.set_chat_permissions(group_id, ChatPermissions(can_send_messages=False))
+        await callback.answer("Chat cerrado.", show_alert=True)
+    except:
+        pass
 
-@router.message(Command("quitar_aportador"), F.chat.type.in_(["group", "supergroup"]))
-async def quitar_etiqueta_aportador(message: Message):
-    """Revoca el título personalizado y elimina de excepciones."""
-    if message.from_user.id not in SUPER_ADMIN_IDS:
-        return
-    
-    if not message.reply_to_message:
-        await message.reply("⚠️ Responde al mensaje del usuario para quitarle el rol.")
-        return
-
-    target_user = message.reply_to_message.from_user
-    
+@router.callback_query(F.data.startswith("open_"))
+async def open_chat_cb(callback: CallbackQuery):
+    group_id = int(callback.data.split("_")[1])
     try:
-        # Remover status de administrador
-        await bot.promote_chat_member(
-            chat_id=message.chat.id, user_id=target_user.id,
-            can_manage_chat=False, can_change_info=False,
-            can_delete_messages=False, can_invite_users=False,
-            can_restrict_members=False, can_pin_messages=False,
-            can_promote_members=False
-        )
+        await bot.set_chat_permissions(group_id, ChatPermissions(
+            can_send_messages=True, can_send_photos=True, can_send_videos=True, can_send_other_messages=True
+        ))
+        await callback.answer("Chat abierto.", show_alert=True)
+    except:
+        pass
+
+@router.callback_query(F.data.startswith("addid_"))
+async def addid_cb(callback: CallbackQuery, state: FSMContext):
+    group_id = int(callback.data.split("_")[1])
+    await state.set_state(BotStates.waiting_for_id)
+    await state.update_data(group_id=group_id, panel_msg_id=callback.message.message_id)
+    await callback.message.edit_text("✍️ **Envía un mensaje con el ID numérico del usuario.**", reply_markup=get_back_keyboard(group_id), parse_mode="Markdown")
+
+# ================= FUNCIONES DE ÁLBUM =================
+async def process_album(media_group_id: str, chat_title: str):
+    """Espera a que lleguen todas las fotos/videos del álbum y las envía juntas al canal."""
+    await asyncio.sleep(3)  
+    
+    if media_group_id not in album_cache:
+        return
         
-        # Le quitamos la excepción si estaba, EXCEPTO si es uno de los Super Admins
-        if target_user.id in usuarios_exentos and target_user.id not in SUPER_ADMIN_IDS:
-            usuarios_exentos.remove(target_user.id)
+    messages = album_cache.pop(media_group_id)
+    media_group = []
+    
+    for idx, msg in enumerate(messages):
+        caption = None
+        if idx == 0:
+            orig_cap = msg.caption or ""
+            sig = f"📌 Enviado desde: {chat_title}"
+            caption = f"{orig_cap}\n\n{sig}" if orig_cap else sig
+        
+        if msg.photo:
+            media_group.append(InputMediaPhoto(media=msg.photo[-1].file_id, caption=caption))
+        elif msg.video:
+            media_group.append(InputMediaVideo(media=msg.video.file_id, caption=caption))
+        elif msg.document:
+            media_group.append(InputMediaDocument(media=msg.document.file_id, caption=caption))
             
-        await message.reply(f"✅ Se le quitó el rol a {target_user.first_name}. Volverá a ser revisado por el filtro.")
-    except Exception as e:
-        await message.reply(f"❌ Error: {e}")
-
-# ================= FILTRO GLOBAL (PATRULLAJE ESTRICTO EN GRUPOS) =================
-@router.message(F.chat.type.in_(["group", "supergroup"]))
-async def group_messages_processor(message: Message):
-    user_id = message.from_user.id
-    user_name = message.from_user.full_name or ""
-    
-    usuarios_registrados.add(user_id)
-    
-    # Si el usuario está exento (Es admin principal o es Aportador), lo ignoramos
-    if user_id in usuarios_exentos:
-        return  
-
-    # PATRULLAJE ACTIVO: Si escribe y no tiene la etiqueta
-    if ETIQUETA_REQUERIDA not in user_name:
+    if media_group:
         try:
-            await message.delete()
-            # Kick (Banear y Desbanear) para que puedan intentar volver
-            await bot.ban_chat_member(message.chat.id, user_id)
-            await bot.unban_chat_member(message.chat.id, user_id)
-        except:
-            pass
+            await bot.send_media_group(BACKUP_CHANNEL_ID, media=media_group)
+        except Exception as e:
+            logging.error(f"Error copiando álbum al canal: {e}")
+
+# ================= FILTRO GLOBAL =================
+@router.message()
+async def group_messages_processor(message: Message):
+    if message.chat.type in ["group", "supergroup"]:
+        # 1. Filtro de enlaces (Anti-Spam)
+        content = message.text or message.caption
+        if content and LINK_REGEX.search(content):
+            if not await is_admin(message.chat.id, message.from_user.id):
+                try:
+                    await message.delete()
+                    return
+                except:
+                    pass
+        
+        # 2. Filtro de Respaldo Multimedia (SOLO fotos, videos y documentos)
+        if message.photo or message.video or message.document:
+            user_id = message.from_user.id
+            chat_id = message.chat.id
+            
+            # --- LÓGICA DE CONTEO Y ETIQUETA ---
+            if user_id not in media_counts:
+                media_counts[user_id] = {"name": message.from_user.first_name, "count": 0}
+            media_counts[user_id]["count"] += 1
+            
+            # Promover a "Aportador" sutilmente si no es admin (los designados cuentan como admin y se saltan esto)
+            if not await is_admin(chat_id, user_id):
+                if (chat_id, user_id) not in promoted_contributors:
+                    try:
+                        await bot.promote_chat_member(
+                            chat_id, user_id, 
+                            can_manage_chat=True,
+                            can_change_info=False,
+                            can_delete_messages=False,
+                            can_invite_users=False,
+                            can_restrict_members=False,
+                            can_pin_messages=False,
+                            can_manage_video_chats=False,
+                            can_promote_members=False
+                        )
+                        await bot.set_chat_administrator_custom_title(chat_id, user_id, "Aportador")
+                        promoted_contributors.add((chat_id, user_id))
+                    except Exception as e:
+                        logging.error(f"No se pudo promover a Aportador al usuario {user_id}: {e}")
+
+            # --- LÓGICA DE RESPALDO MULTIMEDIA ---
+            if message.media_group_id:
+                group_id = message.media_group_id
+                if group_id not in album_cache:
+                    album_cache[group_id] = []
+                    asyncio.create_task(process_album(group_id, message.chat.title))
+                
+                album_cache[group_id].append(message)
+            
+            else:
+                try:
+                    original_caption = message.caption or ""
+                    group_signature = f"📌 Enviado desde: {message.chat.title}"
+                    new_caption = f"{original_caption}\n\n{group_signature}" if original_caption else group_signature
+
+                    await message.copy_to(BACKUP_CHANNEL_ID, caption=new_caption)
+                except Exception as e:
+                    logging.error(f"Error copiando archivo suelto: {e}")
 
 # ================= SERVIDOR WEB FALSO PARA RENDER =================
 async def handle(request):
-    return web.Response(text="Bot is running!")
+    return web.Response(text="Bot is running smoothly!")
 
 async def web_server():
     app = web.Application()
@@ -301,9 +386,10 @@ async def web_server():
 # ================= EJECUCIÓN PRINCIPAL =================
 async def main():
     dp.include_router(router)
-    # Iniciamos el servidor web falso en segundo plano
+    # Ejecutamos el server aiohttp en background
     asyncio.create_task(web_server())
-    print("🤖 Bot Iniciado y Corriendo...")
+    print("🤖 Bot Web Service iniciado y corriendo en puerto 10000...")
+    await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
