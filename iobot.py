@@ -11,7 +11,7 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.exceptions import TelegramAPIError
 
 # ================= CONFIGURACIÓN =================
-TOKEN = "8985157561:AAEP2XkXV86iSSNqpawYqfqIuY2ApmBu4o8"
+TOKEN = "8783353791:AAF0wQHXBeRzBrovC3hisyxOUOUuspUgyTs"
 ETIQUETA_REQUERIDA = "ᴼᵀᴹ"
 DATA_FILE = "users.json" # Archivo para guardar la memoria persistente
 
