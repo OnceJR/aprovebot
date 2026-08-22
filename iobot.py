@@ -27,18 +27,29 @@ bot = Bot(token=TOKEN)
 dp = Dispatcher()
 router = Router()
 
-# ================= MENÚS Y BOTONES =================
+# ================= MENÚS PROFESIONALES =================
+def menu_idioma():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🇪🇸 Español", callback_data="lang_es"), 
+         InlineKeyboardButton(text="🇬🇧 English", callback_data="lang_en")]
+    ])
+
 def menu_principal(user_id):
-    is_admin = user_id in SUPER_ADMIN_IDS
+    lang = usuarios_data.get(str(user_id), {}).get("lang", "es")
+    text_link = "🔗 Get Invite Link" if lang == "en" else "🔗 Obtener mi Link"
+    text_stats = "📊 Stats" if lang == "en" else "📊 Mis Estadísticas"
+    text_how = "📖 How it works" if lang == "en" else "📖 ¿Cómo funciona?"
+    
     buttons = [
-        [InlineKeyboardButton(text="🔗 Obtener Link de Invitación", callback_data="get_link")],
-        [InlineKeyboardButton(text="📊 Mis Estadísticas", callback_data="stats")]
+        [InlineKeyboardButton(text=text_link, callback_data="get_link")],
+        [InlineKeyboardButton(text=text_stats, callback_data="stats")],
+        [InlineKeyboardButton(text=text_how, callback_data="how_it_works")]
     ]
-    if is_admin:
-        buttons.append([InlineKeyboardButton(text="📢 Difusión Global (Admin)", callback_data="admin_broadcast")])
+    if user_id in SUPER_ADMIN_IDS:
+        buttons.append([InlineKeyboardButton(text="📢 Broadcast (Admin)", callback_data="admin_broadcast")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
-# ================= LÓGICA DE START Y REFERIDOS =================
+# ================= LÓGICA DE IDIOMA Y START =================
 @router.message(CommandStart())
 async def start_cmd(message: Message):
     user_id = str(message.from_user.id)
@@ -48,50 +59,65 @@ async def start_cmd(message: Message):
     if len(args) > 1 and args[1].isdigit():
         inviter = args[1]
         if inviter != user_id:
-            if inviter not in usuarios_data: usuarios_data[inviter] = {"referidos": 0}
+            if inviter not in usuarios_data: usuarios_data[inviter] = {"referidos": 0, "lang": "es"}
             usuarios_data[inviter]["referidos"] = usuarios_data.get(inviter, {"referidos": 0})["referidos"] + 1
             save_data()
-            try: await bot.send_message(int(inviter), "🎉 ¡Alguien usó tu link! (+1 referido)")
+            try: await bot.send_message(int(inviter), "🎉 +1 Referido!")
             except: pass
 
     if user_id not in usuarios_data:
-        usuarios_data[user_id] = {"referidos": 0}
-        save_data()
-        
-    await message.answer(
-        "🏛 **SISTEMA DE ADMISIÓN**\n\n"
-        "Para ingresar al grupo exclusivo, debes invitar a **3 personas** usando tu link personal.\n\n"
-        "Usa los botones para gestionar tu acceso:", 
-        reply_markup=menu_principal(message.from_user.id)
-    )
+        await message.answer("¡Bienvenido! Selecciona tu idioma:\nWelcome! Select your language:", reply_markup=menu_idioma())
+    else:
+        await message.answer("Menú Principal:", reply_markup=menu_principal(int(user_id)))
 
-# ================= CALLBACKS =================
+@router.callback_query(F.data.startswith("lang_"))
+async def set_lang(call: CallbackQuery):
+    lang = call.data.split("_")[1]
+    if call.from_user.id not in usuarios_data: usuarios_data[str(call.from_user.id)] = {"referidos": 0}
+    usuarios_data[str(call.from_user.id)]["lang"] = lang
+    save_data()
+    await call.message.edit_text("Configurado. Menu:", reply_markup=menu_principal(call.from_user.id))
+
+# ================= BOTÓN: ¿CÓMO FUNCIONA? =================
+@router.callback_query(F.data == "how_it_works")
+async def show_how(call: CallbackQuery):
+    lang = usuarios_data.get(str(call.from_user.id), {}).get("lang", "es")
+    if lang == "es":
+        text = ("📖 **¿Cómo ingresar al grupo?**\n\n"
+                "1. Comparte tu link personal con tus amigos.\n"
+                "2. Consigue 3 personas que inicien el bot.\n"
+                "3. ¡El acceso al grupo se desbloquea automáticamente!\n\n"
+                "¡Es fácil, rápido y seguro!")
+    else:
+        text = ("📖 **How to join?**\n\n"
+                "1. Share your personal link with your friends.\n"
+                "2. Get 3 people to start this bot.\n"
+                "3. Group access unlocks automatically!\n\n"
+                "Fast, easy and safe!")
+    await call.message.edit_text(text, parse_mode="Markdown", reply_markup=menu_principal(call.from_user.id))
+
+# ================= CALLBACKS DE ACCIÓN =================
 @router.callback_query(F.data == "get_link")
 async def get_link(call: CallbackQuery):
     bot_info = await bot.get_me()
     link = f"https://t.me/{bot_info.username}?start={call.from_user.id}"
-    await call.message.answer(f"🔗 Tu link personal:\n`{link}`\n\nInvita a 3 amigos para desbloquear el acceso.", parse_mode="Markdown")
+    await call.message.answer(f"🔗 Tu link:\n`{link}`", parse_mode="Markdown")
 
 @router.callback_query(F.data == "stats")
 async def stats(call: CallbackQuery):
     count = usuarios_data.get(str(call.from_user.id), {}).get("referidos", 0)
-    await call.answer(f"Has invitado a {count} personas.", show_alert=True)
+    msg = f"👥 Invitaciones: {count}/3"
+    await call.answer(msg, show_alert=True)
 
-# ================= ADMISIÓN AL GRUPO =================
+# ================= ADMISIÓN (CHAT JOIN REQUEST) =================
 @router.chat_join_request()
 async def join_req(request: ChatJoinRequest):
     count = usuarios_data.get(str(request.from_user.id), {}).get("referidos", 0)
     if count >= 3 or request.from_user.id in SUPER_ADMIN_IDS:
         await request.approve()
     else:
-        await bot.send_message(request.from_user.id, "❌ Necesitas 3 referidos para entrar. Usa /start para ver tu progreso.")
+        await bot.send_message(request.from_user.id, "❌ Necesitas 3 referidos para entrar.")
         await request.decline()
-
-# ================= ADMIN: DIFUSIÓN =================
-@router.callback_query(F.data == "admin_broadcast")
-async def broadcast_cmd(call: CallbackQuery, state: FSMContext):
-    await call.message.answer("Envíame el mensaje que quieres difundir a todos los usuarios:")
-    # (Aquí podrías implementar un State para capturar el mensaje)
 
 # ================= SERVIDOR WEB RENDER =================
 async def web_server():
