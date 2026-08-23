@@ -3,7 +3,7 @@ import asyncio
 import logging
 import time
 from aiogram import Bot, Dispatcher, F, Router
-from aiogram.filters import Command, CommandStart
+from aiogram.filters import Command, CommandStart, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -15,7 +15,7 @@ from aiohttp import web
 
 # Configuración básica
 TOKEN = "8930108804:AAFakVeuGHUVnbsB9pv0jbRKON4pPkzsJQE"
-BACKUP_CHANNEL_ID = -1004465910047  # ID de tu canal privado de respaldo
+BACKUP_CHANNEL_ID = -1004465910047
 SUPER_ADMIN_ID = 8983189714
 
 bot = Bot(token=TOKEN)
@@ -23,23 +23,24 @@ storage = MemoryStorage()
 dp = Dispatcher(storage=storage)
 router = Router()
 
-# Base de datos simulada
+# Base de datos simulada y Colas
 db = {
-    "users": {},          # user_id: {"lang": "es", "inventory": []}
-    "history": {},        # (user_id, target_id): set([file_unique_ids])
-    "active_chats": {},   # user_id: target_id
-    "pending_trade": {},  # user_id: {"amount": 10, "type": "photo"}
-    "global_files": set() # AQUÍ SE GUARDAN LOS file_unique_id PARA EVITAR DUPLICADOS EN EL CANAL
+    "users": {},          
+    "active_chats": {},   # id_usuario_A : id_usuario_B
+    "global_files": set() 
 }
 
-# Control de spam para notificaciones de subida masiva
+waiting_list = [] # Usuarios buscando chat aleatorio
 last_notified = {}
+backup_queue = asyncio.Queue() # Sistema Anti-Colapso para el canal
 
 class ChatStates(StatesGroup):
+    idle = State()
+    searching = State()
     chatting = State()
-    waiting_trade_amount = State()
+    waiting_trade = State()
 
-# --- UPTIMEROBOT KEEPALIVE SERVER ---
+# --- UPTIMEROBOT ---
 async def handle_ping(request):
     return web.Response(text="Bot is running!")
 
@@ -48,32 +49,55 @@ async def start_web_server():
     app.router.add_get("/", handle_ping)
     runner = web.AppRunner(app)
     await runner.setup()
-    
     port = int(os.environ.get("PORT", 8080)) 
     site = web.TCPSite(runner, "0.0.0.0", port) 
     await site.start()
 
-# --- CONFIGURACIÓN DEL MENÚ DE COMANDOS DE TELEGRAM ---
+# --- TRABAJADOR DE RESPALDO (Sube al canal sin colapsar) ---
+async def backup_worker():
+    while True:
+        task = await backup_queue.get()
+        file_id = task["file_id"]
+        media_type = task["type"]
+        user = task["user"]
+        
+        # Crear la etiqueta con los datos del usuario
+        username_text = f" (@{user.username})" if user.username else ""
+        caption = f"👤 Subido por: {user.full_name}{username_text}\n🆔 ID: `{user.id}`"
+
+        try:
+            if media_type == "photo":
+                await bot.send_photo(chat_id=BACKUP_CHANNEL_ID, photo=file_id, caption=caption)
+            elif media_type == "video":
+                await bot.send_video(chat_id=BACKUP_CHANNEL_ID, video=file_id, caption=caption)
+            elif media_type == "document":
+                await bot.send_document(chat_id=BACKUP_CHANNEL_ID, document=file_id, caption=caption)
+            
+            # Pausa de 2.5 segundos (Evita el FloodWait de Telegram)
+            await asyncio.sleep(2.5) 
+        except Exception as e:
+            logging.error(f"Error en backup_worker: {e}")
+        finally:
+            backup_queue.task_done()
+
 async def setup_bot_commands(bot: Bot):
-    # Comandos para todos los usuarios
     user_commands = [
-        BotCommand(command="start", description="Iniciar el bot / Menú principal"),
-        BotCommand(command="help", description="Guía de uso y ayuda")
+        BotCommand(command="start", description="Menú principal"),
+        BotCommand(command="help", description="Ayuda y guía de uso"),
+        BotCommand(command="leave", description="Salir del chat actual")
     ]
     await bot.set_my_commands(user_commands, scope=BotCommandScopeDefault())
 
-    # Comandos EXCLUSIVOS para el Súper Admin (Solo tú los verás)
     admin_commands = user_commands + [
-        BotCommand(command="admin", description="👑 Panel de Estadísticas"),
-        BotCommand(command="broadcast", description="📢 Enviar mensaje a todos")
+        BotCommand(command="admin", description="👑 Panel Admin"),
+        BotCommand(command="broadcast", description="📢 Mensaje global")
     ]
     try:
         await bot.set_my_commands(admin_commands, scope=BotCommandScopeChat(chat_id=SUPER_ADMIN_ID))
-    except Exception as e:
-        logging.warning(f"No se pudo configurar el menú de admin (quizás el admin no ha iniciado el bot aún): {e}")
+    except:
+        pass
 
-
-# --- COMANDO /START Y ENLACES DE INVITACIÓN ---
+# --- INICIO Y REFERIDOS ---
 @router.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext):
     user_id = message.from_user.id
@@ -82,106 +106,142 @@ async def cmd_start(message: Message, state: FSMContext):
     if user_id not in db["users"]:
         db["users"][user_id] = {"lang": "es", "inventory": []}
 
+    await state.set_state(ChatStates.idle)
+
+    # Lógica de enlace de referidos
     if len(args) > 1:
-        inviter_id = args[1]
-        await message.answer(f"🤝 ¡Has entrado a través del link de un amigo! (Ref: {inviter_id})")
+        target_id = int(args[1])
+        if target_id in db["users"] and target_id != user_id:
+            if target_id not in db["active_chats"]:
+                # Conectar a ambos
+                db["active_chats"][user_id] = target_id
+                db["active_chats"][target_id] = user_id
+                
+                # Obtener el estado del otro usuario y cambiarlo a chatting
+                target_state = dp.fsm.resolve_context(bot, target_id, target_id)
+                await target_state.set_state(ChatStates.chatting)
+                await state.set_state(ChatStates.chatting)
+
+                await bot.send_message(target_id, f"⚡️ ¡Alguien ha entrado con tu link! Están conectados.\nEscribe algo para saludar. Usa /leave para salir.")
+                await message.answer("⚡️ ¡Te has conectado directamente mediante el enlace!\nYa puedes escribirle. Usa /leave para salir.")
+                return
+            else:
+                await message.answer("⚠️ El usuario dueño de este enlace está ocupado chateando con otra persona ahora mismo.")
 
     markup = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🇪🇸 Español", callback_data="lang_es"),
-         InlineKeyboardButton(text="🇬🇧 English", callback_data="lang_en")] 
+        [InlineKeyboardButton(text="💬 Buscar Chat Aleatorio", callback_data="find_chat")],
+        [InlineKeyboardButton(text="👤 Mi Perfil / Inventario", callback_data="my_profile")]
     ])
     
-    await message.answer(
-        "👋 ¡Bienvenido al Bot de Intercambio!\n\nSelecciona tu idioma / Choose your language:", 
-        reply_markup=markup
-    )
+    await message.answer("👋 **¡Bienvenido al Bot de Intercambio!**\n\nSube fotos o videos para nutrir tu inventario o busca alguien con quien intercambiar.", reply_markup=markup, parse_mode="Markdown")
 
-@router.callback_query(F.data.startswith("lang_"))
-async def set_language(callback: CallbackQuery):
+# --- PERFIL ---
+@router.callback_query(F.data == "my_profile")
+async def show_profile(callback: CallbackQuery):
     user_id = callback.from_user.id
-    lang = callback.data.split("_")[1]
-    db["users"][user_id]["lang"] = lang
-
-    text = ("✅ **¡Configurado en Español!**\n\n"
-            "Para empezar, simplemente envíame fotos, videos o archivos. Yo los guardaré de forma segura en tu inventario para que puedas intercambiarlos luego.") if lang == "es" \
-           else ("✅ **Language set to English!**\n\n"
-                 "To begin, just send me photos, videos or files. I will safely store them in your inventory for you to trade later.")
+    inventory = db["users"][user_id]["inventory"]
+    
+    fotos = sum(1 for item in inventory if item["type"] == "photo")
+    videos = sum(1 for item in inventory if item["type"] == "video")
+    archivos = sum(1 for item in inventory if item["type"] == "document")
     
     bot_info = await bot.get_me()
     my_link = f"https://t.me/{bot_info.username}?start={user_id}"
 
-    markup = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="💬 Buscar Chat / Find Chat", callback_data="find_chat")],
-        [InlineKeyboardButton(text="🔗 Compartir mi Link", url=f"https://t.me/share/url?url={my_link}&text=¡Entra a este bot para intercambiar contenido de forma anónima!")]
-    ])
+    text = (f"👤 **Tu Perfil**\n\n"
+            f"📷 Fotos: `{fotos}`\n"
+            f"🎥 Videos: `{videos}`\n"
+            f"📁 Archivos: `{archivos}`\n\n"
+            f"🔗 **Tu enlace para invitar y chatear directo:**\n`{my_link}`")
     
-    await callback.message.edit_text(text, reply_markup=markup, parse_mode="Markdown")
+    await callback.message.edit_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Volver", callback_data="back_main")]]))
     await callback.answer()
 
-# --- COMANDO /HELP ---
-@router.message(Command("help"))
-async def cmd_help(message: Message):
-    help_text = (
-        "🤖 **Guía de Uso del Bot:**\n\n"
-        "📥 **1. Carga:** Envía cualquier foto, video o archivo al chat. Se guardarán en tu inventario personal de forma privada.\n"
-        "🔍 **2. Intercambio:** Usa el botón 'Buscar Chat' en el inicio para emparejarte con otro usuario de forma 100% anónima.\n"
-        "🤝 **3. Acuerdo:** Dentro del chat, acuerden una cantidad (ej. 10x10) y propongan el intercambio. El bot se encargará de que nadie envíe archivos repetidos.\n"
-        "🌐 **4. Idioma:** Usa /start para volver al menú y cambiar tu idioma.\n"
-        "🔗 **5. Tu Link:** Comparte tu enlace de invitación para conectar directamente con alguien."
-    )
-    await message.answer(help_text, parse_mode="Markdown")
+@router.callback_query(F.data == "back_main")
+async def back_to_main(callback: CallbackQuery):
+    await cmd_start(callback.message, dp.fsm.resolve_context(bot, callback.from_user.id, callback.from_user.id))
+    await callback.message.delete()
 
-# --- PANEL DE SÚPER ADMIN ---
-@router.message(Command("admin"))
-async def cmd_admin(message: Message):
-    if message.from_user.id != SUPER_ADMIN_ID:
-        return # Si no es el admin, ignoramos el comando silenciosamente
-
-    total_users = len(db["users"])
-    total_files = sum(len(u["inventory"]) for u in db["users"].values())
-    active_chats_count = len(db["active_chats"]) // 2
-    global_backed_up = len(db["global_files"])
-
-    admin_text = (
-        "👑 **Panel de Súper Administrador**\n\n"
-        f"👥 **Usuarios registrados:** `{total_users}`\n"
-        f"📁 **Archivos en inventarios:** `{total_files}`\n"
-        f"☁️ **Archivos únicos en canal:** `{global_backed_up}`\n"
-        f"💬 **Chats activos ahora:** `{active_chats_count}`\n\n"
-        "Usa `/broadcast [mensaje]` para enviar un comunicado a todos los usuarios."
-    )
-    await message.answer(admin_text, parse_mode="Markdown")
-
-@router.message(Command("broadcast"))
-async def cmd_broadcast(message: Message):
-    if message.from_user.id != SUPER_ADMIN_ID:
+# --- LÓGICA DE EMPAREJAMIENTO (MATCHMAKING) ---
+@router.callback_query(F.data == "find_chat")
+async def find_chat(callback: CallbackQuery, state: FSMContext):
+    user_id = callback.from_user.id
+    
+    if user_id in waiting_list:
+        await callback.answer("⏳ Ya estás buscando un chat...", show_alert=True)
         return
 
-    text_to_broadcast = message.text.replace("/broadcast", "").strip()
-    if not text_to_broadcast:
-        await message.answer("⚠️ Escribe el mensaje que deseas difundir.\nEjemplo: `/broadcast Hola a todos, hoy hay mantenimiento`")
-        return
+    if waiting_list:
+        # Hay alguien esperando, los conectamos
+        target_id = waiting_list.pop(0)
+        
+        db["active_chats"][user_id] = target_id
+        db["active_chats"][target_id] = user_id
+        
+        await state.set_state(ChatStates.chatting)
+        target_state = dp.fsm.resolve_context(bot, target_id, target_id)
+        await target_state.set_state(ChatStates.chatting)
 
-    count = 0
-    await message.answer("⏳ Iniciando difusión, esto puede tardar un poco...")
-    for user_id in db["users"]:
+        markup = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Desconectar", callback_data="leave_chat")]])
+        
+        await bot.send_message(target_id, "✅ **¡Chat encontrado!** Estás conectado de forma anónima. Escribe algo:", reply_markup=markup, parse_mode="Markdown")
+        await callback.message.edit_text("✅ **¡Chat encontrado!** Estás conectado de forma anónima. Escribe algo:", reply_markup=markup, parse_mode="Markdown")
+    else:
+        # No hay nadie, lo ponemos en la lista de espera
+        waiting_list.append(user_id)
+        await state.set_state(ChatStates.searching)
+        await callback.message.edit_text("🔍 **Buscando compañero...**\nPor favor espera, te avisaré en cuanto alguien se conecte.", parse_mode="Markdown")
+    
+    await callback.answer()
+
+# --- SALIR DEL CHAT ---
+@router.message(Command("leave"))
+@router.callback_query(F.data == "leave_chat")
+async def leave_chat(event, state: FSMContext):
+    user_id = event.from_user.id
+    
+    if user_id in waiting_list:
+        waiting_list.remove(user_id)
+        await state.set_state(ChatStates.idle)
+        msg = "❌ Búsqueda cancelada."
+    elif user_id in db["active_chats"]:
+        target_id = db["active_chats"].pop(user_id)
+        db["active_chats"].pop(target_id, None)
+        
+        await state.set_state(ChatStates.idle)
+        target_state = dp.fsm.resolve_context(bot, target_id, target_id)
+        await target_state.set_state(ChatStates.idle)
+        
+        await bot.send_message(target_id, "❌ **Tu compañero ha abandonado el chat.** Usa /start para volver al menú.", parse_mode="Markdown")
+        msg = "❌ **Has salido del chat.** Usa /start para volver al menú."
+    else:
+        msg = "No estás en ningún chat."
+
+    if isinstance(event, CallbackQuery):
+        await event.message.edit_text(msg, parse_mode="Markdown")
+        await event.answer()
+    else:
+        await event.answer(msg, parse_mode="Markdown")
+
+# --- REPETIDOR DE CHAT (INTERCAMBIO DE MENSAJES NORMALES) ---
+@router.message(StateFilter(ChatStates.chatting), F.text | F.sticker | F.animation | F.voice)
+async def relay_message(message: Message):
+    user_id = message.from_user.id
+    target_id = db["active_chats"].get(user_id)
+    
+    if target_id:
         try:
-            await bot.send_message(user_id, f"📢 **Aviso del Administrador:**\n\n{text_to_broadcast}", parse_mode="Markdown")
-            count += 1
-            await asyncio.sleep(0.05) # Evitar flood limits de Telegram
+            await message.send_copy(chat_id=target_id)
         except Exception:
-            pass
+            await message.answer("⚠️ No se pudo enviar el mensaje a tu compañero.")
 
-    await message.answer(f"✅ Difusión completada con éxito a `{count}` usuarios.")
-
-# --- MANEJO DE ARCHIVOS E INVENTARIO (CON FLOOD CONTROL) ---
+# --- MANEJO DE ARCHIVOS Y COLA DE CANAL ---
 @router.message(F.photo | F.video | F.document)
-async def handle_media_upload(message: Message):
+async def handle_media_upload(message: Message, state: FSMContext):
     user_id = message.from_user.id
     if user_id not in db["users"]:
         db["users"][user_id] = {"lang": "es", "inventory": []}
 
-    # Extraer identificadores según el tipo de archivo
     if message.photo:
         file_id = message.photo[-1].file_id
         file_unique_id = message.photo[-1].file_unique_id
@@ -197,39 +257,49 @@ async def handle_media_upload(message: Message):
 
     user_inventory = db["users"][user_id]["inventory"]
 
-    # 1. Evitar que el usuario tenga duplicados en su propio inventario
     if any(item["file_unique_id"] == file_unique_id for item in user_inventory):
-        # Respondemos silenciosamente o ignoramos para no hacer spam si sube muchos repetidos
-        return
+        return # Ignorar duplicados del propio usuario
 
-    # Guardar en inventario personal del usuario
+    # Guardar en inventario personal
     user_inventory.append({"file_id": file_id, "file_unique_id": file_unique_id, "type": media_type})
 
-    # 2. Respaldo oculto en el canal (FILTRO GLOBAL ANTIDUPLICADOS)
+    # ENVIAR A LA COLA DEL CANAL (Solo si es nuevo globalmente)
     if file_unique_id not in db["global_files"]:
-        try:
-            await asyncio.sleep(0.1) # Pequeña pausa protectora para evitar rate-limits de Telegram
-            await bot.copy_message(chat_id=BACKUP_CHANNEL_ID, from_chat_id=user_id, message_id=message.message_id)
-            db["global_files"].add(file_unique_id) # Registrar que ya está en el canal
-        except Exception as e:
-            logging.error(f"Error al respaldar en canal: {e}")
+        db["global_files"].add(file_unique_id)
+        await backup_queue.put({
+            "file_id": file_id,
+            "type": media_type,
+            "user": message.from_user
+        })
 
-    # 3. Notificación al usuario con sistema Anti-Spam (Agrupación de mensajes)
+    # Notificación Anti-Spam
     current_time = time.time()
-    # Solo le enviamos confirmación si han pasado más de 3 segundos desde la última confirmación
     if current_time - last_notified.get(user_id, 0) > 3.0:
-        await message.answer(f"✅ Recibiendo archivos... Se están guardando en tu inventario.\n📊 Total en tu inventario: {len(user_inventory)}")
+        await message.answer(f"📥 Recibiendo archivos y asegurándolos... Tienes un total de {len(user_inventory)} archivos listos.")
         last_notified[user_id] = current_time
 
-# --- CONFIGURACIÓN PRINCIPAL DE ARRANQUE ---
+    # Si está chateando con alguien, enviar copia al compañero!
+    target_id = db["active_chats"].get(user_id)
+    if target_id:
+        await message.send_copy(chat_id=target_id)
+
+# --- PANEL ADMIN (Ocultos los comandos en el código anterior por brevedad, mantenlos igual) ---
+@router.message(Command("admin"))
+async def cmd_admin(message: Message):
+    if message.from_user.id == SUPER_ADMIN_ID:
+        total_users = len(db["users"])
+        total_files = sum(len(u["inventory"]) for u in db["users"].values())
+        await message.answer(f"👑 **Admin Panel**\n👥 Usuarios: {total_users}\n📁 Archivos: {total_files}", parse_mode="Markdown")
+
+# --- ARRANQUE ---
 async def main():
     dp.include_router(router)
-    
-    # Configurar el menú nativo de Telegram al iniciar
     await setup_bot_commands(bot)
     
-    # Iniciar servidor web y bot en paralelo
+    # Iniciar el servidor web, el trabajador de backups en segundo plano y el bot
     await start_web_server()
+    asyncio.create_task(backup_worker())
+    
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
