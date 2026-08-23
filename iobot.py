@@ -1,3 +1,4 @@
+import os
 import asyncio
 import logging
 from aiogram import Bot, Dispatcher, F, Router
@@ -39,7 +40,12 @@ async def start_web_server():
     app.router.add_get("/", handle_ping)
     runner = web.AppRunner(app)
     await runner.setup()
-    site = web.AppSite(runner, "0.0.0.0", 8080)
+    
+    # Render asigna un puerto dinámico, si no lo encuentra usa 8080
+    port = int(os.environ.get("PORT", 8080)) 
+    
+    # Aquí está la corrección: TCPSite en lugar de AppSite
+    site = web.TCPSite(runner, "0.0.0.0", port) 
     await site.start()
 
 # --- COMANDO /START Y ENLACES DE INVITACIÓN ---
