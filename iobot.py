@@ -1,153 +1,189 @@
-import asyncio, logging, json, os
-from aiohttp import web
+import asyncio
+import logging
 from aiogram import Bot, Dispatcher, F, Router
-from aiogram.types import Message, ChatJoinRequest, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
-from aiogram.filters import CommandStart
+from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
-from aiogram.exceptions import TelegramAPIError
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
+from aiohttp import web
 
-# ================= CONFIGURACIÓN =================
-TOKEN = "8783353791:AAF0wQHXBeRzBrovC3hisyxOUOUuspUgyTs"
-DATA_FILE = "users.json"
-SUPER_ADMIN_IDS = {8983189714, 8764734838} 
-GRUPO_ID = -1003537663095  # ⚠️ REEMPLAZA ESTO con el ID real de tu grupo (debe empezar con -100 y el bot ser admin)
+# Configuración básica
+TOKEN = "8930108804:AAFakVeuGHUVnbsB9pv0jbRKON4pPkzsJQE"
+BACKUP_CHANNEL_ID = -1004465910047  # ID de tu canal privado de respaldo
+SUPER_ADMIN_ID = 8983189714
 
-# ================= DATOS PERSISTENTES =================
-usuarios_data = {} # {user_id: {"referidos": 0, "lang": "es"}}
-
-def load_data():
-    global usuarios_data
-    if os.path.exists(DATA_FILE):
-        with open(DATA_FILE, "r") as f: usuarios_data = json.load(f)
-
-def save_data():
-    with open(DATA_FILE, "w") as f: json.dump(usuarios_data, f)
-
-load_data()
 bot = Bot(token=TOKEN)
-dp = Dispatcher()
+storage = MemoryStorage()
+dp = Dispatcher(storage=storage)
 router = Router()
 
-# ================= MENÚS PROFESIONALES =================
-def menu_idioma():
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🇪🇸 Español", callback_data="lang_es"), 
-         InlineKeyboardButton(text="🇬🇧 English", callback_data="lang_en")]
-    ])
+# Base de datos simulada (En producción, reemplaza esto por PostgreSQL o SQLite)
+db = {
+    "users": {},          # user_id: {"lang": "es", "inventory": []}
+    "history": {},        # (user_id, target_id): set([file_unique_ids])
+    "active_chats": {},   # user_id: target_id
+    "pending_trade": {}   # user_id: {"amount": 10, "type": "photo"}
+}
 
-def menu_principal(user_id):
-    lang = usuarios_data.get(str(user_id), {}).get("lang", "es")
-    text_link = "🔗 Get Invite Link" if lang == "en" else "🔗 Obtener mi Link"
-    text_stats = "📊 Stats" if lang == "en" else "📊 Mis Estadísticas"
-    text_how = "📖 How it works" if lang == "en" else "📖 ¿Cómo funciona?"
-    text_check = "🔓 Get Group Link" if lang == "en" else "🔓 Obtener Link de Grupo"
-    
-    buttons = [
-        [InlineKeyboardButton(text=text_link, callback_data="get_link")],
-        [InlineKeyboardButton(text=text_stats, callback_data="stats")],
-        [InlineKeyboardButton(text=text_how, callback_data="how_it_works")],
-        [InlineKeyboardButton(text=text_check, callback_data="check_join")]
-    ]
-    if user_id in SUPER_ADMIN_IDS:
-        buttons.append([InlineKeyboardButton(text="📢 Broadcast (Admin)", callback_data="admin_broadcast")])
-    return InlineKeyboardMarkup(inline_keyboard=buttons)
+class ChatStates(StatesGroup):
+    chtting = State()
+    waiting_trade_amount = State()
 
-# ================= LÓGICA DE IDIOMA Y START =================
+# --- UPTIMEROBOT KEEPALIVE SERVER ---
+async def handle_ping(request):
+    return web.Response(text="Bot is running!")
+
+async def start_web_server():
+    app = web.Application()
+    app.router.add_get("/", handle_ping)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.AppSite(runner, "0.0.0.0", 8080)
+    await site.start()
+
+# --- COMANDO /START Y ENLACES DE INVITACIÓN ---
 @router.message(CommandStart())
-async def start_cmd(message: Message):
-    user_id = str(message.from_user.id)
-    
-    # Lógica de referido
-    args = message.text.split()
-    if len(args) > 1 and args[1].isdigit():
-        inviter = args[1]
-        if inviter != user_id:
-            if inviter not in usuarios_data: usuarios_data[inviter] = {"referidos": 0, "lang": "es"}
-            usuarios_data[inviter]["referidos"] = usuarios_data.get(inviter, {"referidos": 0})["referidos"] + 1
-            save_data()
-            try: await bot.send_message(int(inviter), "🎉 +1 Referido!")
-            except: pass
+async def cmd_start(message: Message, state: FSMContext):
+    user_id = message.from_user.id
+    args = message.text.split(maxsplit=1) # Permite capturar links tipo /start ref_12345
 
-    if user_id not in usuarios_data:
-        await message.answer("¡Bienvenido! Selecciona tu idioma:\nWelcome! Select your language:", reply_markup=menu_idioma())
-    else:
-        await message.answer("Menú Principal:", reply_markup=menu_principal(int(user_id)))
+    if user_id not in db["users"]:
+        db["users"][user_id] = {"lang": "es", "inventory": []}
+
+    # Si entró por un enlace de invitación de otro usuario
+    if len(args) > 1:
+        inviter_id = args[1]
+        await message.answer(f"¡Has entrado a través del link de un amigo! (Referencia: {inviter_id})")
+
+    markup = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🇪🇸 Español", callback_data="lang_es"),
+         InlineKeyboardButton(text="🇬🇧 English", callback_data="lang_de")] # (o en)
+    ])
+    
+    await message.answer("¡Bienvenido! Selecciona tu idioma / Welcome! Choose your language:", reply_markup=markup)
 
 @router.callback_query(F.data.startswith("lang_"))
-async def set_lang(call: CallbackQuery):
-    lang = call.data.split("_")[1]
-    if call.from_user.id not in usuarios_data: usuarios_data[str(call.from_user.id)] = {"referidos": 0}
-    usuarios_data[str(call.from_user.id)]["lang"] = lang
-    save_data()
-    await call.message.edit_text("Configurado. Menu:", reply_markup=menu_principal(call.from_user.id))
+async def set_language(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    lang = callback.data.split("_")[1]
+    db["users"][user_id]["lang"] = lang
 
-# ================= BOTÓN: ¿CÓMO FUNCIONA? =================
-@router.callback_query(F.data == "how_it_works")
-async def show_how(call: CallbackQuery):
-    lang = usuarios_data.get(str(call.from_user.id), {}).get("lang", "es")
-    if lang == "es":
-        text = ("📖 **¿Cómo ingresar al grupo?**\n\n"
-                "1. Comparte tu link personal con tus amigos.\n"
-                "2. Consigue 3 personas que inicien el bot.\n"
-                "3. Presiona **'Obtener Link de Grupo'** para recibir tu acceso único.\n\n"
-                "¡Es fácil, rápido y seguro!")
-    else:
-        text = ("📖 **How to join?**\n\n"
-                "1. Share your personal link with your friends.\n"
-                "2. Get 3 people to start this bot.\n"
-                "3. Click **'Get Group Link'** to receive your unique access.\n\n"
-                "Fast, easy and safe!")
-    await call.message.edit_text(text, parse_mode="Markdown", reply_markup=menu_principal(call.from_user.id))
-
-# ================= CALLBACKS DE ACCIÓN =================
-@router.callback_query(F.data == "get_link")
-async def get_link(call: CallbackQuery):
-    bot_info = await bot.get_me()
-    link = f"https://t.me/{bot_info.username}?start={call.from_user.id}"
-    await call.message.answer(f"🔗 Tu link personal:\n`{link}`\n\nComparte este enlace para acumular tus 3 referidos.", parse_mode="Markdown")
-
-@router.callback_query(F.data == "stats")
-async def stats(call: CallbackQuery):
-    count = usuarios_data.get(str(call.from_user.id), {}).get("referidos", 0)
-    msg = f"👥 Invitaciones: {count}/3"
-    await call.answer(msg, show_alert=True)
-
-# ================= VERIFICACIÓN Y ENTREGA DE LINK DE UN SOLO USO =================
-@router.callback_query(F.data == "check_join")
-async def check_join(call: CallbackQuery):
-    user_id = call.from_user.id
-    count = usuarios_data.get(str(user_id), {}).get("referidos", 0)
+    text = "¡Idioma configurado en Español! Envía fotos, videos o archivos para guardarlos en tu inventario." if lang == "es" \
+           else "Language set to English! Send photos, videos or files to save them to your inventory."
     
-    if count >= 3 or user_id in SUPER_ADMIN_IDS:
+    # Generar Link de Referidos del usuario
+    bot_info = await bot.get_me()
+    my_link = f"https://t.me/{bot_info.username}?start={user_id}"
+
+    markup = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="💬 Buscar Chat / Find Chat", callback_data="find_chat")],
+        [InlineKeyboardButton(text="🔗 Compartir mi Link", url=f"https://t.me/share/url?url={my_link}&text=¡Entra a este bot para intercambiar contenido!")]
+    ])
+    
+    await callback.message.edit_text(text, reply_markup=markup)
+    await callback.answer()
+
+# --- COMANDO /HELP ---
+@router.message(Command("help"))
+async def cmd_help(message: Message):
+    help_text = (
+        "🤖 **Guía de Uso del Bot:**\n\n"
+        "1. **Carga:** Envía cualquier foto, video o archivo al chat. Se guardarán en tu inventario personal.\n"
+        "2. **Intercambio:** Usa 'Buscar Chat' para emparejarte con otro usuario de forma anónima.\n"
+        "3. **Acuerdo:** En el chat, acuerden una cantidad (ej. 10x10) y propongan el intercambio.\n"
+        "4. **Idioma:** Usa /start para reconfigurar tu idioma en cualquier momento.\n"
+        "5. **Tu Link:** Comparte tu enlace de invitación para que otros seconecten contigo."
+    )
+    await message.answer(help_text, parse_mode="Markdown")
+
+# --- PANEL DE SÚPER ADMIN ---
+@router.message(Command("admin"))
+async def cmd_admin(message: Message):
+    if message.from_user.id != SUPER_ADMIN_ID:
+        await message.answer("No tienes permisos para usar este comando.")
+        return
+
+    total_users = len(db["users"])
+    total_files = sum(len(u["inventory"]) for u in db["users"].values())
+    active_chats_count = len(db["active_chats"]) // 2
+
+    admin_text = (
+        "👑 **Panel de Súper Administrador**\n\n"
+        f"👥 Usuarios totales: `{total_users}`\n"
+        f"📁 Archivos en inventarios: `{total_files}`\n"
+        f"💬 Chats activos ahora: `{active_chats_count}`\n\n"
+        "Usa `/broadcast [mensaje]` para enviar un comunicado a todos."
+    )
+    await message.answer(admin_text, parse_mode="Markdown")
+
+@router.message(Command("broadcast"))
+async def cmd_broadcast(message: Message):
+    if message.from_user.id != SUPER_ADMIN_ID:
+        return
+
+    text_to_broadcast = message.text.replace("/broadcast", "").strip()
+    if not text_to_broadcast:
+        await message.answer("Escribe el mensaje que deseas difundir. Ejemplo: `/broadcast Hola a todos`")
+        return
+
+    count = 0
+    for user_id in db["users"]:
         try:
-            # Generamos el enlace de un solo uso al instante
-            link = await bot.create_chat_invite_link(
-                chat_id=GRUPO_ID,
-                member_limit=1,
-                name=f"Acceso de {user_id}"
-            )
-            await call.message.answer(
-                f"✅ **¡Felicidades! Has cumplido el requisito.**\n\n"
-                f"🔗 **Tu enlace de acceso exclusivo (1 solo uso):**\n`{link.invite_link}`\n\n"
-                "⚠️ *Este enlace se autodestruirá en cuanto lo utilices para entrar.*",
-                parse_mode="Markdown"
-            )
-        except TelegramAPIError as e:
-            await call.message.answer(f"❌ Error al generar el enlace. Asegúrate de que el bot sea administrador del grupo con permisos para invitar usuarios. Detalles: `{e}`", parse_mode="Markdown")
+            await bot.send_message(user_id, f"📢 **Aviso importante:**\n\n{text_to_broadcast}", parse_mode="Markdown")
+            count += 1
+            await asyncio.sleep(0.05) # Evitar flood limits de Telegram
+        except Exception:
+            pass
+
+    await message.answer(f"✅ Difusión completada con éxito a `{count}` usuarios.")
+
+# --- MANEJO DE ARCHIVOS E INVENTARIO ---
+@router.message(F.photo | F.video | F.document)
+async def handle_media_upload(message: Message):
+    user_id = message.from_user.id
+    if user_id not in db["users"]:
+        db["users"][user_id] = {"lang": "es", "inventory": []}
+
+    # Extraer identificadores de Telegram
+    if message.photo:
+        file_id = message.photo[-1].file_id
+        file_unique_id = message.photo[-1].file_unique_id
+        media_type = "photo"
+    elif message.video:
+        file_id = message.video.file_id
+        file_unique_id = message.video.file_unique_id
+        media_type = "video"
     else:
-        faltan = 3 - count
-        await call.answer(f"❌ Aún te faltan {faltan} referidos para desbloquear el acceso.", show_alert=True)
+        file_id = message.document.file_id
+        file_unique_id = message.document.file_unique_id
+        media_type = "document"
 
-# ================= SERVIDOR WEB RENDER =================
-async def web_server():
-    runner = web.AppRunner(web.Application())
-    await runner.setup()
-    await web.TCPSite(runner, "0.0.0.0", int(os.environ.get("PORT", 10000))).start()
+    # Evitar duplicados absolutos en el inventario del usuario
+    user_inventory = db["users"][user_id]["inventory"]
+    if any(item["file_unique_id"] == file_unique_id for item in user_inventory):
+        await message.answer("⚠️ Este archivo ya está en tu inventario.")
+        return
 
+    # Guardar en inventario personal
+    user_inventory.append({"file_id": file_id, "file_unique_id": file_unique_id, "type": media_type})
+
+    # Respaldo oculto en el canal (Evitando duplicados globales mediante file_unique_id)
+    try:
+        # Nota: Aquí implementarías la validación si el file_unique_id ya pasó por el canal
+        await bot.copy_message(chat_id=BACKUP_CHANNEL_ID, from_chat_id=user_id, message_id=message.message_id)
+    except Exception as e:
+        logging.error(f"Error al respaldar en canal: {e}")
+
+    await message.answer(f"✅ Archivo guardado correctamente en tu inventario.\n📊 Total en inventario: {len(user_inventory)}")
+
+# --- CONFIGURACIÓN PRINCIPAL DE ARRANCKE ---
 async def main():
     dp.include_router(router)
-    asyncio.create_task(web_server())
+    # Iniciar servidor web para UptimeRobot en paralelo con el bot de Telegram
+    await start_web_server()
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO)
     asyncio.run(main())
