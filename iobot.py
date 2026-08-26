@@ -16,7 +16,7 @@ from motor.motor_asyncio import AsyncIOMotorClient
 
 # --- CONFIGURACIÓN PRINCIPAL ---
 MAIN_BOT_TOKEN = "8758379002:AAHMOIe4-dVfmiW2FzESo-C11q63J0buqIg"
-BACKUP_BOT_TOKEN = "8843856010:AAETEm3tDGPjsFFHktoBdLSlB0hXVsMuufM"  # Cambiar por el token de tu Bot Secundario
+BACKUP_BOT_TOKEN = "8843856010:AAETEm3tDGPjsFFHktoBdLSlB0hXVsMuufM"  
 
 MONGO_URI = "mongodb+srv://carlosjrpelegrina_db_user:1DNyN9AFa9bh1tCr@cluster0.haf2f1l.mongodb.net"
 
@@ -24,9 +24,9 @@ FORCE_SUB_CHANNEL_ID = -1004381717458
 FORCE_SUB_CHANNEL_LINK = "https://t.me/+UErsppCsR2Q5MzVh"
 VIP_GROUP_ID = -1003581180620 
 
+# Todos los de esta lista son Super Admins: verán estadísticas, podrán reinvitar y RECIBIRÁN TODOS LOS RESPALDOS AUTOMÁTICAMENTE
 ADMIN_IDS = [8983189714, 8748956307, 8764734838, 6630522163, 8831263313, 8556221763, 5142196200, 7452819858, 8803304819, 8266066936, 8985586526, 8847243934, 8864888335]
-SUPER_ADMIN_IDS = ADMIN_IDS  # Admins con permisos de estadísticas y reinvitación
-BACKUP_RECEIVER_IDS = [8983189714]  # IDs de los usuarios que recibirán los respaldos en su DM
+SUPER_ADMIN_IDS = ADMIN_IDS  
 
 bot = Bot(token=MAIN_BOT_TOKEN)
 bot_backup = Bot(token=BACKUP_BOT_TOKEN)
@@ -37,6 +37,7 @@ db_client = AsyncIOMotorClient(MONGO_URI)
 db = db_client.intercambio_bot
 
 active_chats = {}
+waiting_list = {}
 waiting_list = []
 pending_trades = {}
 backup_queue = asyncio.Queue()
@@ -69,6 +70,13 @@ async def check_force_sub(user_id):
         logging.error(f"Error Force Sub: {e}")
         return False
 
+# Obtiene la lista definitiva de quién recibe los respaldos (Super Admins + Agregados Manualmente)
+async def get_backup_receivers():
+    doc = await db.settings.find_one({"_id": "config"})
+    extra_ids = doc.get("extra_receivers", []) if doc else []
+    # Usamos set() para no enviar archivos duplicados si un admin está también en extra_receivers
+    return list(set(SUPER_ADMIN_IDS + extra_ids))
+
 # --- WEB SERVER & BACKUP WORKER ---
 async def handle_ping(request): return web.Response(text="Bot is running!")
 async def start_web_server():
@@ -85,7 +93,9 @@ async def backup_worker():
             caption = f"👤 Subido por: {task['name']} (`{task['user_id']}`)"
             file_id = task["file_id"]
             
-            for receiver_id in BACKUP_RECEIVER_IDS:
+            receivers = await get_backup_receivers()
+            
+            for receiver_id in receivers:
                 try:
                     if task["type"] == "photo":
                         await bot_backup.send_photo(receiver_id, file_id, caption=caption)
@@ -93,11 +103,11 @@ async def backup_worker():
                         await bot_backup.send_video(receiver_id, file_id, caption=caption)
                     else:
                         await bot_backup.send_document(receiver_id, file_id, caption=caption)
-                except Exception:
-                    pass
+                except Exception as e:
+                    print(f"❌ Error enviando respaldo a {receiver_id}: {e}")
             await asyncio.sleep(2.5)
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"❌ Error en la cola de respaldo: {e}")
         finally:
             backup_queue.task_done()
 
@@ -109,6 +119,26 @@ async def setup_bot_commands(bot: Bot):
     ], scope=BotCommandScopeDefault())
 
 # --- COMANDOS ADMINISTRATIVOS ---
+@router.message(Command("add_receiver"))
+async def cmd_add_receiver(message: Message):
+    if message.from_user.id not in SUPER_ADMIN_IDS: return
+    try:
+        new_id = int(message.text.split()[1])
+        await db.settings.update_one({"_id": "config"}, {"$addToSet": {"extra_receivers": new_id}}, upsert=True)
+        await message.answer(f"✅ El usuario con ID `{new_id}` ahora recibirá los respaldos del bot secundario.")
+    except:
+        await message.answer("⚠️ Uso correcto: `/add_receiver ID`")
+
+@router.message(Command("del_receiver"))
+async def cmd_del_receiver(message: Message):
+    if message.from_user.id not in SUPER_ADMIN_IDS: return
+    try:
+        rem_id = int(message.text.split()[1])
+        await db.settings.update_one({"_id": "config"}, {"$pull": {"extra_receivers": rem_id}}, upsert=True)
+        await message.answer(f"✅ ID `{rem_id}` eliminado de la lista de receptores adicionales.")
+    except:
+        await message.answer("⚠️ Uso correcto: `/del_receiver ID`")
+
 @router.message(Command("broadcast"))
 async def cmd_broadcast(message: Message):
     if message.from_user.id not in ADMIN_IDS: return
@@ -135,13 +165,15 @@ async def cmd_migrar_respaldo(message: Message):
     count_success = 0
     count_error = 0
     
+    receivers = await get_backup_receivers()
     cursor = db.inventory.find({})
+    
     async for doc in cursor:
         caption = f"♻️ [Migrado] Usuario ID: `{doc['user_id']}`"
         file_id = doc["file_id"]
         exito_en_archivo = False
         
-        for receiver_id in BACKUP_RECEIVER_IDS:
+        for receiver_id in receivers:
             try:
                 if doc["type"] == "photo":
                     await bot_backup.send_photo(receiver_id, file_id, caption=caption)
@@ -150,8 +182,8 @@ async def cmd_migrar_respaldo(message: Message):
                 else:
                     await bot_backup.send_document(receiver_id, file_id, caption=caption)
                 exito_en_archivo = True
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"❌ Error migrando archivo a {receiver_id}: {e}")
         
         if exito_en_archivo: count_success += 1
         else: count_error += 1
