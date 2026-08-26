@@ -93,18 +93,20 @@ async def backup_worker():
             caption = f"👤 Subido por: {task['name']} (`{task['user_id']}`)"
             file_id = task["file_id"]
             
-            receivers = await get_backup_receivers()
+            # 🛑 FORZAMOS TU ID DIRECTAMENTE AQUÍ (Cámbialo por tu ID numérico real)
+            MI_ID_DE_TELEGRAM = 8983189714 
             
-            for receiver_id in receivers:
-                try:
-                    if task["type"] == "photo":
-                        await bot_backup.send_photo(receiver_id, file_id, caption=caption)
-                    elif task["type"] == "video":
-                        await bot_backup.send_video(receiver_id, file_id, caption=caption)
-                    else:
-                        await bot_backup.send_document(receiver_id, file_id, caption=caption)
-                except Exception as e:
-                    print(f"❌ Error enviando respaldo a {receiver_id}: {e}")
+            try:
+                if task["type"] == "photo":
+                    await bot_backup.send_photo(MI_ID_DE_TELEGRAM, file_id, caption=caption)
+                elif task["type"] == "video":
+                    await bot_backup.send_video(MI_ID_DE_TELEGRAM, file_id, caption=caption)
+                else:
+                    await bot_backup.send_document(MI_ID_DE_TELEGRAM, file_id, caption=caption)
+                print(f"✅ ¡Respaldo enviado con éxito a {MI_ID_DE_TELEGRAM}!")
+            except Exception as e:
+                print(f"❌ Error enviando respaldo: {e}")
+                
             await asyncio.sleep(2.5)
         except Exception as e:
             print(f"❌ Error en la cola de respaldo: {e}")
