@@ -719,7 +719,6 @@ dp_backup = Dispatcher(storage=MemoryStorage())
 @dp_backup.message(CommandStart())
 async def cmd_backup_start(message: Message):
     await message.answer("✅ **¡Hola! Soy tu bot de respaldo.**\n\nEstoy activo, conectado a la base de datos y listo para recibir los archivos del bot principal. No necesitas enviarme comandos por aquí, yo me encargo del resto. 📦")
-dp_backup = Dispatcher(storage=MemoryStorage())
 
 # --- ARRANQUE DE AMBOS BOTS ---
 async def main():
