@@ -19,6 +19,7 @@ TOKEN = os.getenv("BOT_TOKEN", "8758379002:AAHMOIe4-dVfmiW2FzESo-C11q63J0buqIg")
 MONGO_URI = os.getenv("MONGO_URI", "mongodb+srv://carlosjrpelegrina_db_user:1DNyN9AFa9bh1tCr@cluster0.haf2f1l.mongodb.net")
 BACKUP_CHANNEL_ID = -1004499528343  # Reemplaza con ID de tu canal
 FORCE_SUB_CHANNEL_ID = -1004381717458 # Reemplaza con ID de tu canal principal
+FORCE_SUB_CHANNEL_LINK = "https://t.me/+UErsppCsR2Q5MzVh"
 VIP_GROUP_ID = -1003581180620 # Reemplaza con ID de tu grupo VIP
 
 # Inmunidad administrativa
@@ -135,7 +136,8 @@ async def cmd_start(message: Message, state: FSMContext):
 
     if not await check_force_sub(user_id):
         markup = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="📢 Unirse al Canal", url=f"https://t.me/c/{str(FORCE_SUB_CHANNEL_ID)[4:]}")],
+            # --- ANTES USABA EL GENERADOR AUTOMÁTICO, AHORA USA TU LINK DIRECTO ---
+            [InlineKeyboardButton(text="📢 Unirse al Canal", url=FORCE_SUB_CHANNEL_LINK)],
             [InlineKeyboardButton(text="✅ Verificar Ingreso", callback_data="verify_sub")]
         ])
         return await message.answer("🛑 **Acceso Restringido**\nDebes unirte a nuestro canal principal para usar el bot.", reply_markup=markup, parse_mode="Markdown")
