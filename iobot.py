@@ -17,13 +17,13 @@ from motor.motor_asyncio import AsyncIOMotorClient
 # --- CONFIGURACIÓN PRINCIPAL ---
 TOKEN = os.getenv("BOT_TOKEN", "8758379002:AAHMOIe4-dVfmiW2FzESo-C11q63J0buqIg")
 MONGO_URI = os.getenv("MONGO_URI", "mongodb+srv://carlosjrpelegrina_db_user:1DNyN9AFa9bh1tCr@cluster0.haf2f1l.mongodb.net")
-BACKUP_CHANNEL_ID = -1004499528343  # Reemplaza con ID de tu canal
-FORCE_SUB_CHANNEL_ID = -1004381717458 # Reemplaza con ID de tu canal principal
+BACKUP_CHANNEL_ID = -1004499528343  
+FORCE_SUB_CHANNEL_ID = -1004381717458 
 FORCE_SUB_CHANNEL_LINK = "https://t.me/+UErsppCsR2Q5MzVh"
-VIP_GROUP_ID = -1003581180620 # Reemplaza con ID de tu grupo VIP
+VIP_GROUP_ID = -1003581180620 
 
 # Inmunidad administrativa
-ADMIN_IDS = [8764734838, 6630522163, 8831263313, 8556221763, 5142196200, 7452819858, 8803304819, 8266066936, 8985586526, 8847243934, 8864888335]
+ADMIN_IDS = [8748956307, 8764734838, 6630522163, 8831263313, 8556221763, 5142196200, 7452819858, 8803304819, 8266066936, 8985586526, 8847243934, 8864888335]
 
 bot = Bot(token=TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
@@ -59,7 +59,9 @@ async def check_force_sub(user_id):
     try:
         member = await bot.get_chat_member(FORCE_SUB_CHANNEL_ID, user_id)
         return member.status in ["member", "administrator", "creator"]
-    except: return False
+    except Exception as e: 
+        logging.error(f"Error Force Sub: {e}")
+        return False
 
 # --- WEB SERVER & BACKUP ---
 async def handle_ping(request): return web.Response(text="Bot is running!")
@@ -136,7 +138,6 @@ async def cmd_start(message: Message, state: FSMContext):
 
     if not await check_force_sub(user_id):
         markup = InlineKeyboardMarkup(inline_keyboard=[
-            # --- ANTES USABA EL GENERADOR AUTOMÁTICO, AHORA USA TU LINK DIRECTO ---
             [InlineKeyboardButton(text="📢 Unirse al Canal", url=FORCE_SUB_CHANNEL_LINK)],
             [InlineKeyboardButton(text="✅ Verificar Ingreso", callback_data="verify_sub")]
         ])
@@ -173,9 +174,9 @@ async def show_main_menu(send_func, user):
 async def cmd_help(message: Message):
     help_text = (
         "🤖 **Guía Completa del Bot de Intercambio**\n\n"
-        "📦 **1. Tu Inventario:** Envía archivos a este chat. Se guardarán para intercambiarlos.\n"
+        "📦 **1. Tu Inventario:** Envía archivos a este chat para guardarlos (solo si no estás emparejado).\n"
         "⚠️ **Importante:** No elimines los mensajes que envíes. El bot funciona reenviándolos.\n\n"
-        "💬 **2. Chatear:** Conecta con alguien al azar o por su ID. Lo que envíes se reenviará en vivo.\n"
+        "💬 **2. Chatear:** Conecta con alguien al azar o por su ID. El material enviado aquí va directo a tu compañero.\n"
         "🤝 **3. Lotes:** Usa 'Proponer Intercambio' para mandar ráfagas automáticas sin repetidos.\n"
         "🌟 **4. VIP:** Gana 15 de reputación o invita 3 amigos para entrar al grupo exclusivo."
     )
@@ -331,7 +332,7 @@ async def process_rating(callback: CallbackQuery):
         await check_vip_status(int(target_id))
     await callback.message.edit_text("✅ Gracias por tu valoración.")
 
-# --- INVENTARIO ---
+# --- INVENTARIO Y REENVÍO MULTIMEDIA DIRECTO ---
 @router.message(F.chat.type == "private", F.photo | F.video | F.document)
 async def handle_media(message: Message):
     user_id = message.from_user.id
@@ -339,14 +340,24 @@ async def handle_media(message: Message):
     file_id, file_unique_id = media.file_id, media.file_unique_id
     media_type = "photo" if message.photo else ("video" if message.video else "document")
 
+    # 1. Respaldo (Solo sube al canal si es un archivo no repetido a nivel global)
+    if not await db.global_files.find_one({"_id": file_unique_id}):
+        await db.global_files.insert_one({"_id": file_unique_id})
+        await backup_queue.put({"file_id": file_id, "type": media_type, "user_id": user_id, "name": message.from_user.full_name})
+
+    # 2. Comportamiento según el estado del chat
+    if user_id in active_chats:
+        # Si está chateando, lo reenvía directo y finaliza (no se guarda en inventario)
+        target = active_chats[user_id]
+        try: await message.forward(target)
+        except: pass
+        return
+
+    # 3. Si NO está chateando, se guarda en el inventario personal
     if not await db.inventory.find_one({"user_id": user_id, "file_unique_id": file_unique_id}):
         await db.inventory.insert_one({"user_id": user_id, "file_id": file_id, "message_id": message.message_id, "file_unique_id": file_unique_id, "type": media_type})
         total = await db.inventory.count_documents({"user_id": user_id})
         await message.answer(f"📥 **Archivo guardado en tu inventario.** (Total: {total})\n\n⚠️ **Importante:** El bot funciona reenviando tus archivos originales. Por favor, **no elimines los mensajes que subas a este chat**. Si los borras, se eliminarán automáticamente de tu inventario.", parse_mode="Markdown")
-
-    if not await db.global_files.find_one({"_id": file_unique_id}):
-        await db.global_files.insert_one({"_id": file_unique_id})
-        await backup_queue.put({"file_id": file_id, "type": media_type, "user_id": user_id, "name": message.from_user.full_name})
 
 # --- INTERCAMBIO Y ESCROW ---
 async def get_random_batch(db, sender_id: int, receiver_id: int, category: str, amount: int):
@@ -438,6 +449,18 @@ async def accept_trade(callback: CallbackQuery):
     
     await send_rating_request(user_id, sender_id)
     await send_rating_request(sender_id, user_id)
+
+@router.callback_query(F.data == "reject_trade")
+async def reject_trade(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    trade = pending_trades.pop(user_id, None)
+    
+    if not trade: 
+        return await callback.message.answer("⚠️ No hay intercambios pendientes.", show_alert=True)
+    
+    sender_id = trade["sender"]
+    await callback.message.edit_text("❌ Has rechazado la propuesta de intercambio.")
+    await bot.send_message(sender_id, "❌ Tu compañero ha rechazado la propuesta de intercambio.")
 
 @router.message(StateFilter(BotStates.chatting), ~F.text.in_(["🤝 Proponer Intercambio", "❌ Desconectar"]))
 async def relay_msg(message: Message):
