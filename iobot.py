@@ -34,6 +34,7 @@ active_chats = {}
 waiting_list = []
 pending_trades = {}
 backup_queue = asyncio.Queue()
+processed_albums = set()
 
 class BotStates(StatesGroup):
     idle = State()
@@ -436,21 +437,42 @@ async def handle_media(message: Message):
     file_id, file_unique_id = media.file_id, media.file_unique_id
     media_type = "photo" if message.photo else ("video" if message.video else "document")
 
+    # 1. Respaldo
     if not await db.global_files.find_one({"_id": file_unique_id}):
         await db.global_files.insert_one({"_id": file_unique_id})
         await backup_queue.put({"file_id": file_id, "type": media_type, "user_id": user_id, "name": message.from_user.full_name})
 
+    # 2. Si está chateando, reenvía directo
     if user_id in active_chats:
         target = active_chats[user_id]
         try: await message.forward(target)
         except: pass
         return
 
+    # 3. Guardar en inventario
+    is_new = False
     if not await db.inventory.find_one({"user_id": user_id, "file_unique_id": file_unique_id}):
         await db.inventory.insert_one({"user_id": user_id, "file_id": file_id, "message_id": message.message_id, "file_unique_id": file_unique_id, "type": media_type})
-        total = await db.inventory.count_documents({"user_id": user_id})
-        msg = f"📥 **Archivo guardado en tu inventario.** (Total: {total})\n\n⚠️ **Importante:** El bot funciona reenviando tus archivos originales. Por favor, **no elimines los mensajes que subas a este chat**. Si los borras, se eliminarán automáticamente de tu inventario." if lang == "es" else f"📥 **File saved in your inventory.** (Total: {total})\n\n⚠️ **Important:** The bot works by forwarding your original files. Please, **do not delete the messages you send here**. If you delete them, they will be removed from your inventory."
-        await message.answer(msg, parse_mode="Markdown")
+        is_new = True
+
+    # 4. Control de Spam para Álbumes
+    if is_new:
+        group_id = message.media_group_id
+        send_reply = True
+        
+        if group_id:
+            if group_id in processed_albums:
+                send_reply = False
+            else:
+                processed_albums.add(group_id)
+                if len(processed_albums) > 1000: # Auto-limpieza de memoria
+                    processed_albums.clear()
+        
+        if send_reply:
+            if group_id: await asyncio.sleep(0.5) # Le damos medio segundo para que la DB cuente bien el total del álbum
+            total = await db.inventory.count_documents({"user_id": user_id})
+            msg = f"📥 **Archivo(s) guardado(s).** (Total: {total})\n\n⚠️ **Importante:** El bot funciona reenviando tus archivos originales. Por favor, **no elimines los mensajes que subas a este chat**. Si los borras, se eliminarán automáticamente de tu inventario." if lang == "es" else f"📥 **File(s) saved.** (Total: {total})\n\n⚠️ **Important:** The bot works by forwarding your original files. Please, **do not delete the messages you send here**. If you delete them, they will be removed from your inventory."
+            await message.answer(msg, parse_mode="Markdown")
 
 # --- INTERCAMBIO Y ESCROW ---
 async def get_random_batch(db, sender_id: int, receiver_id: int, category: str, amount: int):
