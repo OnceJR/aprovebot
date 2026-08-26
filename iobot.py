@@ -713,12 +713,34 @@ async def relay_msg(message: Message):
         try: await message.forward(target)
         except: pass
 
+# --- CEREBRO DEL BOT SECUNDARIO ---
+dp_backup = Dispatcher(storage=MemoryStorage())
+
+@dp_backup.message(CommandStart())
+async def cmd_backup_start(message: Message):
+    await message.answer("✅ **¡Hola! Soy tu bot de respaldo.**\n\nEstoy activo, conectado a la base de datos y listo para recibir los archivos del bot principal. No necesitas enviarme comandos por aquí, yo me encargo del resto. 📦")
+dp_backup = Dispatcher(storage=MemoryStorage())
+
+# --- ARRANQUE DE AMBOS BOTS ---
 async def main():
     dp.include_router(router)
     await setup_bot_commands(bot)
     await start_web_server()
+    
+    # Iniciamos la cola de trabajos en segundo plano
     asyncio.create_task(backup_worker())
-    await dp.start_polling(bot)
+    
+    # Limpiamos conexiones trabadas por si acaso
+    await bot.delete_webhook(drop_pending_updates=True)
+    await bot_backup.delete_webhook(drop_pending_updates=True)
+    
+    print("🤖 ¡Bot principal y bot de respaldo iniciados y escuchando!")
+    
+    # Hacemos que AMBOS bots escuchen mensajes al mismo tiempo
+    await asyncio.gather(
+        dp.start_polling(bot),
+        dp_backup.start_polling(bot_backup)
+    )
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
