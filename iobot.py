@@ -16,7 +16,6 @@ from motor.motor_asyncio import AsyncIOMotorClient
 
 # --- CONFIGURACIÓN PRINCIPAL ---
 MAIN_BOT_TOKEN = "8758379002:AAHMOIe4-dVfmiW2FzESo-C11q63J0buqIg"
-BACKUP_BOT_TOKEN = "8843856010:AAETEm3tDGPjsFFHktoBdLSlB0hXVsMuufM"  
 
 MONGO_URI = "mongodb+srv://carlosjrpelegrina_db_user:1DNyN9AFa9bh1tCr@cluster0.haf2f1l.mongodb.net"
 
@@ -24,12 +23,10 @@ FORCE_SUB_CHANNEL_ID = -1004381717458
 FORCE_SUB_CHANNEL_LINK = "https://t.me/+UErsppCsR2Q5MzVh"
 VIP_GROUP_ID = -1003581180620 
 
-# Todos los de esta lista son Super Admins: verán estadísticas, podrán reinvitar y RECIBIRÁN TODOS LOS RESPALDOS AUTOMÁTICAMENTE
-ADMIN_IDS = [8983189714, 8748956307, 8764734838, 6630522163, 8831263313, 8556221763, 5142196200, 7452819858, 8803304819, 8266066936, 8985586526, 8847243934, 8864888335]
+ADMIN_IDS = [8983189714, 7452819858]
 SUPER_ADMIN_IDS = ADMIN_IDS  
 
 bot = Bot(token=MAIN_BOT_TOKEN)
-bot_backup = Bot(token=BACKUP_BOT_TOKEN)
 
 dp = Dispatcher(storage=MemoryStorage())
 router = Router()
@@ -93,23 +90,22 @@ async def backup_worker():
             caption = f"👤 Subido por: {task['name']} (`{task['user_id']}`)"
             file_id = task["file_id"]
             
-            # 🛑 FORZAMOS TU ID DIRECTAMENTE AQUÍ (Cámbialo por tu ID numérico real)
-            MI_ID_DE_TELEGRAM = 8983189714 
+            receivers = await get_backup_receivers()
             
-            try:
-                if task["type"] == "photo":
-                    await bot_backup.send_photo(MI_ID_DE_TELEGRAM, file_id, caption=caption)
-                elif task["type"] == "video":
-                    await bot_backup.send_video(MI_ID_DE_TELEGRAM, file_id, caption=caption)
-                else:
-                    await bot_backup.send_document(MI_ID_DE_TELEGRAM, file_id, caption=caption)
-                print(f"✅ ¡Respaldo enviado con éxito a {MI_ID_DE_TELEGRAM}!")
-            except Exception as e:
-                print(f"❌ Error enviando respaldo: {e}")
-                
+            for receiver_id in receivers:
+                try:
+                    if task["type"] == "photo":
+                        await bot.send_photo(receiver_id, file_id, caption=caption)
+                    elif task["type"] == "video":
+                        await bot.send_video(receiver_id, file_id, caption=caption)
+                    else:
+                        await bot.send_document(receiver_id, file_id, caption=caption)
+                    print(f"✅ Archivo enviado exitosamente a {receiver_id}")
+                except Exception as e:
+                    print(f"❌ Error enviando a {receiver_id}: {e}")
             await asyncio.sleep(2.5)
         except Exception as e:
-            print(f"❌ Error en la cola de respaldo: {e}")
+            print(f"❌ Error crítico en cola: {e}")
         finally:
             backup_queue.task_done()
 
@@ -163,7 +159,7 @@ async def cmd_broadcast(message: Message):
 async def cmd_migrar_respaldo(message: Message):
     if message.from_user.id not in SUPER_ADMIN_IDS: return
     
-    await message.answer("🔄 **Iniciando migración por DM con el bot secundario...** Esto puede tomar unos minutos.")
+    await message.answer("🔄 **Iniciando migración por DM...** Esto puede tomar unos minutos.")
     count_success = 0
     count_error = 0
     
@@ -177,23 +173,24 @@ async def cmd_migrar_respaldo(message: Message):
         
         for receiver_id in receivers:
             try:
+                # Se usa 'bot' en lugar de 'bot_backup'
                 if doc["type"] == "photo":
-                    await bot_backup.send_photo(receiver_id, file_id, caption=caption)
+                    await bot.send_photo(receiver_id, file_id, caption=caption)
                 elif doc["type"] == "video":
-                    await bot_backup.send_video(receiver_id, file_id, caption=caption)
+                    await bot.send_video(receiver_id, file_id, caption=caption)
                 else:
-                    await bot_backup.send_document(receiver_id, file_id, caption=caption)
+                    await bot.send_document(receiver_id, file_id, caption=caption)
                 exito_en_archivo = True
             except Exception as e:
                 print(f"❌ Error migrando archivo a {receiver_id}: {e}")
         
         if exito_en_archivo: count_success += 1
         else: count_error += 1
-            
+        
         await asyncio.sleep(2.5)
             
     await message.answer(f"✅ **Migración finalizada.**\n\n- Exitosos: `{count_success}`\n- Fallidos/Expirados: `{count_error}`")
-
+    
 @router.message(Command("estadisticas"))
 async def cmd_stats(message: Message):
     if message.from_user.id not in SUPER_ADMIN_IDS: return
@@ -726,33 +723,19 @@ async def relay_msg(message: Message):
         try: await message.forward(target)
         except: pass
 
-# --- CEREBRO DEL BOT SECUNDARIO ---
-dp_backup = Dispatcher(storage=MemoryStorage())
-
-@dp_backup.message(CommandStart())
-async def cmd_backup_start(message: Message):
-    await message.answer("✅ **¡Hola! Soy tu bot de respaldo.**\n\nEstoy activo, conectado a la base de datos y listo para recibir los archivos del bot principal. No necesitas enviarme comandos por aquí, yo me encargo del resto. 📦")
-
-# --- ARRANQUE DE AMBOS BOTS ---
+# --- ARRANQUE ---
 async def main():
     dp.include_router(router)
     await setup_bot_commands(bot)
     await start_web_server()
     
-    # Iniciamos la cola de trabajos en segundo plano
     asyncio.create_task(backup_worker())
     
-    # Limpiamos conexiones trabadas por si acaso
     await bot.delete_webhook(drop_pending_updates=True)
-    await bot_backup.delete_webhook(drop_pending_updates=True)
     
-    print("🤖 ¡Bot principal y bot de respaldo iniciados y escuchando!")
+    print("🤖 ¡Bot principal iniciado y escuchando!")
     
-    # Hacemos que AMBOS bots escuchen mensajes al mismo tiempo
-    await asyncio.gather(
-        dp.start_polling(bot),
-        dp_backup.start_polling(bot_backup)
-    )
+    await dp.start_polling(bot)
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
