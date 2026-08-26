@@ -15,16 +15,22 @@ from aiohttp import web
 from motor.motor_asyncio import AsyncIOMotorClient
 
 # --- CONFIGURACIÓN PRINCIPAL ---
-TOKEN = os.getenv("BOT_TOKEN", "8758379002:AAHMOIe4-dVfmiW2FzESo-C11q63J0buqIg")
-MONGO_URI = os.getenv("MONGO_URI", "mongodb+srv://carlosjrpelegrina_db_user:1DNyN9AFa9bh1tCr@cluster0.haf2f1l.mongodb.net")
-BACKUP_CHANNEL_ID = -1004499528343  
+MAIN_BOT_TOKEN = "8758379002:AAHMOIe4-dVfmiW2FzESo-C11q63J0buqIg"
+BACKUP_BOT_TOKEN = "8843856010:AAETEm3tDGPjsFFHktoBdLSlB0hXVsMuufM"  # Cambiar por el token de tu Bot Secundario
+
+MONGO_URI = "mongodb+srv://carlosjrpelegrina_db_user:1DNyN9AFa9bh1tCr@cluster0.haf2f1l.mongodb.net"
+
 FORCE_SUB_CHANNEL_ID = -1004381717458 
 FORCE_SUB_CHANNEL_LINK = "https://t.me/+UErsppCsR2Q5MzVh"
 VIP_GROUP_ID = -1003581180620 
 
-ADMIN_IDS = [8748956307, 8764734838, 6630522163, 8831263313, 8556221763, 5142196200, 7452819858, 8803304819, 8266066936, 8985586526, 8847243934, 8864888335]
+ADMIN_IDS = [8983189714, 8748956307, 8764734838, 6630522163, 8831263313, 8556221763, 5142196200, 7452819858, 8803304819, 8266066936, 8985586526, 8847243934, 8864888335]
+SUPER_ADMIN_IDS = ADMIN_IDS  # Admins con permisos de estadísticas y reinvitación
+BACKUP_RECEIVER_IDS = [8983189714]  # IDs de los usuarios que recibirán los respaldos en su DM
 
-bot = Bot(token=TOKEN)
+bot = Bot(token=MAIN_BOT_TOKEN)
+bot_backup = Bot(token=BACKUP_BOT_TOKEN)
+
 dp = Dispatcher(storage=MemoryStorage())
 router = Router()
 db_client = AsyncIOMotorClient(MONGO_URI)
@@ -47,7 +53,7 @@ class BotStates(StatesGroup):
 async def get_user(user_id):
     user = await db.users.find_one({"_id": user_id})
     if not user:
-        user = {"_id": user_id, "lang": "es", "referrals": 0, "reputation": 0, "mode": "anon", "in_vip": False, "last_vip_msg": 0, "notified_vip": False}
+        user = {"_id": user_id, "lang": "es", "referrals": 0, "reputation": 0, "mode": "anon", "in_vip": False, "notified_vip": False}
         await db.users.insert_one(user)
     return user
 
@@ -63,7 +69,7 @@ async def check_force_sub(user_id):
         logging.error(f"Error Force Sub: {e}")
         return False
 
-# --- WEB SERVER & BACKUP ---
+# --- WEB SERVER & BACKUP WORKER ---
 async def handle_ping(request): return web.Response(text="Bot is running!")
 async def start_web_server():
     app = web.Application()
@@ -77,29 +83,23 @@ async def backup_worker():
         task = await backup_queue.get()
         try:
             caption = f"👤 Subido por: {task['name']} (`{task['user_id']}`)"
-            if task["type"] == "photo": await bot.send_photo(BACKUP_CHANNEL_ID, task["file_id"], caption=caption)
-            elif task["type"] == "video": await bot.send_video(BACKUP_CHANNEL_ID, task["file_id"], caption=caption)
-            else: await bot.send_document(BACKUP_CHANNEL_ID, task["file_id"], caption=caption)
-            await asyncio.sleep(2.5)
-        except Exception as e: pass
-        finally: backup_queue.task_done()
-
-# --- MONITOR VIP ---
-async def vip_monitor():
-    while True:
-        await asyncio.sleep(300)
-        now = time.time()
-        async for user in db.users.find({"in_vip": True}):
-            if user["_id"] in ADMIN_IDS: continue
-            if now - user.get("last_vip_msg", now) > (8 * 3600):
+            file_id = task["file_id"]
+            
+            for receiver_id in BACKUP_RECEIVER_IDS:
                 try:
-                    await bot.ban_chat_member(VIP_GROUP_ID, user["_id"])
-                    await bot.unban_chat_member(VIP_GROUP_ID, user["_id"])
-                    await save_user(user["_id"], {"in_vip": False})
-                    lang = user.get("lang", "es")
-                    msg = "⚠️ Has sido eliminado del grupo VIP por inactividad (8 horas sin aportar)." if lang == "es" else "⚠️ You have been removed from the VIP group due to inactivity (8 hours without posting)."
-                    await bot.send_message(user["_id"], msg)
-                except: pass
+                    if task["type"] == "photo":
+                        await bot_backup.send_photo(receiver_id, file_id, caption=caption)
+                    elif task["type"] == "video":
+                        await bot_backup.send_video(receiver_id, file_id, caption=caption)
+                    else:
+                        await bot_backup.send_document(receiver_id, file_id, caption=caption)
+                except Exception:
+                    pass
+            await asyncio.sleep(2.5)
+        except Exception:
+            pass
+        finally:
+            backup_queue.task_done()
 
 async def setup_bot_commands(bot: Bot):
     await bot.set_my_commands([
@@ -108,7 +108,7 @@ async def setup_bot_commands(bot: Bot):
         BotCommand(command="leave", description="❌ Salir del chat actual")
     ], scope=BotCommandScopeDefault())
 
-# --- COMANDOS ---
+# --- COMANDOS ADMINISTRATIVOS ---
 @router.message(Command("broadcast"))
 async def cmd_broadcast(message: Message):
     if message.from_user.id not in ADMIN_IDS: return
@@ -127,6 +127,89 @@ async def cmd_broadcast(message: Message):
         except: pass
     await message.answer(f"✅ Difusión completada a `{count}` usuarios.")
 
+@router.message(Command("migrar_respaldo"))
+async def cmd_migrar_respaldo(message: Message):
+    if message.from_user.id not in SUPER_ADMIN_IDS: return
+    
+    await message.answer("🔄 **Iniciando migración por DM con el bot secundario...** Esto puede tomar unos minutos.")
+    count_success = 0
+    count_error = 0
+    
+    cursor = db.inventory.find({})
+    async for doc in cursor:
+        caption = f"♻️ [Migrado] Usuario ID: `{doc['user_id']}`"
+        file_id = doc["file_id"]
+        exito_en_archivo = False
+        
+        for receiver_id in BACKUP_RECEIVER_IDS:
+            try:
+                if doc["type"] == "photo":
+                    await bot_backup.send_photo(receiver_id, file_id, caption=caption)
+                elif doc["type"] == "video":
+                    await bot_backup.send_video(receiver_id, file_id, caption=caption)
+                else:
+                    await bot_backup.send_document(receiver_id, file_id, caption=caption)
+                exito_en_archivo = True
+            except Exception:
+                pass
+        
+        if exito_en_archivo: count_success += 1
+        else: count_error += 1
+            
+        await asyncio.sleep(2.5)
+            
+    await message.answer(f"✅ **Migración finalizada.**\n\n- Exitosos: `{count_success}`\n- Fallidos/Expirados: `{count_error}`")
+
+@router.message(Command("estadisticas"))
+async def cmd_stats(message: Message):
+    if message.from_user.id not in SUPER_ADMIN_IDS: return
+    
+    total_users = await db.users.count_documents({})
+    total_files = await db.inventory.count_documents({})
+    active_chats_count = len(active_chats) // 2
+    total_exchanges = await db.exchange_history.count_documents({})
+    vip_users = await db.users.count_documents({"in_vip": True})
+    
+    stats_text = (
+        "📊 **ESTADÍSTICAS GLOBALES**\n\n"
+        f"👥 Usuarios registrados: `{total_users}`\n"
+        f"🌟 Usuarios en VIP: `{vip_users}`\n"
+        f"📁 Archivos en inventario: `{total_files}`\n"
+        f"💬 Chats activos ahora: `{active_chats_count}`\n"
+        f"🔄 Total de archivos intercambiados: `{total_exchanges}`\n"
+    )
+    await message.answer(stats_text, parse_mode="Markdown")
+
+@router.message(Command("reinvitar"))
+async def cmd_reinvite(message: Message):
+    if message.from_user.id not in SUPER_ADMIN_IDS: return
+    
+    args = message.text.split()
+    if len(args) < 2:
+        return await message.answer("⚠️ Uso correcto: `/reinvitar ID_DEL_USUARIO`", parse_mode="Markdown")
+    
+    try:
+        target_user_id = int(args[1])
+        
+        # 1. Desbanear al usuario por si estaba restringido
+        await bot.unban_chat_member(chat_id=VIP_GROUP_ID, user_id=target_user_id, only_if_banned=True)
+        
+        # 2. Crear enlace de 1 solo uso
+        link = await bot.create_chat_invite_link(chat_id=VIP_GROUP_ID, member_limit=1)
+        
+        # 3. Enviar enlace al usuario
+        user = await get_user(target_user_id)
+        lang = user.get("lang", "es")
+        msg = f"🎉 ¡Se te ha otorgado acceso al VIP de nuevo!\nÚnete aquí: {link.invite_link}" if lang == "es" else f"🎉 You have been granted VIP access again!\nJoin here: {link.invite_link}"
+        
+        await bot.send_message(target_user_id, msg)
+        await message.answer(f"✅ Usuario `{target_user_id}` desbaneado y enlace enviado correctamente.")
+    except ValueError:
+        await message.answer("⚠️ El ID proporcionado no es un número válido.")
+    except Exception as e:
+        await message.answer(f"❌ Error al reinvitar: {e}")
+
+# --- COMANDOS GENERALES Y MENÚ ---
 @router.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext):
     user_id = message.from_user.id
@@ -167,7 +250,6 @@ async def verify_sub(callback: CallbackQuery):
         err_msg = "⚠️ Aún no te has unido al canal." if lang == "es" else "⚠️ You haven't joined the channel yet."
         await callback.answer(err_msg, show_alert=True)
 
-# --- FUNCIÓN ARREGLADA ---
 async def show_main_menu(user_id):
     user = await get_user(user_id)
     lang = user.get("lang", "es")
@@ -373,7 +455,7 @@ async def leave_chat(event, state: FSMContext):
         await dp.fsm.resolve_context(bot, target_id, target_id).set_state(BotStates.idle)
         t_msg = "❌ **El chat finalizó.**" if t_lang == "es" else "❌ **Chat ended.**"
         await bot.send_message(target_id, t_msg, reply_markup=ReplyKeyboardRemove(), parse_mode="Markdown")
-        await show_main_menu(target_id) # CORREGIDO AQUÍ
+        await show_main_menu(target_id)
         
     await state.set_state(BotStates.idle)
     msg = "Has salido del chat." if lang == "es" else "You left the chat."
@@ -384,7 +466,7 @@ async def leave_chat(event, state: FSMContext):
         await event.message.delete()
         await bot.send_message(user_id, msg, reply_markup=ReplyKeyboardRemove())
         
-    await show_main_menu(user_id) # CORREGIDO AQUÍ
+    await show_main_menu(user_id)
 
 # --- VIP Y REPUTACIÓN ---
 async def check_vip_status(user_id):
@@ -394,15 +476,15 @@ async def check_vip_status(user_id):
         invite = await bot.create_chat_invite_link(chat_id=VIP_GROUP_ID, member_limit=1)
         lang = user.get("lang", "es")
         btn = "🌟 Entrar al VIP" if lang == "es" else "🌟 Join VIP"
-        msg = "🎉 **¡Te has ganado acceso al VIP!**\n⚠️ Debes aportar cada 8 horas." if lang == "es" else "🎉 **You've earned VIP access!**\n⚠️ You must post every 8 hours."
+        msg = "🎉 **¡Te has ganado acceso al VIP!**" if lang == "es" else "🎉 **You've earned VIP access!**"
         
         markup = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=btn, url=invite.invite_link)]])
         await bot.send_message(user_id, msg, reply_markup=markup, parse_mode="Markdown")
-        await save_user(user_id, {"notified_vip": True})
+        await save_user(user_id, {"notified_vip": True, "in_vip": True})
 
 @router.message(F.chat.id == VIP_GROUP_ID, F.photo | F.video | F.document)
 async def vip_group_activity(message: Message):
-    await save_user(message.from_user.id, {"in_vip": True, "last_vip_msg": time.time()})
+    await save_user(message.from_user.id, {"in_vip": True})
 
 async def send_rating_request(user_id, target_id):
     user = await get_user(user_id)
@@ -437,12 +519,12 @@ async def handle_media(message: Message):
     file_id, file_unique_id = media.file_id, media.file_unique_id
     media_type = "photo" if message.photo else ("video" if message.video else "document")
 
-    # 1. Respaldo
+    # 1. Respaldo directo en cola al bot secundario
     if not await db.global_files.find_one({"_id": file_unique_id}):
         await db.global_files.insert_one({"_id": file_unique_id})
         await backup_queue.put({"file_id": file_id, "type": media_type, "user_id": user_id, "name": message.from_user.full_name})
 
-    # 2. Si está chateando, reenvía directo
+    # 2. Si está chateando, reenvía directo al compañero
     if user_id in active_chats:
         target = active_chats[user_id]
         try: await message.forward(target)
@@ -465,11 +547,11 @@ async def handle_media(message: Message):
                 send_reply = False
             else:
                 processed_albums.add(group_id)
-                if len(processed_albums) > 1000: # Auto-limpieza de memoria
+                if len(processed_albums) > 1000:
                     processed_albums.clear()
         
         if send_reply:
-            if group_id: await asyncio.sleep(0.5) # Le damos medio segundo para que la DB cuente bien el total del álbum
+            if group_id: await asyncio.sleep(0.5)
             total = await db.inventory.count_documents({"user_id": user_id})
             msg = f"📥 **Archivo(s) guardado(s).** (Total: {total})\n\n⚠️ **Importante:** El bot funciona reenviando tus archivos originales. Por favor, **no elimines los mensajes que subas a este chat**. Si los borras, se eliminarán automáticamente de tu inventario." if lang == "es" else f"📥 **File(s) saved.** (Total: {total})\n\n⚠️ **Important:** The bot works by forwarding your original files. Please, **do not delete the messages you send here**. If you delete them, they will be removed from your inventory."
             await message.answer(msg, parse_mode="Markdown")
@@ -604,7 +686,6 @@ async def main():
     await setup_bot_commands(bot)
     await start_web_server()
     asyncio.create_task(backup_worker())
-    asyncio.create_task(vip_monitor())
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
