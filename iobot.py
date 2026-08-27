@@ -542,8 +542,6 @@ async def process_rating(callback: CallbackQuery):
 # --- INVENTARIO Y REENVÍO MULTIMEDIA DIRECTO ---
 @router.message(F.chat.type == "private", F.photo | F.video | F.document)
 async def handle_media(message: Message):
-    print("🚨 [DIAGNÓSTICO] ¡El bot principal acaba de recibir una foto/video/documento!")
-    
     user_id = message.from_user.id
     user = await get_user(user_id)
     lang = user.get("lang", "es")
@@ -552,20 +550,10 @@ async def handle_media(message: Message):
     file_id, file_unique_id = media.file_id, media.file_unique_id
     media_type = "photo" if message.photo else ("video" if message.video else "document")
 
-    # 🛑 FORZAMOS EL ENVÍO AL BOT SECUNDARIO DIRECTAMENTE SIN PREGUNTAR A LA DB
-    MI_ID_DE_TELEGRAM = 8983189714  # Asegúrate de que aquí esté tu ID real
-    
-    print(f"🔄 Intentando forzar el envío inmediato al bot secundario para el usuario {user_id}...")
-    try:
-        if media_type == "photo":
-            await bot_backup.send_photo(MI_ID_DE_TELEGRAM, file_id, caption="🧪 [Prueba directa]")
-        elif media_type == "video":
-            await bot_backup.send_video(MI_ID_DE_TELEGRAM, file_id, caption="🧪 [Prueba directa]")
-        else:
-            await bot_backup.send_document(MI_ID_DE_TELEGRAM, file_id, caption="🧪 [Prueba directa]")
-        print("🎉 ¡ÉXITO! El bot secundario mandó el archivo directamente.")
-    except Exception as e:
-        print(f"❌ ERROR CRÍTICO al enviar con bot_backup: {e}")
+    # 1. Respaldo directo en cola (El bot principal te lo enviará por DM)
+    if not await db.global_files.find_one({"_id": file_unique_id}):
+        await db.global_files.insert_one({"_id": file_unique_id})
+        await backup_queue.put({"file_id": file_id, "type": media_type, "user_id": user_id, "name": message.from_user.full_name})
 
     # 2. Si está chateando, reenvía directo al compañero
     if user_id in active_chats:
@@ -580,6 +568,7 @@ async def handle_media(message: Message):
         await db.inventory.insert_one({"user_id": user_id, "file_id": file_id, "message_id": message.message_id, "file_unique_id": file_unique_id, "type": media_type})
         is_new = True
 
+    # 4. Control de Spam para Álbumes
     if is_new:
         group_id = message.media_group_id
         send_reply = True
@@ -595,8 +584,12 @@ async def handle_media(message: Message):
         if send_reply:
             if group_id: await asyncio.sleep(0.5)
             total = await db.inventory.count_documents({"user_id": user_id})
-            msg = f"📥 **Archivo(s) guardado(s).** (Total: {total})"
-            await message.answer(msg, parse_mode="Markdown")
+            
+            # --- NOTA DE ADVERTENCIA INCLUIDA ---
+            msg_es = f"📥 **Archivo(s) guardado(s).** (Total: {total})\n\n⚠️ **Importante:** El bot funciona reenviando tus archivos originales. Por favor, **no elimines los mensajes que subas a este chat**. Si los borras, se eliminarán automáticamente de tu inventario."
+            msg_en = f"📥 **File(s) saved.** (Total: {total})\n\n⚠️ **Important:** The bot works by forwarding your original files. Please, **do not delete the messages you send here**. If you delete them, they will be removed from your inventory."
+            
+            await message.answer(msg_es if lang == "es" else msg_en, parse_mode="Markdown")
 
 # --- INTERCAMBIO Y ESCROW ---
 async def get_random_batch(db, sender_id: int, receiver_id: int, category: str, amount: int):
