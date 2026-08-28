@@ -34,7 +34,6 @@ db_client = AsyncIOMotorClient(MONGO_URI)
 db = db_client.intercambio_bot
 
 active_chats = {}
-waiting_list = {}
 waiting_list = []
 pending_trades = {}
 backup_queue = asyncio.Queue()
@@ -44,6 +43,7 @@ class BotStates(StatesGroup):
     idle = State()
     searching = State()
     chatting = State()
+    waiting_trade_type = State()  # <-- ESTO ES LO NUEVO
     waiting_trade_amount = State()
     waiting_for_id = State()
 
@@ -620,7 +620,12 @@ async def handle_media(message: Message):
 # --- INTERCAMBIO Y ESCROW ---
 async def get_random_batch(db, sender_id: int, receiver_id: int, category: str, amount: int):
     already_sent_ids = [doc["file_unique_id"] async for doc in db.exchange_history.find({"sender_id": sender_id, "receiver_id": receiver_id}, {"file_unique_id": 1, "_id": 0})]
-    pipeline = [{"$match": {"user_id": sender_id, "type": category, "file_unique_id": {"$nin": already_sent_ids}}}, {"$sample": {"size": amount + 15}}]
+    
+    match_query = {"user_id": sender_id, "file_unique_id": {"$nin": already_sent_ids}}
+    if category != "mixed":
+        match_query["type"] = category
+        
+    pipeline = [{"$match": match_query}, {"$sample": {"size": amount + 15}}]
     selected_files = [doc async for doc in db.inventory.aggregate(pipeline)]
     return len(selected_files) >= amount, selected_files
 
@@ -629,38 +634,65 @@ async def btn_propose(message: Message, state: FSMContext):
     user = await get_user(message.from_user.id)
     lang = user.get("lang", "es")
     
+    await state.set_state(BotStates.waiting_trade_type)
+    markup = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📷 Fotos" if lang == "es" else "📷 Photos", callback_data="settype_photo"),
+         InlineKeyboardButton(text="🎥 Videos" if lang == "es" else "🎥 Videos", callback_data="settype_video")],
+        [InlineKeyboardButton(text="🔀 Mixto" if lang == "es" else "🔀 Mixed", callback_data="settype_mixed")]
+    ])
+    msg = "🎬 **¿Qué tipo de archivos deseas intercambiar?**" if lang == "es" else "🎬 **What type of files do you want to trade?**"
+    await message.answer(msg, reply_markup=markup, parse_mode="Markdown")
+
+@router.callback_query(StateFilter(BotStates.waiting_trade_type), F.data.startswith("settype_"))
+async def process_trade_type(callback: CallbackQuery, state: FSMContext):
+    trade_type = callback.data.split("_")[1]
+    await state.update_data(trade_type=trade_type) # Guardamos el tipo de archivo elegido
+    
+    user = await get_user(callback.from_user.id)
+    lang = user.get("lang", "es")
+    
     await state.set_state(BotStates.waiting_trade_amount)
     markup = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="10x10", callback_data="trade_10"), InlineKeyboardButton(text="50x50", callback_data="trade_50"), InlineKeyboardButton(text="100x100", callback_data="trade_100")]
     ])
     msg = "🔢 **¿Cuántos archivos deseas intercambiar?**\n\nSelecciona una opción o **escribe un número** en el chat:" if lang == "es" else "🔢 **How many files do you want to trade?**\n\nSelect an option or **type a number** in the chat:"
-    await message.answer(msg, reply_markup=markup, parse_mode="Markdown")
+    await callback.message.edit_text(msg, reply_markup=markup, parse_mode="Markdown")
 
 @router.message(StateFilter(BotStates.waiting_trade_amount), F.text.regexp(r'^\d+$'))
 async def process_manual_trade_offer(message: Message, state: FSMContext):
-    await execute_trade_proposal(message.from_user.id, int(message.text), message.answer, state)
+    data = await state.get_data()
+    trade_type = data.get("trade_type", "mixed")
+    await execute_trade_proposal(message.from_user.id, int(message.text), trade_type, message.answer, state)
 
 @router.callback_query(StateFilter(BotStates.waiting_trade_amount), F.data.startswith("trade_"))
 async def process_button_trade_offer(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    trade_type = data.get("trade_type", "mixed")
     await callback.message.delete()
-    await execute_trade_proposal(callback.from_user.id, int(callback.data.split("_")[1]), callback.message.answer, state)
+    await execute_trade_proposal(callback.from_user.id, int(callback.data.split("_")[1]), trade_type, callback.message.answer, state)
 
-async def execute_trade_proposal(user_id, amt, send_func, state):
+async def execute_trade_proposal(user_id, amt, trade_type, send_func, state):
     target_id = active_chats.get(user_id)
     if not target_id: return await state.set_state(BotStates.idle)
     
     user = await get_user(user_id)
     t_user = await get_user(target_id)
+    lang = user.get("lang", "es")
+    t_lang = t_user.get("lang", "es")
     
-    pending_trades[target_id] = {"sender": user_id, "amount": amt}
+    pending_trades[target_id] = {"sender": user_id, "amount": amt, "type": trade_type}
     await state.set_state(BotStates.chatting)
     
-    btn_acc = "✅ Aceptar" if t_user.get("lang", "es") == "es" else "✅ Accept"
-    btn_rej = "❌ Rechazar" if t_user.get("lang", "es") == "es" else "❌ Reject"
-    markup = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=btn_acc, callback_data="accept_trade"), InlineKeyboardButton(text=btn_rej, callback_data="reject_trade")]])
+    # Nombres bonitos para el mensaje
+    type_names_es = {"photo": "📷 Fotos", "video": "🎥 Videos", "mixed": "🔀 Mixto"}
+    type_names_en = {"photo": "📷 Photos", "video": "🎥 Videos", "mixed": "🔀 Mixed"}
+    s_type = type_names_es.get(trade_type, "") if lang == "es" else type_names_en.get(trade_type, "")
+    t_type = type_names_es.get(trade_type, "") if t_lang == "es" else type_names_en.get(trade_type, "")
     
-    msg_s = f"⏳ Has propuesto un intercambio de **{amt}x{amt}**. Esperando respuesta..." if user.get("lang", "es") == "es" else f"⏳ You proposed a **{amt}x{amt}** trade. Waiting for response..."
-    msg_t = f"🤝 **¡Nueva Propuesta!**\nTu compañero propone intercambiar **{amt}x{amt}** archivos.\n\n¿Aceptas?" if t_user.get("lang", "es") == "es" else f"🤝 **New Trade Offer!**\nYour partner wants to trade **{amt}x{amt}** files.\n\nDo you accept?"
+    markup = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="✅ Aceptar" if t_lang == "es" else "✅ Accept", callback_data="accept_trade"), InlineKeyboardButton(text="❌ Rechazar" if t_lang == "es" else "❌ Reject", callback_data="reject_trade")]])
+    
+    msg_s = f"⏳ Has propuesto un intercambio de **{amt}x{amt}** ({s_type}). Esperando respuesta..." if lang == "es" else f"⏳ You proposed a **{amt}x{amt}** trade ({s_type}). Waiting for response..."
+    msg_t = f"🤝 **¡Nueva Propuesta!**\nTu compañero propone intercambiar **{amt}x{amt}** ({t_type}).\n\n¿Aceptas?" if t_lang == "es" else f"🤝 **New Trade Offer!**\nYour partner wants to trade **{amt}x{amt}** ({t_type}).\n\nDo you accept?"
     
     await send_func(msg_s, parse_mode="Markdown")
     await bot.send_message(target_id, msg_t, reply_markup=markup, parse_mode="Markdown")
@@ -671,48 +703,44 @@ async def accept_trade(callback: CallbackQuery):
     trade = pending_trades.pop(user_id, None)
     if not trade: return
     
-    sender_id, amt = trade["sender"], trade["amount"]
+    sender_id, amt, trade_type = trade["sender"], trade["amount"], trade.get("type", "mixed")
     user = await get_user(user_id)
     s_user = await get_user(sender_id)
     lang, s_lang = user.get("lang", "es"), s_user.get("lang", "es")
     
     await callback.message.edit_text("✅ Comprobando inventarios..." if lang == "es" else "✅ Checking inventories...")
     
-    success_sender, files_sender = await get_random_batch(db, sender_id, user_id, "photo", amt)
-    success_receiver, files_receiver = await get_random_batch(db, user_id, sender_id, "photo", amt)
+    success_sender, files_sender = await get_random_batch(db, sender_id, user_id, trade_type, amt)
+    success_receiver, files_receiver = await get_random_batch(db, user_id, sender_id, trade_type, amt)
     
     if not success_sender or not success_receiver:
-        await callback.message.edit_text("⚠️ Intercambio cancelado. Uno de los dos no tiene suficientes archivos NUEVOS." if lang == "es" else "⚠️ Trade canceled. One of you doesn't have enough NEW files.")
-        return await bot.send_message(sender_id, "⚠️ Intercambio cancelado. Uno de los dos no tiene suficientes archivos NUEVOS." if s_lang == "es" else "⚠️ Trade canceled. One of you doesn't have enough NEW files.")
+        msg_err_es = "⚠️ Intercambio cancelado. Uno de los dos no tiene suficientes archivos NUEVOS del tipo seleccionado."
+        msg_err_en = "⚠️ Trade canceled. One of you doesn't have enough NEW files of the selected type."
+        await callback.message.edit_text(msg_err_es if lang == "es" else msg_err_en)
+        return await bot.send_message(sender_id, msg_err_es if s_lang == "es" else msg_err_en)
 
     await callback.message.edit_text("✅ Aceptado. Procesando envío..." if lang == "es" else "✅ Accepted. Processing batch...")
     await bot.send_message(sender_id, "✅ Aceptado. Procesando envío..." if s_lang == "es" else "✅ Accepted. Processing batch...")
     
-    sent_1 = 0
-    for f in files_sender:
-        if sent_1 >= amt: break
+    for f in files_sender[:amt]:
         try:
             await bot.forward_message(chat_id=user_id, from_chat_id=sender_id, message_id=f["message_id"])
             await db.exchange_history.insert_one({"sender_id": sender_id, "receiver_id": user_id, "file_unique_id": f["file_unique_id"]})
-            sent_1 += 1
         except Exception: await db.inventory.delete_one({"file_unique_id": f["file_unique_id"]})
         await asyncio.sleep(0.05)
         
-    sent_2 = 0
-    for f in files_receiver:
-        if sent_2 >= amt: break
+    for f in files_receiver[:amt]:
         try:
             await bot.forward_message(chat_id=sender_id, from_chat_id=user_id, message_id=f["message_id"])
             await db.exchange_history.insert_one({"sender_id": user_id, "receiver_id": sender_id, "file_unique_id": f["file_unique_id"]})
-            sent_2 += 1
         except Exception: await db.inventory.delete_one({"file_unique_id": f["file_unique_id"]})
         await asyncio.sleep(0.05)
         
-    msg_ok = f"🎉 **¡Intercambio finalizado!**\n\n💡 **Sugerencia de seguridad:** Para no perder este contenido, guárdalo en tus **Mensajes Guardados**." if lang == "es" else f"🎉 **Trade completed!**\n\n💡 **Security tip:** Save this content in your **Saved Messages** so you don't lose it."
-    s_msg_ok = f"🎉 **¡Intercambio finalizado!**\n\n💡 **Sugerencia de seguridad:** Para no perder este contenido, guárdalo en tus **Mensajes Guardados**." if s_lang == "es" else f"🎉 **Trade completed!**\n\n💡 **Security tip:** Save this content in your **Saved Messages** so you don't lose it."
+    msg_ok_es = "🎉 **¡Intercambio finalizado!**\n\n💡 **Sugerencia de seguridad:** Para no perder este contenido, guárdalo en tus **Mensajes Guardados**."
+    msg_ok_en = "🎉 **Trade completed!**\n\n💡 **Security tip:** Save this content in your **Saved Messages** so you don't lose it."
     
-    await bot.send_message(user_id, msg_ok, parse_mode="Markdown")
-    await bot.send_message(sender_id, s_msg_ok, parse_mode="Markdown")
+    await bot.send_message(user_id, msg_ok_es if lang == "es" else msg_ok_en, parse_mode="Markdown")
+    await bot.send_message(sender_id, msg_ok_es if s_lang == "es" else msg_ok_en, parse_mode="Markdown")
     
     await send_rating_request(user_id, sender_id)
     await send_rating_request(sender_id, user_id)
