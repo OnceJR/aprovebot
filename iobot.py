@@ -299,7 +299,19 @@ async def show_main_menu(user_id):
         [InlineKeyboardButton(text=btn_share, url=f"https://t.me/share/url?url={my_link}")]
     ])
     
-    text = "👋 **¡Bienvenido!**\nSube material para guardarlo en tu caja fuerte, o conéctate con alguien para intercambiar." if lang == "es" else "👋 **Welcome!**\nUpload media to save it in your vault, or connect with someone to trade."
+    if lang == "es":
+        text = (
+            "👋 **¡Bienvenido a la red de intercambio!**\n\n"
+            "⚠️ **REQUISITO CLAVE:** Para que el bot funcione y puedas participar, **debes subir tus videos o fotos directamente a este chat** para llenar tu inventario. ¡Sin material propio no hay intercambios!\n\n"
+            "Sube tus archivos ahora para guardarlos en tu caja fuerte secreta, o busca a un compañero para empezar a tradear. 🚀"
+        )
+    else:
+        text = (
+            "👋 **Welcome to the exchange network!**\n\n"
+            "⚠️ **KEY REQUIREMENT:** For the bot to work and for you to participate, you **must upload your videos or photos directly to this chat** to fill your inventory. No personal media means no trading!\n\n"
+            "Send your files now to save them in your secure vault, or find a partner to start trading. 🚀"
+        )
+        
     await bot.send_message(chat_id=user_id, text=text, reply_markup=markup, parse_mode="Markdown")
 
 @router.message(Command("help"))
@@ -308,12 +320,26 @@ async def cmd_help(message: Message):
     lang = user.get("lang", "es")
     
     if lang == "es":
-        help_text = "🤖 **Guía Completa**\n\n📦 **1. Tu Inventario:** Envía archivos a este chat para guardarlos (solo si no estás emparejado).\n⚠️ **Importante:** No elimines los mensajes que envíes. El bot funciona reenviándolos.\n\n💬 **2. Chatear:** Conecta con alguien al azar o por su ID. El material enviado aquí va directo a tu compañero.\n🤝 **3. Lotes:** Usa 'Proponer Intercambio' para mandar ráfagas sin repetidos.\n🌟 **4. VIP:** Gana 15 de reputación o invita 3 amigos para entrar al grupo exclusivo."
+        help_text = (
+            "🤖 **Guía Completa de Uso**\n\n"
+            "📦 **1. Carga tu inventario (Obligatorio):** Envía tus videos y fotos directamente a este chat. **Debes subir material al bot para poder intercambiar con otros.**\n"
+            "⚠️ *Aviso crítico:* El bot funciona reenviando tus archivos originales. Si eliminas el mensaje que enviaste aquí, se borrará de tu caja fuerte para siempre.\n\n"
+            "💬 **2. Inicia un Chat:** Conecta con alguien al azar o búscalo por su ID secreto. Todo lo que envíes en modo chat le llegará a tu compañero al instante.\n\n"
+            "🤝 **3. Intercambios en Lote:** Usa el botón 'Proponer Intercambio' dentro del chat para enviar ráfagas automáticas de archivos sin repetir ninguno.\n\n"
+            "🌟 **4. Acceso VIP:** Gana 15 puntos de reputación (recibiendo buenas valoraciones de tus compañeros) o invita a 3 amigos usando tu link para desbloquear el grupo exclusivo."
+        )
     else:
-        help_text = "🤖 **Complete Guide**\n\n📦 **1. Inventory:** Send files here to save them (only if you are not in a chat).\n⚠️ **Important:** Do not delete the messages you send. The bot works by forwarding them.\n\n💬 **2. Chatting:** Connect randomly or via ID. Media sent here goes directly to your partner.\n🤝 **3. Batches:** Use 'Propose Trade' to send bursts of unique files.\n🌟 **4. VIP:** Earn 15 rep points or invite 3 friends for VIP access."
+        help_text = (
+            "🤖 **Complete User Guide**\n\n"
+            "📦 **1. Load your inventory (Mandatory):** Send your videos and photos directly to this chat. **You must upload media to the bot to be able to trade with others.**\n"
+            "⚠️ *Critical warning:* The bot works by forwarding your original files. If you delete the message you sent here, it will be wiped from your vault forever.\n\n"
+            "💬 **2. Start a Chat:** Connect with someone randomly or via their secret ID. Everything you send in chat mode goes instantly to your partner.\n\n"
+            "🤝 **3. Batch Trades:** Use the 'Propose Trade' button inside the chat to send automatic bursts of unique files.\n\n"
+            "🌟 **4. VIP Access:** Earn 15 reputation points (by receiving good ratings from partners) or invite 3 friends using your link to unlock the exclusive group."
+        )
         
     await message.answer(help_text, parse_mode="Markdown")
-
+    
 # --- PERFIL E IDIOMA ---
 @router.callback_query(F.data == "change_lang")
 async def change_lang(callback: CallbackQuery):
