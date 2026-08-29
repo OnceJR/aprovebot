@@ -33,7 +33,7 @@ bot = Bot(token=MAIN_BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 router = Router()
 db_client = AsyncIOMotorClient(MONGO_URI)
-db = db_client.intercambio_bot_v2
+db = db_client.intercambio_bot_v3
 
 active_chats = {}
 waiting_list = {} # Convertido a dict para manejar idiomas si se desea en el futuro, pero lo usaremos como list
@@ -202,12 +202,54 @@ async def handle_webapp(request):
             .btn-main {{ background: var(--accent); color: var(--accent-txt); border: none; border-radius: 12px; padding: 12px; width: 100%; font-size: 14px; font-weight: bold; cursor: pointer; }}
             .btn-danger {{ background: rgba(255,77,79,0.1); color: #ff4d4f; border: 1px solid #ff4d4f; }}
             
-            /* RULETA CSS */
-            .roulette-box {{ background: #111; padding: 20px; border-radius: 16px; text-align: center; border: 2px solid var(--accent); overflow: hidden; position: relative; }}
-            .roulette-window {{ width: 80px; height: 80px; margin: 0 auto 16px auto; background: #222; border-radius: 12px; border: 2px solid #FFD700; overflow: hidden; position: relative; display: flex; align-items: center; justify-content: center; }}
-            .roulette-track {{ display: flex; flex-direction: column; transition: transform 3s cubic-bezier(0.15, 0.9, 0.2, 1); }}
-            .roulette-item {{ width: 80px; height: 80px; display: flex; align-items: center; justify-content: center; font-size: 32px; font-weight: 900; color: #fff; }}
-            .pointer {{ position: absolute; right: -5px; top: 50%; transform: translateY(-50%); width: 0; height: 0; border-top: 10px solid transparent; border-bottom: 10px solid transparent; border-right: 15px solid #FFD700; z-index: 10; }}
+            /* RULETA CSS CORREGIDA */
+            .roulette-box {{ background: #111; padding: 20px; border-radius: 16px; text-align: center; border: 2px solid var(--accent); position: relative; }}
+            .roulette-window {{ 
+                width: 100px; 
+                height: 100px; 
+                margin: 0 auto 16px auto; 
+                background: #222; 
+                border-radius: 16px; 
+                border: 3px solid #FFD700; 
+                overflow: hidden; 
+                position: relative; 
+                box-shadow: 0 0 15px rgba(255, 215, 0, 0.2);
+            }
+            .roulette-window::after {{
+                content: '';
+                position: absolute;
+                top: 0; left: 0; right: 0; bottom: 0;
+                box-shadow: inset 0px 20px 15px -10px rgba(0,0,0,0.9), inset 0px -20px 15px -10px rgba(0,0,0,0.9);
+                pointer-events: none;
+            }}
+            .roulette-track {{ 
+                display: flex; 
+                flex-direction: column; 
+                width: 100%; 
+            }
+            .roulette-item {{ 
+                width: 100%; 
+                height: 100px; 
+                flex-shrink: 0; 
+                display: flex; 
+                align-items: center; 
+                justify-content: center; 
+                font-size: 42px; 
+                font-weight: 900; 
+                color: #fff; 
+            }
+            .pointer {{ 
+                position: absolute; 
+                right: -2px; 
+                top: 50%; 
+                transform: translateY(-50%); 
+                width: 0; 
+                height: 0; 
+                border-top: 12px solid transparent; 
+                border-bottom: 12px solid transparent; 
+                border-right: 18px solid #FFD700; 
+                z-index: 10; 
+            }}
             
             /* MERCADO & RANKING */
             .list-item {{ background: rgba(255,255,255,0.05); padding: 12px; border-radius: 12px; margin-bottom: 8px; display: flex; justify-content: space-between; align-items: center; border-left: 3px solid var(--accent); }}
@@ -314,11 +356,19 @@ async def handle_webapp(request):
                 element.classList.add('active');
             }}
 
-            // RULETA LOGICA
+            // RULETA LOGICA CORREGIDA
             let rTrack = document.getElementById('r-track');
+            
             function initRoulette() {{
+                rTrack.style.transition = 'none';
+                rTrack.style.transform = 'translateY(0)';
                 rTrack.innerHTML = "";
-                // Crear 30 números falsos aleatorios para el efecto de giro
+                
+                let startDiv = document.createElement('div');
+                startDiv.className = 'roulette-item';
+                startDiv.innerText = "🎁";
+                rTrack.appendChild(startDiv);
+
                 for(let i=0; i<30; i++) {{
                     let div = document.createElement('div');
                     div.className = 'roulette-item';
@@ -360,33 +410,34 @@ async def handle_webapp(request):
                 let data = await res.json();
                 
                 if(data.success) {{
-                    // Preparamos el elemento ganador al final de la pista
                     let targetNum = data.bonus;
+                    
                     let winDiv = document.createElement('div');
                     winDiv.className = 'roulette-item';
                     winDiv.style.color = '#FFD700';
-                    winDiv.innerText = targetNum;
+                    winDiv.style.textShadow = '0 0 15px rgba(255, 215, 0, 0.6)';
+                    winDiv.innerText = "+" + targetNum;
                     rTrack.appendChild(winDiv);
                     
-                    // Animación de giro
-                    let itemHeight = 80;
+                    void rTrack.offsetWidth; 
+                    
+                    let itemHeight = 100;
                     let scrollAmount = -((rTrack.children.length - 1) * itemHeight);
+                    
+                    rTrack.style.transition = 'transform 3s cubic-bezier(0.15, 0.9, 0.2, 1)';
                     rTrack.style.transform = `translateY(${{scrollAmount}}px)`;
                     
                     setTimeout(() => {{
                         tg.HapticFeedback.notificationOccurred('success');
                         confetti({{ particleCount: 150, spread: 70, origin: {{ y: 0.6 }} }});
-                        tg.showAlert(`🎉 ¡La ruleta paró en ${{targetNum}}!\nHas ganado ${{targetNum}} Puntos de Reputación.`);
+                        tg.showAlert(`🎉 ¡Felicidades!\nHas ganado ${{targetNum}} Puntos de Reputación.`);
                         loadData();
-                        setTimeout(() => {{ 
-                            rTrack.style.transition = 'none';
-                            rTrack.style.transform = 'translateY(0)';
-                            initRoulette(); 
-                            setTimeout(() => rTrack.style.transition = 'transform 3s cubic-bezier(0.15, 0.9, 0.2, 1)', 50);
-                        }}, 2000);
-                    }}, 3000); // Tarda 3 seg en girar
+                        
+                        setTimeout(() => {{ initRoulette(); }}, 3000);
+                    }}, 3000); 
                 }} else {{
                     tg.showAlert("⚠️ Aún debes esperar.");
+                    document.getElementById("btn-spin").disabled = false;
                 }}
             }}
 
@@ -406,7 +457,6 @@ async def handle_webapp(request):
                 
                 updateBonusUI(data.time_left);
                 
-                // Cargar Ranking
                 let rHTML = "";
                 data.leaderboard.forEach((u, i) => {{
                     let medal = i==0?"🥇":i==1?"🥈":i==2?"🥉":"🏅";
@@ -414,7 +464,6 @@ async def handle_webapp(request):
                 }});
                 document.getElementById("ranking-list").innerHTML = rHTML || "No hay jugadores aún.";
 
-                // Cargar Mercado
                 let oHTML = "";
                 data.offers.forEach(o => {{
                     oHTML += `
