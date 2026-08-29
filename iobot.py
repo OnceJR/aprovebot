@@ -33,7 +33,7 @@ bot = Bot(token=MAIN_BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 router = Router()
 db_client = AsyncIOMotorClient(MONGO_URI)
-db = db_client.intercambio_bot_v3
+db = db_client.intercambio_bot_v2
 
 active_chats = {}
 waiting_list = {} # Convertido a dict para manejar idiomas si se desea en el futuro, pero lo usaremos como list
@@ -89,26 +89,10 @@ def validate_init_data(init_data: str):
 # --- API Y FRONTEND PARA LA MINI APP ---
 async def get_auth_user(request):
     init_data = request.headers.get("Authorization", "")
-    
-    # 1. Intentar validar la firma oficial de Telegram
-    if init_data and validate_init_data(init_data):
-        try:
-            parsed = dict(parse_qsl(init_data))
-            import json
-            user_obj = json.loads(parsed.get('user', '{}'))
-            return user_obj.get('id')
-        except:
-            pass
-            
-    # 2. Respaldo (Fallback) para pruebas locales o navegadores
-    try:
-        query_id = int(request.query.get("id", 0))
-        if query_id:
-            return query_id
-    except:
-        pass
-        
-    return None
+    if not validate_init_data(init_data): return None
+    parsed = dict(parse_qsl(init_data))
+    import json
+    return json.loads(parsed.get('user', '{}')).get('id')
 
 async def api_get_data(request):
     user_id = await get_auth_user(request)
@@ -181,7 +165,7 @@ async def api_clear_inv(request):
 
 async def handle_webapp(request):
     bot_username = request.query.get("bot", "")
-    html_content = """
+    html_content = f"""
     <!DOCTYPE html>
     <html lang="es">
     <head>
@@ -192,86 +176,44 @@ async def handle_webapp(request):
         <script src="https://cdn.jsdelivr.net/npm/canvas-confetti@1.6.0/dist/confetti.browser.min.js"></script>
         <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap" rel="stylesheet">
         <style>
-            :root {
+            :root {{
                 --bg: var(--tg-theme-bg-color, #0f141c);
                 --card-bg: var(--tg-theme-secondary-bg-color, #1a2332);
                 --text: var(--tg-theme-text-color, #ffffff);
                 --hint: var(--tg-theme-hint-color, #8a9ba8);
                 --accent: var(--tg-theme-button-color, #2ea6ff);
                 --accent-txt: var(--tg-theme-button-text-color, #ffffff);
-            }
-            * { box-sizing: border-box; margin: 0; padding: 0; font-family: 'Inter', sans-serif; }
-            body { background: var(--bg); color: var(--text); padding: 12px; padding-bottom: 20px; }
-            .header { text-align: center; margin-bottom: 16px; margin-top: 10px; }
-            .header h1 { font-size: 20px; margin-bottom: 4px; }
-            .tabs { display: flex; background: var(--card-bg); border-radius: 12px; padding: 4px; margin-bottom: 16px; overflow-x: auto; }
-            .tab { flex: none; width: 33%; text-align: center; padding: 10px 4px; font-size: 13px; font-weight: 600; color: var(--hint); cursor: pointer; border-radius: 8px; transition: 0.3s; }
-            .tab.active { background: var(--accent); color: var(--accent-txt); }
-            .section { display: none; flex-direction: column; gap: 12px; }
-            .section.active { display: flex; animation: fadeIn 0.3s; }
-            @keyframes fadeIn { from { opacity: 0; transform: translateY(5px); } to { opacity: 1; transform: translateY(0); } }
-            .card { background: var(--card-bg); border-radius: 16px; padding: 16px; }
-            .flex-between { display: flex; align-items: center; justify-content: space-between; }
-            .value { font-size: 20px; font-weight: 700; }
-            .progress-bg { background: rgba(255,255,255,0.1); border-radius: 8px; height: 12px; margin-top: 10px; overflow: hidden; width: 100%; }
-            .progress-fill { background: linear-gradient(90deg, #FFD700, #FFA500); height: 100%; width: 0%; transition: 0.5s; }
-            .btn-main { background: var(--accent); color: var(--accent-txt); border: none; border-radius: 12px; padding: 12px; width: 100%; font-size: 14px; font-weight: bold; cursor: pointer; }
-            .btn-danger { background: rgba(255,77,79,0.1); color: #ff4d4f; border: 1px solid #ff4d4f; }
+            }}
+            * {{ box-sizing: border-box; margin: 0; padding: 0; font-family: 'Inter', sans-serif; }}
+            body {{ background: var(--bg); color: var(--text); padding: 12px; padding-bottom: 20px; }}
+            .header {{ text-align: center; margin-bottom: 16px; margin-top: 10px; }}
+            .header h1 {{ font-size: 20px; margin-bottom: 4px; }}
+            .tabs {{ display: flex; background: var(--card-bg); border-radius: 12px; padding: 4px; margin-bottom: 16px; overflow-x: auto; }}
+            .tab {{ flex: none; width: 33%; text-align: center; padding: 10px 4px; font-size: 13px; font-weight: 600; color: var(--hint); cursor: pointer; border-radius: 8px; transition: 0.3s; }}
+            .tab.active {{ background: var(--accent); color: var(--accent-txt); }}
+            .section {{ display: none; flex-direction: column; gap: 12px; }}
+            .section.active {{ display: flex; animation: fadeIn 0.3s; }}
+            @keyframes fadeIn {{ from {{ opacity: 0; transform: translateY(5px); }} to {{ opacity: 1; transform: translateY(0); }} }}
+            .card {{ background: var(--card-bg); border-radius: 16px; padding: 16px; }}
+            .flex-between {{ display: flex; align-items: center; justify-content: space-between; }}
+            .value {{ font-size: 20px; font-weight: 700; }}
+            .progress-bg {{ background: rgba(255,255,255,0.1); border-radius: 8px; height: 12px; margin-top: 10px; overflow: hidden; width: 100%; }}
+            .progress-fill {{ background: linear-gradient(90deg, #FFD700, #FFA500); height: 100%; width: 0%; transition: 0.5s; }}
+            .btn-main {{ background: var(--accent); color: var(--accent-txt); border: none; border-radius: 12px; padding: 12px; width: 100%; font-size: 14px; font-weight: bold; cursor: pointer; }}
+            .btn-danger {{ background: rgba(255,77,79,0.1); color: #ff4d4f; border: 1px solid #ff4d4f; }}
             
-            /* RULETA CSS CORREGIDA */
-            .roulette-box { background: #111; padding: 20px; border-radius: 16px; text-align: center; border: 2px solid var(--accent); position: relative; }
-            .roulette-window { 
-                width: 100px; 
-                height: 100px; 
-                margin: 0 auto 16px auto; 
-                background: #222; 
-                border-radius: 16px; 
-                border: 3px solid #FFD700; 
-                overflow: hidden; 
-                position: relative; 
-                box-shadow: 0 0 15px rgba(255, 215, 0, 0.2);
-            }
-            .roulette-window::after {
-                content: '';
-                position: absolute;
-                top: 0; left: 0; right: 0; bottom: 0;
-                box-shadow: inset 0px 20px 15px -10px rgba(0,0,0,0.9), inset 0px -20px 15px -10px rgba(0,0,0,0.9);
-                pointer-events: none;
-            }
-            .roulette-track { 
-                display: flex; 
-                flex-direction: column; 
-                width: 100%; 
-            }
-            .roulette-item { 
-                width: 100%; 
-                height: 100px; 
-                flex-shrink: 0; 
-                display: flex; 
-                align-items: center; 
-                justify-content: center; 
-                font-size: 42px; 
-                font-weight: 900; 
-                color: #fff; 
-            }
-            .pointer { 
-                position: absolute; 
-                right: -2px; 
-                top: 50%; 
-                transform: translateY(-50%); 
-                width: 0; 
-                height: 0; 
-                border-top: 12px solid transparent; 
-                border-bottom: 12px solid transparent; 
-                border-right: 18px solid #FFD700; 
-                z-index: 10; 
-            }
+            /* RULETA CSS */
+            .roulette-box {{ background: #111; padding: 20px; border-radius: 16px; text-align: center; border: 2px solid var(--accent); overflow: hidden; position: relative; }}
+            .roulette-window {{ width: 80px; height: 80px; margin: 0 auto 16px auto; background: #222; border-radius: 12px; border: 2px solid #FFD700; overflow: hidden; position: relative; display: flex; align-items: center; justify-content: center; }}
+            .roulette-track {{ display: flex; flex-direction: column; transition: transform 3s cubic-bezier(0.15, 0.9, 0.2, 1); }}
+            .roulette-item {{ width: 80px; height: 80px; display: flex; align-items: center; justify-content: center; font-size: 32px; font-weight: 900; color: #fff; }}
+            .pointer {{ position: absolute; right: -5px; top: 50%; transform: translateY(-50%); width: 0; height: 0; border-top: 10px solid transparent; border-bottom: 10px solid transparent; border-right: 15px solid #FFD700; z-index: 10; }}
             
             /* MERCADO & RANKING */
-            .list-item { background: rgba(255,255,255,0.05); padding: 12px; border-radius: 12px; margin-bottom: 8px; display: flex; justify-content: space-between; align-items: center; border-left: 3px solid var(--accent); }
-            .list-item p { font-size: 13px; margin: 4px 0; color: #ddd; }
-            .copy-btn { background: rgba(255,255,255,0.1); border: none; color: #fff; padding: 6px 10px; border-radius: 6px; font-size: 12px; cursor: pointer; }
-            input[type="text"] { width: 100%; padding: 12px; border-radius: 8px; border: none; background: rgba(255,255,255,0.1); color: #fff; margin-bottom: 10px; font-family: 'Inter'; }
+            .list-item {{ background: rgba(255,255,255,0.05); padding: 12px; border-radius: 12px; margin-bottom: 8px; display: flex; justify-content: space-between; align-items: center; border-left: 3px solid var(--accent); }}
+            .list-item p {{ font-size: 13px; margin: 4px 0; color: #ddd; }}
+            .copy-btn {{ background: rgba(255,255,255,0.1); border: none; color: #fff; padding: 6px 10px; border-radius: 6px; font-size: 12px; cursor: pointer; }}
+            input[type="text"] {{ width: 100%; padding: 12px; border-radius: 8px; border: none; background: rgba(255,255,255,0.1); color: #fff; margin-bottom: 10px; font-family: 'Inter'; }}
         </style>
     </head>
     <body>
@@ -355,111 +297,102 @@ async def handle_webapp(request):
             tg.setHeaderColor('#1a2332'); /* Estilo Nativo */
             
             let user = tg.initDataUnsafe?.user;
-            // Si Telegram no pasa el usuario (prueba local), usamos un ID de respaldo o simulado
-            let userId = user?.id || 8983189714; 
-            let botUsername = "BOT_USERNAME_PLACEHOLDER"; 
+            let userId = user?.id || 0;
+            let botUsername = "{bot_username}"; 
 
-            let reqHeaders = {
+            // Configurar cabecera segura para llamadas API
+            let reqHeaders = {{
                 "Content-Type": "application/json",
-                "Authorization": tg.initData || ""
-            };
+                "Authorization": tg.initData
+            }};
 
-            function switchTab(tabId, element) {
+            function switchTab(tabId, element) {{
                 tg.HapticFeedback.impactOccurred('light');
                 document.querySelectorAll('.section').forEach(s => s.classList.remove('active'));
                 document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
                 document.getElementById(tabId).classList.add('active');
                 element.classList.add('active');
-            }
+            }}
 
-            // RULETA LOGICA CORREGIDA
+            // RULETA LOGICA
             let rTrack = document.getElementById('r-track');
-            
-            function initRoulette() {
-                rTrack.style.transition = 'none';
-                rTrack.style.transform = 'translateY(0)';
+            function initRoulette() {{
                 rTrack.innerHTML = "";
-                
-                let startDiv = document.createElement('div');
-                startDiv.className = 'roulette-item';
-                startDiv.innerText = "🎁";
-                rTrack.appendChild(startDiv);
-
-                for(let i=0; i<30; i++) {
+                // Crear 30 números falsos aleatorios para el efecto de giro
+                for(let i=0; i<30; i++) {{
                     let div = document.createElement('div');
                     div.className = 'roulette-item';
                     div.innerText = Math.floor(Math.random() * 5) + 1;
                     rTrack.appendChild(div);
-                }
-            }
+                }}
+            }}
             initRoulette();
 
             let bonusTimer;
-            function updateBonusUI(timeLeft) {
+            function updateBonusUI(timeLeft) {{
                 let btn = document.getElementById("btn-spin");
                 let txt = document.getElementById("bonus-status");
                 clearInterval(bonusTimer);
-                if (timeLeft <= 0) {
+                if (timeLeft <= 0) {{
                     btn.disabled = false;
                     btn.style.opacity = "1";
                     txt.innerText = "¡Tiro Disponible!";
-                } else {
+                }} else {{
                     btn.disabled = true;
                     btn.style.opacity = "0.5";
-                    bonusTimer = setInterval(() => {
+                    bonusTimer = setInterval(() => {{
                         timeLeft--;
                         if (timeLeft <= 0) updateBonusUI(0);
-                        else {
+                        else {{
                             let h = Math.floor(timeLeft / 3600);
                             let m = Math.floor((timeLeft % 3600) / 60);
-                            txt.innerText = `⏳ Próximo tiro en: ${h}h ${m}m`;
-                        }
-                    }, 1000);
-                }
-            }
+                            txt.innerText = `⏳ Próximo tiro en: ${{h}}h ${{m}}m`;
+                        }}
+                    }}, 1000);
+                }}
+            }}
 
-            async function spinRoulette() {
+            async function spinRoulette() {{
                 tg.HapticFeedback.impactOccurred('medium');
                 document.getElementById("btn-spin").disabled = true;
                 
-                let res = await fetch(`/api/bonus?id=${userId}`, { method: "POST", headers: reqHeaders, body: JSON.stringify({}) });
+                let res = await fetch('/api/bonus', {{ method: "POST", headers: reqHeaders, body: JSON.stringify({{}}) }});
                 let data = await res.json();
                 
-                if(data.success) {
+                if(data.success) {{
+                    // Preparamos el elemento ganador al final de la pista
                     let targetNum = data.bonus;
-                    
                     let winDiv = document.createElement('div');
                     winDiv.className = 'roulette-item';
                     winDiv.style.color = '#FFD700';
-                    winDiv.style.textShadow = '0 0 15px rgba(255, 215, 0, 0.6)';
-                    winDiv.innerText = "+" + targetNum;
+                    winDiv.innerText = targetNum;
                     rTrack.appendChild(winDiv);
                     
-                    void rTrack.offsetWidth; 
-                    
-                    let itemHeight = 100;
+                    // Animación de giro
+                    let itemHeight = 80;
                     let scrollAmount = -((rTrack.children.length - 1) * itemHeight);
+                    rTrack.style.transform = `translateY(${{scrollAmount}}px)`;
                     
-                    rTrack.style.transition = 'transform 3s cubic-bezier(0.15, 0.9, 0.2, 1)';
-                    rTrack.style.transform = `translateY(${scrollAmount}px)`;
-                    
-                    setTimeout(() => {
+                    setTimeout(() => {{
                         tg.HapticFeedback.notificationOccurred('success');
-                        confetti({ particleCount: 150, spread: 70, origin: { y: 0.6 } });
-                        tg.showAlert(`🎉 ¡Felicidades!\nHas ganado ${targetNum} Puntos de Reputación.`);
+                        confetti({{ particleCount: 150, spread: 70, origin: {{ y: 0.6 }} }});
+                        tg.showAlert(`🎉 ¡La ruleta paró en ${{targetNum}}!\nHas ganado ${{targetNum}} Puntos de Reputación.`);
                         loadData();
-                        
-                        setTimeout(() => { initRoulette(); }, 3000);
-                    }, 3000); 
-                } else {
+                        setTimeout(() => {{ 
+                            rTrack.style.transition = 'none';
+                            rTrack.style.transform = 'translateY(0)';
+                            initRoulette(); 
+                            setTimeout(() => rTrack.style.transition = 'transform 3s cubic-bezier(0.15, 0.9, 0.2, 1)', 50);
+                        }}, 2000);
+                    }}, 3000); // Tarda 3 seg en girar
+                }} else {{
                     tg.showAlert("⚠️ Aún debes esperar.");
-                    document.getElementById("btn-spin").disabled = false;
-                }
-            }
+                }}
+            }}
 
-            async function loadData() {
+            async function loadData() {{
                 if (!userId) return;
-                let res = await fetch(`/api/data?id=${userId}`, { headers: reqHeaders });
+                let res = await fetch('/api/data', {{ headers: reqHeaders }});
                 if(res.status !== 200) return;
                 let data = await res.json();
                 
@@ -467,60 +400,62 @@ async def handle_webapp(request):
                 document.getElementById("video-count").innerText = data.videos;
                 
                 let rep = data.reputation;
-                document.getElementById("vip-text").innerText = `${rep}/20 Pts`;
-                document.getElementById("vip-fill"].style.width = Math.min(100, (rep / 20) * 100) + "%";
+                document.getElementById("vip-text").innerText = `${{rep}}/20 Pts`;
+                document.getElementById("vip-fill").style.width = Math.min(100, (rep / 20) * 100) + "%";
                 document.getElementById("ref-count").innerText = data.referrals;
                 
                 updateBonusUI(data.time_left);
                 
+                // Cargar Ranking
                 let rHTML = "";
-                data.leaderboard.forEach((u, i) => {
+                data.leaderboard.forEach((u, i) => {{
                     let medal = i==0?"🥇":i==1?"🥈":i==2?"🥉":"🏅";
-                    rHTML += `<div class="list-item"><b>${medal} ID: ${u.id}</b><span style="color:#FFD700">⭐ ${u.rep}</span></div>`;
-                });
+                    rHTML += `<div class="list-item"><b>${{medal}} ID: ${{u.id}}</b><span style="color:#FFD700">⭐ ${{u.rep}}</span></div>`;
+                }});
                 document.getElementById("ranking-list").innerHTML = rHTML || "No hay jugadores aún.";
 
+                // Cargar Mercado
                 let oHTML = "";
-                data.offers.forEach(o => {
+                data.offers.forEach(o => {{
                     oHTML += `
                     <div class="list-item" style="flex-direction:column; align-items:flex-start;">
                         <div style="width:100%; display:flex; justify-content:space-between; margin-bottom:5px;">
-                            <b style="color:var(--accent); font-size:12px;">👤 ${o.name}</b>
-                            <button class="copy-btn" onclick="copyId(${o.user_id})">Copiar ID</button>
+                            <b style="color:var(--accent); font-size:12px;">👤 ${{o.name}}</b>
+                            <button class="copy-btn" onclick="copyId(${{o.user_id}})">Copiar ID</button>
                         </div>
-                        <p>💬 "${o.text}"</p>
+                        <p>💬 "${{o.text}}"</p>
                     </div>`;
-                });
+                }});
                 document.getElementById("offers-list").innerHTML = oHTML || "El mercado está vacío.";
-            }
+            }}
 
-            async function postOffer() {
+            async function postOffer() {{
                 let val = document.getElementById('offer-input').value;
                 if(val.length < 5) return tg.showAlert("⚠️ La oferta es muy corta.");
                 tg.HapticFeedback.impactOccurred('light');
                 let name = user?.first_name || "Anónimo";
                 
-                await fetch(`/api/offer?id=${userId}`, { 
+                await fetch('/api/offer', {{ 
                     method: "POST", headers: reqHeaders, 
-                    body: JSON.stringify({ text: val, name: name }) 
-                });
+                    body: JSON.stringify({{ text: val, name: name }}) 
+                }});
                 document.getElementById('offer-input').value = "";
                 tg.showAlert("✅ Oferta publicada en el mercado.");
                 loadData();
-            }
+            }}
 
-            async function clearInventory() {
-                tg.showConfirm("¿Estás seguro de vaciar TODAS tus fotos y videos de tu cofre? Esta acción no se puede deshacer.", async (ok) => {
-                    if(ok) {
-                        await fetch(`/api/clear?id=${userId}`, { method: "POST", headers: reqHeaders });
+            async function clearInventory() {{
+                tg.showConfirm("¿Estás seguro de vaciar TODAS tus fotos y videos de tu cofre? Esta acción no se puede deshacer.", async (ok) => {{
+                    if(ok) {{
+                        await fetch('/api/clear', {{ method: "POST", headers: reqHeaders }});
                         tg.HapticFeedback.notificationOccurred('success');
                         tg.showAlert("🗑️ Cofre vaciado.");
                         loadData();
-                    }
-                });
-            }
+                    }}
+                }});
+            }}
 
-            function copyId(id) {
+            function copyId(id) {{
                 tg.HapticFeedback.impactOccurred('light');
                 let temp = document.createElement("input");
                 temp.value = id;
@@ -528,27 +463,26 @@ async def handle_webapp(request):
                 temp.select();
                 document.execCommand("copy");
                 document.body.removeChild(temp);
-                tg.showAlert("✅ ID copiado: " + id + "\n\nVuelve al bot, selecciona 'Conectar ID' y pégalo.");
-            }
+                tg.showAlert("✅ ID copiado: " + id + "\\n\\nVuelve al bot, selecciona 'Conectar ID' y pégalo.");
+            }}
 
-            function copyRefLink() {
+            function copyRefLink() {{
                 tg.HapticFeedback.impactOccurred('light');
-                let link = `https://t.me/${botUsername}?start=${userId}`;
+                let link = `https://t.me/${{botUsername}}?start=${{userId}}`;
                 let temp = document.createElement("input");
                 temp.value = link;
                 document.body.appendChild(temp);
                 temp.select();
                 document.execCommand("copy");
                 document.body.removeChild(temp);
-                tg.showAlert("✅ Link copiado.\nEnvíalo a tus amigos para ganar VIP rápido.");
-            }
+                tg.showAlert("✅ Link copiado.\\nEnvíalo a tus amigos para ganar VIP rápido.");
+            }}
 
             loadData();
         </script>
     </body>
     </html>
-    """.replace("BOT_USERNAME_PLACEHOLDER", bot_username)
-    
+    """
     return web.Response(text=html_content, content_type="text/html")
 
 async def start_web_server():
