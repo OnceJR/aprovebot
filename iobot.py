@@ -6,6 +6,7 @@ import random
 import hmac
 import hashlib
 from urllib.parse import parse_qsl
+from urllib.parse import unquote
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.filters import Command, CommandStart, StateFilter
 from aiogram.fsm.context import FSMContext
@@ -17,6 +18,7 @@ from aiogram.types import (
 )
 from aiohttp import web
 from motor.motor_asyncio import AsyncIOMotorClient
+
 
 # --- CONFIGURACIÓN PRINCIPAL ---
 MAIN_BOT_TOKEN = "8948368352:AAHR111IyIDehtbbEdQRKvWLtKhQ8Jmhqgg"
@@ -76,33 +78,53 @@ async def get_backup_receivers():
 
 def validate_init_data(init_data: str):
     try:
-        parsed_data = dict(parse_qsl(init_data))
-        hash_val = parsed_data.pop('hash')
-        data_check_string = "\n".join(f"{k}={v}" for k, v in sorted(parsed_data.items()))
+        parsed_vals = {}
+        for part in init_data.split('&'):
+            if '=' in part:
+                k, v = part.split('=', 1)
+                parsed_vals[k] = unquote(v)
+        
+        if 'hash' not in parsed_vals:
+            return False
+            
+        hash_val = parsed_vals.pop('hash')
+        
+        # Ordenar alfabéticamente y construir el string de comprobación oficial
+        data_check_string = "\n".join(f"{k}={v}" for k, v in sorted(parsed_vals.items()))
+        
+        # Orden correcto de llaves para el HMAC de Telegram
         secret_key = hmac.new(b"WebAppData", MAIN_BOT_TOKEN.encode(), hashlib.sha256).digest()
         calculated_hash = hmac.new(secret_key, data_check_string.encode(), hashlib.sha256).hexdigest()
+        
         return calculated_hash == hash_val
-    except:
+    except Exception as e:
+        logging.error(f"Error validando init_data: {e}")
         return False
 
-# --- API Y FRONTEND PARA LA MINI APP ---
 async def get_auth_user(request):
     init_data = request.headers.get("Authorization", "")
     
-    # 1. Intentar validar la firma oficial de Telegram
-    if init_data and validate_init_data(init_data):
-        try:
-            parsed = dict(parse_qsl(init_data))
-            import json
-            return json.loads(parsed.get('user', '{}')).get('id')
-        except: pass
-        
-    # 2. Respaldo (Fallback) para pruebas locales o de navegador
+    # Si hay init_data, validamos y extraemos el ID del usuario de manera segura
+    if init_data:
+        if validate_init_data(init_data):
+            try:
+                parsed = dict(parse_qsl(init_data))
+                import json
+                user_data = json.loads(parsed.get('user', '{}'))
+                return user_data.get('id')
+            except: 
+                pass
+        else:
+            logging.warning("⚠️ Falló la validación estricta de initData de Telegram.")
+
+    # Respaldo (Fallback) temporal si estás probando desde ciertos navegadores o entornos de desarrollo
     try:
         query_id = int(request.query.get("id", 0))
-        if query_id: return query_id
-    except: pass
-    
+        if query_id: 
+            return query_id
+    except: 
+        pass
+        
     return None
 
 async def api_get_data(request):
