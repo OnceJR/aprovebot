@@ -5,8 +5,7 @@ import time
 import random
 import hmac
 import hashlib
-from urllib.parse import parse_qsl
-from urllib.parse import unquote
+from urllib.parse import unquote, parse_qsl
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.filters import Command, CommandStart, StateFilter
 from aiogram.fsm.context import FSMContext
