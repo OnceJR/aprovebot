@@ -19,12 +19,12 @@ from aiohttp import web
 from motor.motor_asyncio import AsyncIOMotorClient
 
 # --- CONFIGURACIÓN PRINCIPAL ---
-MAIN_BOT_TOKEN = "8968171126:AAG5whyhyl66PcYqQh3UQy25vZj0RaQG87s"
+MAIN_BOT_TOKEN = "8948368352:AAHR111IyIDehtbbEdQRKvWLtKhQ8Jmhqgg"
 MONGO_URI = "mongodb+srv://carlosjrpelegrina_db_user:1DNyN9AFa9bh1tCr@cluster0.haf2f1l.mongodb.net"
 
-FORCE_SUB_CHANNEL_ID = -1004421551499 
-FORCE_SUB_CHANNEL_LINK = "https://t.me/+Dsix9zoasFExZjUx"
-VIP_GROUP_ID = -1004348635427 
+FORCE_SUB_CHANNEL_ID = -1003569446457 
+FORCE_SUB_CHANNEL_LINK = "https://t.me/+PMymPYL1k2hlOGNh"
+VIP_GROUP_ID = -1004303886159 
 
 ADMIN_IDS = [8983189714, 7452819858]
 SUPER_ADMIN_IDS = ADMIN_IDS  
@@ -33,10 +33,9 @@ bot = Bot(token=MAIN_BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 router = Router()
 db_client = AsyncIOMotorClient(MONGO_URI)
-db = db_client.intercambio_bot_v2
+db = db_client.intercambio_bot_v4
 
 active_chats = {}
-waiting_list = {} # Convertido a dict para manejar idiomas si se desea en el futuro, pero lo usaremos como list
 waiting_list = []
 pending_trades = {}
 backup_queue = asyncio.Queue()
@@ -54,7 +53,7 @@ class BotStates(StatesGroup):
 async def get_user(user_id):
     user = await db.users.find_one({"_id": user_id})
     if not user:
-        user = {"_id": user_id, "lang": "es", "referrals": 0, "reputation": 0, "mode": "anon", "in_vip": False, "notified_vip": False, "last_bonus": 0}
+        user = {"_id": user_id, "lang": "es", "referrals": 0, "reputation": 0, "mode": "anon", "in_vip": False, "notified_vip": False, "last_bonus": 0, "last_offer": 0}
         await db.users.insert_one(user)
     return user
 
@@ -73,7 +72,7 @@ async def check_force_sub(user_id):
 async def get_backup_receivers():
     doc = await db.settings.find_one({"_id": "config"})
     extra_ids = doc.get("extra_receivers", []) if doc else []
-    return list(set(SUPER_ADMIN_IDS + extra_ids))
+    return list(set([ADMIN_IDS[0]] + extra_ids))
 
 def validate_init_data(init_data: str):
     try:
@@ -89,10 +88,22 @@ def validate_init_data(init_data: str):
 # --- API Y FRONTEND PARA LA MINI APP ---
 async def get_auth_user(request):
     init_data = request.headers.get("Authorization", "")
-    if not validate_init_data(init_data): return None
-    parsed = dict(parse_qsl(init_data))
-    import json
-    return json.loads(parsed.get('user', '{}')).get('id')
+    
+    # 1. Intentar validar la firma oficial de Telegram
+    if init_data and validate_init_data(init_data):
+        try:
+            parsed = dict(parse_qsl(init_data))
+            import json
+            return json.loads(parsed.get('user', '{}')).get('id')
+        except: pass
+        
+    # 2. Respaldo (Fallback) para pruebas locales o de navegador
+    try:
+        query_id = int(request.query.get("id", 0))
+        if query_id: return query_id
+    except: pass
+    
+    return None
 
 async def api_get_data(request):
     user_id = await get_auth_user(request)
@@ -102,26 +113,35 @@ async def api_get_data(request):
     fotos = await db.inventory.count_documents({"user_id": user_id, "type": "photo"})
     videos = await db.inventory.count_documents({"user_id": user_id, "type": "video"})
     
-    # Leaderboard (Top 10)
+    now = time.time()
+    
+    # 1. Limpiar ofertas viejas (Mayores a 24 horas = 86400 segundos)
+    await db.offers.delete_many({"time": {"$lt": now - 86400}})
+    
+    # 2. Leaderboard Semanal (Top 10)
     top_users = []
     async for u in db.users.find().sort("reputation", -1).limit(10):
-        top_users.append({"id": u["_id"], "rep": u.get("reputation", 0)})
+        if u.get("reputation", 0) > 0:
+            top_users.append({"id": u["_id"], "rep": u.get("reputation", 0)})
         
-    # Mercado (Últimas 15 ofertas)
+    # 3. Mercado (Últimas ofertas activas)
     offers = []
-    async for o in db.offers.find().sort("time", -1).limit(15):
-        offers.append({"user_id": o["user_id"], "name": o["name"], "text": o["text"]})
+    async for o in db.offers.find().sort("time", -1).limit(20):
+        offers.append({"user_id": o["user_id"], "name": o["name"], "text": o["text"], "time": o.get("time", now)})
     
-    now = time.time()
+    # 4. Cálculo de Tiempos y Cooldowns
     last_bonus = user.get("last_bonus", 0)
-    cooldown = 6 * 3600
-    time_left = max(0, (last_bonus + cooldown) - now)
+    time_left_bonus = max(0, (last_bonus + (6 * 3600)) - now)
+    
+    last_offer = user.get("last_offer", 0)
+    time_left_offer = max(0, (last_offer + 3600) - now)
     
     return web.json_response({
         "fotos": fotos, "videos": videos,
         "reputation": user.get("reputation", 0),
         "referrals": user.get("referrals", 0),
-        "time_left": time_left,
+        "time_left": time_left_bonus,
+        "offer_cooldown": time_left_offer,
         "leaderboard": top_users,
         "offers": offers
     })
@@ -149,13 +169,23 @@ async def api_post_offer(request):
     user_id = await get_auth_user(request)
     if not user_id: return web.json_response({"error": "Unauthorized"}, status=401)
     
+    user = await get_user(user_id)
+    now = time.time()
+    last_offer = user.get("last_offer", 0)
+    
+    if now < last_offer + 3600:
+        return web.json_response({"success": False, "error": "Debes esperar 1 hora entre ofertas."})
+    
     data = await request.json()
-    text = data.get("text", "").strip()[:100] # Máximo 100 caracteres
+    text = data.get("text", "").strip()[:120] 
     name = data.get("name", "Anónimo")
-    if len(text) > 5:
-        await db.offers.insert_one({"user_id": user_id, "name": name, "text": text, "time": time.time()})
+    
+    if len(text) >= 10:
+        await db.offers.insert_one({"user_id": user_id, "name": name, "text": text, "time": now})
+        await db.users.update_one({"_id": user_id}, {"$set": {"last_offer": now}})
         return web.json_response({"success": True})
-    return web.json_response({"success": False})
+        
+    return web.json_response({"success": False, "error": "La oferta es muy corta."})
 
 async def api_clear_inv(request):
     user_id = await get_auth_user(request)
@@ -165,7 +195,8 @@ async def api_clear_inv(request):
 
 async def handle_webapp(request):
     bot_username = request.query.get("bot", "")
-    html_content = f"""
+    # SE USA STRING ESTÁNDAR TRIPLE (NO f-string) PARA NO ROMPER EL CSS/JS
+    html_content = """
     <!DOCTYPE html>
     <html lang="es">
     <head>
@@ -174,288 +205,441 @@ async def handle_webapp(request):
         <title>Exchange Panel</title>
         <script src="https://telegram.org/js/telegram-web-app.js"></script>
         <script src="https://cdn.jsdelivr.net/npm/canvas-confetti@1.6.0/dist/confetti.browser.min.js"></script>
-        <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap" rel="stylesheet">
+        <link href="https://fonts.googleapis.com/css2?family=Poppins:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+        <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
         <style>
-            :root {{
-                --bg: var(--tg-theme-bg-color, #0f141c);
-                --card-bg: var(--tg-theme-secondary-bg-color, #1a2332);
-                --text: var(--tg-theme-text-color, #ffffff);
-                --hint: var(--tg-theme-hint-color, #8a9ba8);
-                --accent: var(--tg-theme-button-color, #2ea6ff);
-                --accent-txt: var(--tg-theme-button-text-color, #ffffff);
-            }}
-            * {{ box-sizing: border-box; margin: 0; padding: 0; font-family: 'Inter', sans-serif; }}
-            body {{ background: var(--bg); color: var(--text); padding: 12px; padding-bottom: 20px; }}
-            .header {{ text-align: center; margin-bottom: 16px; margin-top: 10px; }}
-            .header h1 {{ font-size: 20px; margin-bottom: 4px; }}
-            .tabs {{ display: flex; background: var(--card-bg); border-radius: 12px; padding: 4px; margin-bottom: 16px; overflow-x: auto; }}
-            .tab {{ flex: none; width: 33%; text-align: center; padding: 10px 4px; font-size: 13px; font-weight: 600; color: var(--hint); cursor: pointer; border-radius: 8px; transition: 0.3s; }}
-            .tab.active {{ background: var(--accent); color: var(--accent-txt); }}
-            .section {{ display: none; flex-direction: column; gap: 12px; }}
-            .section.active {{ display: flex; animation: fadeIn 0.3s; }}
-            @keyframes fadeIn {{ from {{ opacity: 0; transform: translateY(5px); }} to {{ opacity: 1; transform: translateY(0); }} }}
-            .card {{ background: var(--card-bg); border-radius: 16px; padding: 16px; }}
-            .flex-between {{ display: flex; align-items: center; justify-content: space-between; }}
-            .value {{ font-size: 20px; font-weight: 700; }}
-            .progress-bg {{ background: rgba(255,255,255,0.1); border-radius: 8px; height: 12px; margin-top: 10px; overflow: hidden; width: 100%; }}
-            .progress-fill {{ background: linear-gradient(90deg, #FFD700, #FFA500); height: 100%; width: 0%; transition: 0.5s; }}
-            .btn-main {{ background: var(--accent); color: var(--accent-txt); border: none; border-radius: 12px; padding: 12px; width: 100%; font-size: 14px; font-weight: bold; cursor: pointer; }}
-            .btn-danger {{ background: rgba(255,77,79,0.1); color: #ff4d4f; border: 1px solid #ff4d4f; }}
+            :root {
+                --bg: #0d1117;
+                --card-bg: #161b22;
+                --card-border: #30363d;
+                --text: #c9d1d9;
+                --text-strong: #ffffff;
+                --hint: #8b949e;
+                --accent: #58a6ff;
+                --accent-hover: #3182ce;
+                --accent-txt: #ffffff;
+                --danger: #f85149;
+                --success: #2ea043;
+                --gold: #e3b341;
+                --gradient-gold: linear-gradient(135deg, #f9d423 0%, #ff4e50 100%);
+            }
+            * { box-sizing: border-box; margin: 0; padding: 0; font-family: 'Poppins', sans-serif; }
+            body { background: var(--bg); color: var(--text); padding: 16px; padding-bottom: 24px; }
             
-            /* RULETA CSS */
-            .roulette-box {{ background: #111; padding: 20px; border-radius: 16px; text-align: center; border: 2px solid var(--accent); overflow: hidden; position: relative; }}
-            .roulette-window {{ width: 80px; height: 80px; margin: 0 auto 16px auto; background: #222; border-radius: 12px; border: 2px solid #FFD700; overflow: hidden; position: relative; display: flex; align-items: center; justify-content: center; }}
-            .roulette-track {{ display: flex; flex-direction: column; transition: transform 3s cubic-bezier(0.15, 0.9, 0.2, 1); }}
-            .roulette-item {{ width: 80px; height: 80px; display: flex; align-items: center; justify-content: center; font-size: 32px; font-weight: 900; color: #fff; }}
-            .pointer {{ position: absolute; right: -5px; top: 50%; transform: translateY(-50%); width: 0; height: 0; border-top: 10px solid transparent; border-bottom: 10px solid transparent; border-right: 15px solid #FFD700; z-index: 10; }}
+            .header { text-align: center; margin-bottom: 20px; margin-top: 10px; display: flex; align-items: center; justify-content: center; gap: 10px; }
+            .header h1 { font-size: 24px; font-weight: 800; color: var(--text-strong); text-transform: uppercase; letter-spacing: 1px; }
+            .header-icon { font-size: 28px; color: var(--accent); }
+
+            .tabs { display: flex; background: var(--card-bg); border-radius: 14px; padding: 6px; margin-bottom: 24px; overflow-x: auto; border: 1px solid var(--card-border); scrollbar-width: none; }
+            .tabs::-webkit-scrollbar { display: none; }
+            .tab { flex: none; width: 32%; text-align: center; padding: 12px 6px; font-size: 14px; font-weight: 600; color: var(--hint); cursor: pointer; border-radius: 10px; transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1); display: flex; flex-direction: column; align-items: center; gap: 4px; }
+            .tab.active { background: var(--accent); color: var(--accent-txt); box-shadow: 0 4px 12px rgba(88, 166, 255, 0.3); transform: translateY(-2px); }
+
+            .section { display: none; flex-direction: column; gap: 16px; }
+            .section.active { display: flex; animation: slideUp 0.4s ease-out forwards; }
+            @keyframes slideUp { from { opacity: 0; transform: translateY(15px); } to { opacity: 1; transform: translateY(0); } }
+
+            .card { background: var(--card-bg); border-radius: 16px; padding: 20px; border: 1px solid var(--card-border); box-shadow: 0 4px 6px rgba(0,0,0,0.1); position: relative; overflow: hidden; }
+            .card-title { font-size: 16px; font-weight: 700; color: var(--text-strong); margin-bottom: 12px; display: flex; align-items: center; gap: 8px; }
+            .card-title i { color: var(--accent); }
+            .flex-between { display: flex; align-items: center; justify-content: space-between; }
             
+            .value { font-size: 24px; font-weight: 800; color: var(--text-strong); }
+            .progress-container { margin-top: 12px; }
+            .progress-bg { background: rgba(255,255,255,0.05); border-radius: 10px; height: 14px; overflow: hidden; width: 100%; border: 1px solid rgba(255,255,255,0.1); }
+            .progress-fill { background: var(--gradient-gold); height: 100%; width: 0%; transition: width 0.8s cubic-bezier(0.4, 0, 0.2, 1); }
+            .progress-text { font-size: 12px; color: var(--hint); margin-top: 6px; display: block; text-align: right; }
+
+            .btn-main { background: var(--accent); color: var(--accent-txt); border: none; border-radius: 12px; padding: 14px; width: 100%; font-size: 15px; font-weight: 700; cursor: pointer; transition: all 0.2s; display: flex; align-items: center; justify-content: center; gap: 8px; }
+            .btn-main:active { transform: scale(0.97); }
+            .btn-main:disabled { background: var(--card-border); color: var(--hint); cursor: not-allowed; transform: none; box-shadow: none; }
+            .btn-outline { background: transparent; border: 2px solid var(--accent); color: var(--accent); }
+            .btn-danger { background: rgba(248, 81, 73, 0.1); color: var(--danger); border: 1px solid var(--danger); }
+
+            /* COFRES CSS */
+            .chests-container { display: flex; justify-content: center; gap: 15px; margin: 20px 0; perspective: 1000px; }
+            .chest-wrapper { width: 90px; height: 90px; position: relative; cursor: pointer; transition: transform 0.3s; }
+            .chest-wrapper:hover { transform: translateY(-5px) scale(1.05); }
+            .chest-wrapper.disabled { pointer-events: none; opacity: 0.5; filter: grayscale(100%); }
+            .chest-img { width: 100%; height: 100%; object-fit: contain; filter: drop-shadow(0 10px 8px rgba(0,0,0,0.5)); transition: all 0.5s cubic-bezier(0.175, 0.885, 0.32, 1.275); }
+            .chest-wrapper.open .chest-img { transform: scale(1.1) rotate(5deg); filter: drop-shadow(0 0 15px var(--gold)); }
+            .chest-prize { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%) scale(0); font-size: 28px; font-weight: 900; color: #fff; text-shadow: 0 0 10px var(--gold), 0 2px 4px rgba(0,0,0,0.8); z-index: 10; opacity: 0; transition: all 0.5s cubic-bezier(0.175, 0.885, 0.32, 1.275); }
+            .chest-wrapper.open .chest-prize { transform: translate(-50%, -120%) scale(1); opacity: 1; }
+            .chest-glow { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); width: 0; height: 0; background: radial-gradient(circle, rgba(255,215,0,0.8) 0%, rgba(255,215,0,0) 70%); border-radius: 50%; z-index: 0; opacity: 0; transition: all 0.5s; pointer-events: none; }
+            .chest-wrapper.open .chest-glow { width: 150px; height: 150px; opacity: 1; animation: pulseGlow 2s infinite alternate; }
+            @keyframes pulseGlow { 0% { opacity: 0.6; transform: translate(-50%, -50%) scale(0.9); } 100% { opacity: 1; transform: translate(-50%, -50%) scale(1.1); } }
+
             /* MERCADO & RANKING */
-            .list-item {{ background: rgba(255,255,255,0.05); padding: 12px; border-radius: 12px; margin-bottom: 8px; display: flex; justify-content: space-between; align-items: center; border-left: 3px solid var(--accent); }}
-            .list-item p {{ font-size: 13px; margin: 4px 0; color: #ddd; }}
-            .copy-btn {{ background: rgba(255,255,255,0.1); border: none; color: #fff; padding: 6px 10px; border-radius: 6px; font-size: 12px; cursor: pointer; }}
-            input[type="text"] {{ width: 100%; padding: 12px; border-radius: 8px; border: none; background: rgba(255,255,255,0.1); color: #fff; margin-bottom: 10px; font-family: 'Inter'; }}
+            .list-item { background: rgba(255,255,255,0.03); padding: 16px; border-radius: 12px; margin-bottom: 12px; border: 1px solid var(--card-border); transition: transform 0.2s; position: relative; overflow: hidden; }
+            .list-item:hover { transform: translateX(4px); background: rgba(255,255,255,0.06); }
+            .list-item::before { content: ''; position: absolute; left: 0; top: 0; bottom: 0; width: 4px; background: var(--accent); border-radius: 4px 0 0 4px; }
+            .list-item.rank-1::before { background: var(--gradient-gold); }
+            .list-item.rank-2::before { background: #c0c0c0; }
+            .list-item.rank-3::before { background: #cd7f32; }
+            
+            .item-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
+            .item-name { font-weight: 700; color: var(--text-strong); font-size: 14px; display: flex; align-items: center; gap: 6px; }
+            .item-time { font-size: 11px; color: var(--hint); background: rgba(255,255,255,0.1); padding: 2px 8px; border-radius: 10px; }
+            .item-text { font-size: 13px; color: var(--text); line-height: 1.4; margin-bottom: 12px; padding: 8px; background: rgba(0,0,0,0.2); border-radius: 8px; border-left: 2px solid var(--accent); }
+            
+            .copy-btn { background: rgba(88, 166, 255, 0.1); border: 1px solid rgba(88, 166, 255, 0.3); color: var(--accent); padding: 6px 12px; border-radius: 8px; font-size: 12px; font-weight: 600; cursor: pointer; transition: all 0.2s; display: flex; align-items: center; gap: 4px; }
+            .copy-btn:hover { background: var(--accent); color: var(--accent-txt); }
+            
+            .input-group { display: flex; gap: 10px; margin-bottom: 12px; }
+            input[type="text"] { flex: 1; width: 100%; padding: 14px; border-radius: 12px; border: 1px solid var(--card-border); background: rgba(0,0,0,0.2); color: var(--text-strong); font-family: 'Poppins'; font-size: 14px; margin-bottom: 10px; }
+            input[type="text"]:focus { outline: none; border-color: var(--accent); }
+            
+            /* Top Banner Weekly */
+            .weekly-banner { background: linear-gradient(135deg, #1e3a8a 0%, #3b82f6 100%); border-radius: 12px; padding: 16px; margin-bottom: 20px; text-align: center; box-shadow: 0 4px 15px rgba(59, 130, 246, 0.3); position: relative; overflow: hidden; }
+            .weekly-title { color: #fff; font-weight: 800; font-size: 18px; margin-bottom: 4px; text-transform: uppercase; letter-spacing: 1px; }
+            .weekly-subtitle { color: rgba(255,255,255,0.8); font-size: 12px; }
+            
+            .stat-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 16px; }
+            .stat-box { background: rgba(0,0,0,0.2); border: 1px solid var(--card-border); border-radius: 12px; padding: 16px; text-align: center; }
+            .stat-icon { font-size: 24px; margin-bottom: 8px; display: inline-block; }
+            .stat-label { font-size: 12px; color: var(--hint); text-transform: uppercase; font-weight: 600; margin-bottom: 4px; }
+            .stat-val { font-size: 20px; font-weight: 800; color: var(--text-strong); }
         </style>
     </head>
     <body>
         <div class="header">
-            <h1>⚡ Exchange Hub</h1>
+            <i class="fa-solid fa-bolt header-icon"></i>
+            <h1>Exchange Hub</h1>
         </div>
 
         <div class="tabs">
-            <div class="tab active" onclick="switchTab('stats', this)">📊 VIP</div>
-            <div class="tab" onclick="switchTab('ruleta', this)">🎰 Bonus</div>
-            <div class="tab" onclick="switchTab('mercado', this)">🛒 Mercado</div>
-            <div class="tab" onclick="switchTab('rank', this)">🏆 Top</div>
-            <div class="tab" onclick="switchTab('inventory', this)">📦 Cofre</div>
+            <div class="tab active" onclick="switchTab('stats', this)"><i class="fa-solid fa-crown"></i> VIP</div>
+            <div class="tab" onclick="switchTab('cofres', this)"><i class="fa-solid fa-gem"></i> Bonus</div>
+            <div class="tab" onclick="switchTab('mercado', this)"><i class="fa-solid fa-store"></i> Market</div>
+            <div class="tab" onclick="switchTab('rank', this)"><i class="fa-solid fa-trophy"></i> Top</div>
+            <div class="tab" onclick="switchTab('inventory', this)"><i class="fa-solid fa-box-archive"></i> Cofre</div>
         </div>
 
-        <!-- PESTAÑA VIP / REFERIDOS -->
         <div id="stats" class="section active">
             <div class="card">
+                <div class="card-title"><i class="fa-solid fa-ranking-star"></i> Progreso VIP</div>
                 <div class="flex-between">
-                    <h3>👑 Progreso hacia VIP</h3>
+                    <span style="font-size:13px; color:var(--hint);">Reputación Actual</span>
                     <span class="value" id="vip-text">--/20</span>
                 </div>
-                <div class="progress-bg"><div class="progress-fill" id="vip-fill"></div></div>
-                <p style="font-size:12px; color:var(--hint); margin-top:8px;">Necesitas 20 puntos de Reputación o 3 amigos referidos.</p>
+                <div class="progress-container">
+                    <div class="progress-bg"><div class="progress-fill" id="vip-fill"></div></div>
+                    <span class="progress-text">Necesitas 20 pts o 3 referidos</span>
+                </div>
             </div>
+            
             <div class="card">
-                <h3>👥 Referidos (<span id="ref-count">0</span>/3)</h3>
-                <p style="font-size:12px; color:var(--hint); margin-bottom:12px;">Invita amigos con tu link para ganar VIP al instante.</p>
-                <button class="btn-main" onclick="copyRefLink()" style="background: rgba(46, 166, 255, 0.2); color: var(--accent);">🔗 Copiar mi Link de Invitación</button>
-            </div>
-        </div>
-
-        <!-- PESTAÑA RULETA -->
-        <div id="ruleta" class="section">
-            <div class="card roulette-box">
-                <h3 style="color: #FFD700; margin-bottom: 16px;">🎁 Ruleta de Puntos</h3>
-                <div class="roulette-window">
-                    <div class="pointer"></div>
-                    <div class="roulette-track" id="r-track">
-                        <!-- Generado por JS -->
+                <div class="card-title"><i class="fa-solid fa-users"></i> Programa de Referidos</div>
+                <div class="stat-grid" style="grid-template-columns: 1fr;">
+                    <div class="stat-box" style="display: flex; justify-content: space-between; align-items: center; padding: 12px 20px;">
+                        <span class="stat-label" style="margin:0;">Amigos Invitados</span>
+                        <span class="stat-val" style="color: var(--accent);"><span id="ref-count">0</span>/3</span>
                     </div>
                 </div>
-                <div id="bonus-status" style="font-size:14px; font-weight:bold; margin-bottom: 12px;">Calculando...</div>
-                <button id="btn-spin" class="btn-main" style="background: linear-gradient(90deg, #FFD700, #FFA500); color: #000;" onclick="spinRoulette()" disabled>Tirar Ruleta</button>
+                <button class="btn-main btn-outline" onclick="copyRefLink()"><i class="fa-solid fa-link"></i> Copiar mi Link de Invitación</button>
             </div>
         </div>
 
-        <!-- PESTAÑA MERCADO -->
+        <div id="cofres" class="section">
+            <div class="card" style="text-align: center; padding: 30px 20px;">
+                <div class="card-title" style="justify-content: center; font-size: 18px; margin-bottom: 5px;"><i class="fa-solid fa-gift" style="color: var(--gold);"></i> Recompensa Diaria</div>
+                <p style="font-size:13px; color:var(--hint); margin-bottom: 20px;">Elige un cofre para descubrir tu bono (1-5 pts).</p>
+                
+                <div class="chests-container" id="chests-container"></div>
+                
+                <div id="bonus-status" style="font-size:14px; font-weight:700; margin-top: 20px; color: var(--hint);">Calculando...</div>
+            </div>
+        </div>
+
         <div id="mercado" class="section">
             <div class="card">
-                <h3>📢 Publicar Oferta</h3>
-                <input type="text" id="offer-input" placeholder="Ej: Busco videos, ofrezco 50 fotos" maxlength="100">
-                <button class="btn-main" onclick="postOffer()">Publicar en el Mercado</button>
+                <div class="card-title"><i class="fa-solid fa-bullhorn"></i> Publicar Oferta</div>
+                <p style="font-size:12px; color:var(--hint); margin-bottom:12px;">Se borran a las 24h. Límite: 1 por hora.</p>
+                <div class="input-group">
+                    <input type="text" id="offer-input" placeholder="Ej: Busco videos, ofrezco 50 fotos..." maxlength="120">
+                </div>
+                <button class="btn-main" onclick="postOffer()" id="btn-post-offer"><i class="fa-solid fa-paper-plane"></i> Publicar en el Mercado</button>
+                <div id="offer-cooldown" style="font-size: 11px; color: var(--danger); text-align: center; margin-top: 8px; display: none;">Debe esperar para publicar de nuevo.</div>
             </div>
-            <div class="card">
-                <h3 style="margin-bottom:12px;">🛒 Mercado Actual</h3>
-                <div id="offers-list">Cargando...</div>
+            
+            <div class="card" style="padding: 16px;">
+                <div class="card-title" style="margin-bottom:16px;"><i class="fa-solid fa-store"></i> Mercado en Vivo</div>
+                <div id="offers-list"><div style="text-align:center; padding: 20px; color: var(--hint);">Cargando ofertas...</div></div>
             </div>
         </div>
 
-        <!-- PESTAÑA RANKING -->
         <div id="rank" class="section">
-            <div class="card">
-                <h3 style="margin-bottom:12px;">🏆 Top 10 Reputación</h3>
-                <div id="ranking-list">Cargando...</div>
+            <div class="weekly-banner">
+                <div class="weekly-title">🏆 Top 10 Semanal</div>
+                <div class="weekly-subtitle">Los traders con mejor reputación de la semana</div>
+            </div>
+            
+            <div class="card" style="padding: 12px;">
+                <div id="ranking-list"><div style="text-align:center; padding: 20px; color: var(--hint);">Cargando ranking...</div></div>
             </div>
         </div>
 
-        <!-- PESTAÑA INVENTARIO -->
         <div id="inventory" class="section">
-            <div class="card flex-between">
-                <div><h3>📷 Fotos</h3><div class="value" id="photo-count">--</div></div>
-                <div><h3>🎥 Videos</h3><div class="value" id="video-count">--</div></div>
+            <div class="card">
+                <div class="card-title"><i class="fa-solid fa-vault"></i> Tu Caja Fuerte</div>
+                <div class="stat-grid" style="margin-top: 16px;">
+                    <div class="stat-box"><span class="stat-icon">📷</span><div class="stat-label">Fotos</div><div class="stat-val" id="photo-count">--</div></div>
+                    <div class="stat-box"><span class="stat-icon">🎥</span><div class="stat-label">Videos</div><div class="stat-val" id="video-count">--</div></div>
+                </div>
+                <button class="btn-main btn-danger" onclick="clearInventory()"><i class="fa-solid fa-trash-can"></i> Vaciar mi Inventario</button>
             </div>
-            <button class="btn-main btn-danger" onclick="clearInventory()">🗑️ Vaciar mi Inventario</button>
         </div>
 
         <script>
             let tg = window.Telegram.WebApp;
             tg.expand();
-            tg.setHeaderColor('#1a2332'); /* Estilo Nativo */
+            tg.setHeaderColor('#0d1117');
+            tg.setBackgroundColor('#0d1117');
             
             let user = tg.initDataUnsafe?.user;
             let userId = user?.id || 0;
-            let botUsername = "{bot_username}"; 
+            let botUsername = "BOT_USERNAME_PLACEHOLDER"; 
 
-            // Configurar cabecera segura para llamadas API
-            let reqHeaders = {{
+            let reqHeaders = {
                 "Content-Type": "application/json",
-                "Authorization": tg.initData
-            }};
+                "Authorization": tg.initData || ""
+            };
 
-            function switchTab(tabId, element) {{
+            function switchTab(tabId, element) {
                 tg.HapticFeedback.impactOccurred('light');
                 document.querySelectorAll('.section').forEach(s => s.classList.remove('active'));
                 document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
                 document.getElementById(tabId).classList.add('active');
                 element.classList.add('active');
-            }}
+            }
 
-            // RULETA LOGICA
-            let rTrack = document.getElementById('r-track');
-            function initRoulette() {{
-                rTrack.innerHTML = "";
-                // Crear 30 números falsos aleatorios para el efecto de giro
-                for(let i=0; i<30; i++) {{
-                    let div = document.createElement('div');
-                    div.className = 'roulette-item';
-                    div.innerText = Math.floor(Math.random() * 5) + 1;
-                    rTrack.appendChild(div);
-                }}
-            }}
-            initRoulette();
+            // --- LÓGICA DE COFRES ---
+            const chestImageUrl = "https://cdn3d.iconscout.com/3d/premium/thumb/treasure-box-4993548-4161745.png";
+            const chestOpenUrl = "https://cdn3d.iconscout.com/3d/premium/thumb/open-treasure-box-4993550-4161747.png";
+            
+            let chestsContainer = document.getElementById('chests-container');
+            let isBonusReady = false;
+            
+            function initChests(ready) {
+                isBonusReady = ready;
+                chestsContainer.innerHTML = "";
+                
+                for(let i=0; i<3; i++) {
+                    let wrapper = document.createElement('div');
+                    wrapper.className = `chest-wrapper ${ready ? '' : 'disabled'}`;
+                    wrapper.onclick = () => ready ? openChest(wrapper) : null;
+                    
+                    let glow = document.createElement('div');
+                    glow.className = 'chest-glow';
+                    
+                    let img = document.createElement('img');
+                    img.src = chestImageUrl;
+                    img.className = 'chest-img';
+                    
+                    let prize = document.createElement('div');
+                    prize.className = 'chest-prize';
+                    prize.innerText = "+?";
+                    
+                    wrapper.appendChild(glow);
+                    wrapper.appendChild(img);
+                    wrapper.appendChild(prize);
+                    chestsContainer.appendChild(wrapper);
+                }
+            }
 
             let bonusTimer;
-            function updateBonusUI(timeLeft) {{
-                let btn = document.getElementById("btn-spin");
+            function updateBonusUI(timeLeft) {
                 let txt = document.getElementById("bonus-status");
                 clearInterval(bonusTimer);
-                if (timeLeft <= 0) {{
-                    btn.disabled = false;
-                    btn.style.opacity = "1";
-                    txt.innerText = "¡Tiro Disponible!";
-                }} else {{
-                    btn.disabled = true;
-                    btn.style.opacity = "0.5";
-                    bonusTimer = setInterval(() => {{
+                
+                if (timeLeft <= 0) {
+                    if(!isBonusReady) initChests(true);
+                    txt.innerText = "¡Toca un cofre para reclamar!";
+                    txt.style.color = "var(--success)";
+                } else {
+                    if(isBonusReady) initChests(false);
+                    txt.style.color = "var(--hint)";
+                    bonusTimer = setInterval(() => {
                         timeLeft--;
                         if (timeLeft <= 0) updateBonusUI(0);
-                        else {{
+                        else {
                             let h = Math.floor(timeLeft / 3600);
                             let m = Math.floor((timeLeft % 3600) / 60);
-                            txt.innerText = `⏳ Próximo tiro en: ${{h}}h ${{m}}m`;
-                        }}
-                    }}, 1000);
-                }}
-            }}
+                            let s = Math.floor(timeLeft % 60);
+                            txt.innerText = `⏳ Disponible en: ${h}h ${m}m ${s}s`;
+                        }
+                    }, 1000);
+                }
+            }
 
-            async function spinRoulette() {{
+            async function openChest(selectedWrapper) {
+                if(!isBonusReady) return;
                 tg.HapticFeedback.impactOccurred('medium');
-                document.getElementById("btn-spin").disabled = true;
                 
-                let res = await fetch('/api/bonus', {{ method: "POST", headers: reqHeaders, body: JSON.stringify({{}}) }});
-                let data = await res.json();
+                document.querySelectorAll('.chest-wrapper').forEach(w => {
+                    w.classList.add('disabled');
+                    w.onclick = null;
+                });
                 
-                if(data.success) {{
-                    // Preparamos el elemento ganador al final de la pista
-                    let targetNum = data.bonus;
-                    let winDiv = document.createElement('div');
-                    winDiv.className = 'roulette-item';
-                    winDiv.style.color = '#FFD700';
-                    winDiv.innerText = targetNum;
-                    rTrack.appendChild(winDiv);
+                let txt = document.getElementById("bonus-status");
+                txt.innerText = "Abriendo...";
+                txt.style.color = "var(--gold)";
+                
+                try {
+                    let res = await fetch(`/api/bonus?id=${userId}`, { method: "POST", headers: reqHeaders, body: JSON.stringify({}) });
+                    let data = await res.json();
                     
-                    // Animación de giro
-                    let itemHeight = 80;
-                    let scrollAmount = -((rTrack.children.length - 1) * itemHeight);
-                    rTrack.style.transform = `translateY(${{scrollAmount}}px)`;
-                    
-                    setTimeout(() => {{
+                    if(data.success) {
+                        let targetNum = data.bonus;
+                        
+                        selectedWrapper.classList.remove('disabled');
+                        selectedWrapper.classList.add('open');
+                        selectedWrapper.querySelector('.chest-img').src = chestOpenUrl;
+                        selectedWrapper.querySelector('.chest-prize').innerText = `+${targetNum}`;
+                        
                         tg.HapticFeedback.notificationOccurred('success');
-                        confetti({{ particleCount: 150, spread: 70, origin: {{ y: 0.6 }} }});
-                        tg.showAlert(`🎉 ¡La ruleta paró en ${{targetNum}}!\nHas ganado ${{targetNum}} Puntos de Reputación.`);
-                        loadData();
-                        setTimeout(() => {{ 
-                            rTrack.style.transition = 'none';
-                            rTrack.style.transform = 'translateY(0)';
-                            initRoulette(); 
-                            setTimeout(() => rTrack.style.transition = 'transform 3s cubic-bezier(0.15, 0.9, 0.2, 1)', 50);
-                        }}, 2000);
-                    }}, 3000); // Tarda 3 seg en girar
-                }} else {{
-                    tg.showAlert("⚠️ Aún debes esperar.");
-                }}
-            }}
+                        confetti({ particleCount: 150, spread: 80, origin: { y: 0.5 }, colors: ['#FFD700', '#FFA500', '#FFFFFF'] });
+                        txt.innerText = `¡Has ganado ${targetNum} Puntos!`;
+                        
+                        setTimeout(() => {
+                            tg.showAlert(`🎉 ¡Felicidades!\nEncontraste ${targetNum} Puntos de Reputación en el cofre.`);
+                            loadData();
+                        }, 2500); 
+                    } else {
+                        tg.showAlert("⚠️ Aún debes esperar.");
+                        loadData(); 
+                    }
+                } catch(e) {
+                    tg.showAlert("❌ Error de red.");
+                    loadData();
+                }
+            }
 
-            async function loadData() {{
+            function timeAgo(timestamp) {
+                const seconds = Math.floor(Date.now() / 1000 - timestamp);
+                if (seconds < 60) return "hace instantes";
+                const minutes = Math.floor(seconds / 60);
+                if (minutes < 60) return `hace ${minutes}m`;
+                const hours = Math.floor(minutes / 60);
+                if (hours < 24) return `hace ${hours}h`;
+                return `hace ${Math.floor(hours / 24)}d`;
+            }
+
+            async function loadData() {
                 if (!userId) return;
-                let res = await fetch('/api/data', {{ headers: reqHeaders }});
-                if(res.status !== 200) return;
-                let data = await res.json();
-                
-                document.getElementById("photo-count").innerText = data.fotos;
-                document.getElementById("video-count").innerText = data.videos;
-                
-                let rep = data.reputation;
-                document.getElementById("vip-text").innerText = `${{rep}}/20 Pts`;
-                document.getElementById("vip-fill").style.width = Math.min(100, (rep / 20) * 100) + "%";
-                document.getElementById("ref-count").innerText = data.referrals;
-                
-                updateBonusUI(data.time_left);
-                
-                // Cargar Ranking
-                let rHTML = "";
-                data.leaderboard.forEach((u, i) => {{
-                    let medal = i==0?"🥇":i==1?"🥈":i==2?"🥉":"🏅";
-                    rHTML += `<div class="list-item"><b>${{medal}} ID: ${{u.id}}</b><span style="color:#FFD700">⭐ ${{u.rep}}</span></div>`;
-                }});
-                document.getElementById("ranking-list").innerHTML = rHTML || "No hay jugadores aún.";
+                try {
+                    let res = await fetch(`/api/data?id=${userId}`, { headers: reqHeaders });
+                    if(res.status !== 200) return;
+                    let data = await res.json();
+                    
+                    document.getElementById("photo-count").innerText = data.fotos;
+                    document.getElementById("video-count").innerText = data.videos;
+                    
+                    let rep = data.reputation;
+                    document.getElementById("vip-text").innerText = `${rep}/20 Pts`;
+                    document.getElementById("vip-fill").style.width = Math.min(100, (rep / 20) * 100) + "%";
+                    document.getElementById("ref-count").innerText = data.referrals;
+                    
+                    updateBonusUI(data.time_left);
+                    
+                    // Cooldown del mercado
+                    let btnPost = document.getElementById("btn-post-offer");
+                    let cdText = document.getElementById("offer-cooldown");
+                    if (data.offer_cooldown > 0) {
+                        btnPost.disabled = true;
+                        cdText.style.display = "block";
+                        let hm = Math.ceil(data.offer_cooldown / 60);
+                        cdText.innerText = `⏳ Próxima publicación en ${hm} min.`;
+                    } else {
+                        btnPost.disabled = false;
+                        cdText.style.display = "none";
+                    }
+                    
+                    // Ranking
+                    let rHTML = "";
+                    data.leaderboard.forEach((u, i) => {
+                        let rankClass = i < 3 ? `rank-${i+1}` : '';
+                        let medal = i==0?'👑':i==1?'🥈':i==2?'🥉':`#${i+1}`;
+                        let color = i==0?'var(--gold)':i==1?'#c0c0c0':i==2?'#cd7f32':'var(--hint)';
+                        
+                        rHTML += `
+                        <div class="list-item ${rankClass}" style="display:flex; justify-content:space-between; align-items:center;">
+                            <div style="display:flex; align-items:center; gap:12px;">
+                                <span style="font-size:20px; font-weight:800; width:30px; text-align:center; color:${color};">${medal}</span>
+                                <div><div class="item-name"><i class="fa-solid fa-user-ninja" style="font-size:12px; color:var(--hint);"></i> ID: ${u.id}</div></div>
+                            </div>
+                            <div style="text-align:right;">
+                                <div style="font-weight:800; color:var(--text-strong); font-size:16px;">${u.rep}</div>
+                                <div style="font-size:10px; color:var(--hint); text-transform:uppercase;">Pts</div>
+                            </div>
+                        </div>`;
+                    });
+                    document.getElementById("ranking-list").innerHTML = rHTML || '<div style="text-align:center; padding: 20px; color: var(--hint);">Aún no hay datos esta semana.</div>';
 
-                // Cargar Mercado
-                let oHTML = "";
-                data.offers.forEach(o => {{
-                    oHTML += `
-                    <div class="list-item" style="flex-direction:column; align-items:flex-start;">
-                        <div style="width:100%; display:flex; justify-content:space-between; margin-bottom:5px;">
-                            <b style="color:var(--accent); font-size:12px;">👤 ${{o.name}}</b>
-                            <button class="copy-btn" onclick="copyId(${{o.user_id}})">Copiar ID</button>
-                        </div>
-                        <p>💬 "${{o.text}}"</p>
-                    </div>`;
-                }});
-                document.getElementById("offers-list").innerHTML = oHTML || "El mercado está vacío.";
-            }}
+                    // Mercado
+                    let oHTML = "";
+                    data.offers.forEach(o => {
+                        let tAgo = timeAgo(o.time);
+                        oHTML += `
+                        <div class="list-item">
+                            <div class="item-header">
+                                <div class="item-name"><i class="fa-solid fa-circle-user"></i> ${o.name}</div>
+                                <div class="item-time"><i class="fa-regular fa-clock"></i> ${tAgo}</div>
+                            </div>
+                            <p class="item-text">${o.text}</p>
+                            <div style="display:flex; justify-content:flex-end;">
+                                <button class="copy-btn" onclick="copyId(${o.user_id})"><i class="fa-regular fa-copy"></i> Copiar ID</button>
+                            </div>
+                        </div>`;
+                    });
+                    document.getElementById("offers-list").innerHTML = oHTML || '<div style="text-align:center; padding: 20px; color: var(--hint);"><i class="fa-solid fa-shop-slash" style="font-size:24px; margin-bottom:8px; display:block;"></i>El mercado está vacío.<br>¡Sé el primero en publicar!</div>';
+                    
+                } catch(e) { console.error("Error loading data", e); }
+            }
 
-            async function postOffer() {{
-                let val = document.getElementById('offer-input').value;
-                if(val.length < 5) return tg.showAlert("⚠️ La oferta es muy corta.");
+            async function postOffer() {
+                let val = document.getElementById('offer-input').value.trim();
+                if(val.length < 10) return tg.showAlert("⚠️ La oferta es muy corta. Detalla qué buscas y ofreces (min. 10 letras).");
+                
+                let btn = document.getElementById("btn-post-offer");
+                btn.disabled = true;
+                btn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> Publicando...';
+                
                 tg.HapticFeedback.impactOccurred('light');
                 let name = user?.first_name || "Anónimo";
                 
-                await fetch('/api/offer', {{ 
-                    method: "POST", headers: reqHeaders, 
-                    body: JSON.stringify({{ text: val, name: name }}) 
-                }});
-                document.getElementById('offer-input').value = "";
-                tg.showAlert("✅ Oferta publicada en el mercado.");
-                loadData();
-            }}
-
-            async function clearInventory() {{
-                tg.showConfirm("¿Estás seguro de vaciar TODAS tus fotos y videos de tu cofre? Esta acción no se puede deshacer.", async (ok) => {{
-                    if(ok) {{
-                        await fetch('/api/clear', {{ method: "POST", headers: reqHeaders }});
+                try {
+                    let res = await fetch(`/api/offer?id=${userId}`, { 
+                        method: "POST", headers: reqHeaders, 
+                        body: JSON.stringify({ text: val, name: name }) 
+                    });
+                    let data = await res.json();
+                    
+                    if(data.success) {
+                        document.getElementById('offer-input').value = "";
                         tg.HapticFeedback.notificationOccurred('success');
-                        tg.showAlert("🗑️ Cofre vaciado.");
-                        loadData();
-                    }}
-                }});
-            }}
+                        tg.showAlert("✅ Oferta publicada en el mercado con éxito.");
+                    } else { tg.showAlert(data.error || "❌ No se pudo publicar."); }
+                } catch(e) { tg.showAlert("❌ Error de red."); }
+                
+                btn.innerHTML = '<i class="fa-solid fa-paper-plane"></i> Publicar en el Mercado';
+                loadData();
+            }
 
-            function copyId(id) {{
+            async function clearInventory() {
+                tg.showConfirm("⚠️ ¿Estás seguro de vaciar TODAS tus fotos y videos?\n\nEsta acción eliminará permanentemente tu inventario actual.", async (ok) => {
+                    if(ok) {
+                        try {
+                            await fetch(`/api/clear?id=${userId}`, { method: "POST", headers: reqHeaders });
+                            tg.HapticFeedback.notificationOccurred('success');
+                            tg.showAlert("🗑️ Caja fuerte vaciada correctamente.");
+                            loadData();
+                        } catch(e) { tg.showAlert("❌ Error de red."); }
+                    }
+                });
+            }
+
+            function copyId(id) {
                 tg.HapticFeedback.impactOccurred('light');
                 let temp = document.createElement("input");
                 temp.value = id;
@@ -463,26 +647,27 @@ async def handle_webapp(request):
                 temp.select();
                 document.execCommand("copy");
                 document.body.removeChild(temp);
-                tg.showAlert("✅ ID copiado: " + id + "\\n\\nVuelve al bot, selecciona 'Conectar ID' y pégalo.");
-            }}
+                tg.showAlert(`✅ ID copiado: ${id}\n\nVuelve al menú principal del bot, selecciona '🆔 Conectar ID' y pégalo.`);
+            }
 
-            function copyRefLink() {{
+            function copyRefLink() {
                 tg.HapticFeedback.impactOccurred('light');
-                let link = `https://t.me/${{botUsername}}?start=${{userId}}`;
+                let link = `https://t.me/${botUsername}?start=${userId}`;
                 let temp = document.createElement("input");
                 temp.value = link;
                 document.body.appendChild(temp);
                 temp.select();
                 document.execCommand("copy");
                 document.body.removeChild(temp);
-                tg.showAlert("✅ Link copiado.\\nEnvíalo a tus amigos para ganar VIP rápido.");
-            }}
+                tg.showAlert("✅ Link de invitación copiado.\n\nEnvíalo a tus amigos o compártelo en grupos para ganar VIP más rápido.");
+            }
 
+            initChests(false);
             loadData();
         </script>
     </body>
     </html>
-    """
+    """.replace("BOT_USERNAME_PLACEHOLDER", bot_username)
     return web.Response(text=html_content, content_type="text/html")
 
 async def start_web_server():
@@ -579,7 +764,26 @@ async def cmd_migrar_respaldo(message: Message):
 @router.message(Command("estadisticas"))
 async def cmd_stats(message: Message):
     if message.from_user.id not in SUPER_ADMIN_IDS: return
-    await message.answer(f"📊 **ESTADÍSTICAS**\n👥 Usuarios: `{await db.users.count_documents({})}`\n📁 Archivos: `{await db.inventory.count_documents({})}`\n🔄 Intercambios: `{await db.exchange_history.count_documents({})}`\n💬 Chats: `{len(active_chats)//2}`", parse_mode="Markdown")
+    
+    total_users = await db.users.count_documents({})
+    total_files = await db.inventory.count_documents({})
+    active_chats_count = len(active_chats) // 2
+    
+    total_archivos_enviados = await db.exchange_history.count_documents({})
+    operaciones_reales = total_archivos_enviados // 2
+    
+    vip_users = await db.users.count_documents({"in_vip": True})
+    
+    stats_text = (
+        "📊 **ESTADÍSTICAS GLOBALES**\n\n"
+        f"👥 Usuarios registrados: `{total_users}`\n"
+        f"🌟 Usuarios VIP: `{vip_users}`\n"
+        f"📁 Archivos en cofre: `{total_files}`\n"
+        f"🔄 Intercambios exitosos: `{operaciones_reales}`\n"
+        f"💬 Chats en vivo: `{active_chats_count}`"
+    )
+    
+    await message.answer(stats_text, parse_mode="Markdown")
 
 @router.message(Command("reinvitar"))
 async def cmd_reinvite(message: Message):
@@ -639,11 +843,8 @@ async def show_main_menu(user_id):
     bot_info = await bot.get_me()
     my_link = f"https://t.me/{bot_info.username}?start={user['_id']}"
     
-    # --- CAMBIO CLAVE PARA LA MINI APP ---
     base_url = os.environ.get("RENDER_EXTERNAL_URL", "https://tu-servicio.onrender.com")
-    # Agregamos "?bot=nombre_del_bot" al final del enlace
     webapp_url = f"{base_url}?bot={bot_info.username}"
-    # -------------------------------------
     
     btn_rnd = "💬 Buscar Chat" if lang == "es" else "💬 Random Chat"
     btn_id = "🆔 Conectar ID" if lang == "es" else "🆔 Connect ID"
@@ -676,7 +877,7 @@ async def cmd_help(message: Message):
         txt = "🤖 **Complete Guide**\n\n📦 **1. Load inventory:** Upload photos/videos here.\n💬 **2. Start Chat:** Connect randomly or by ID.\n🤝 **3. Batches:** Use the 'Propose' button in chat.\n🌟 **4. VIP:** Earn 20 reputation points (via trades or daily bonus) to enter the VIP group."
     await message.answer(txt, parse_mode="Markdown")
 
-# --- PERFIL E IDIOMA RESTAURADO ---
+# --- PERFIL E IDIOMA ---
 @router.callback_query(F.data == "change_lang")
 async def change_lang(callback: CallbackQuery):
     user = await get_user(callback.from_user.id)
@@ -856,17 +1057,19 @@ async def leave_chat(event, state: FSMContext):
 
 # --- VIP Y REPUTACIÓN ---
 async def check_vip_status(user_id):
-    user = await get_user(user_id)
-    if user.get("notified_vip"): return
-    if user.get("referrals", 0) >= 3 or user.get("reputation", 0) >= 20:
-        invite = await bot.create_chat_invite_link(chat_id=VIP_GROUP_ID, member_limit=1)
-        lang = user.get("lang", "es")
-        btn = "🌟 Entrar al VIP" if lang == "es" else "🌟 Join VIP"
-        msg = "🎉 **¡Te has ganado acceso al VIP!**" if lang == "es" else "🎉 **You've earned VIP access!**"
-        
-        markup = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=btn, url=invite.invite_link)]])
-        await bot.send_message(user_id, msg, reply_markup=markup, parse_mode="Markdown")
-        await save_user(user_id, {"notified_vip": True, "in_vip": True})
+    try:
+        user = await get_user(user_id)
+        if user.get("notified_vip"): return
+        if user.get("referrals", 0) >= 3 or user.get("reputation", 0) >= 20:
+            invite = await bot.create_chat_invite_link(chat_id=VIP_GROUP_ID, member_limit=1)
+            lang = user.get("lang", "es")
+            btn = "🌟 Entrar al VIP" if lang == "es" else "🌟 Join VIP"
+            msg = "🎉 **¡Te has ganado acceso al VIP!**" if lang == "es" else "🎉 **You've earned VIP access!**"
+            
+            markup = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=btn, url=invite.invite_link)]])
+            await bot.send_message(user_id, msg, reply_markup=markup, parse_mode="Markdown")
+            await save_user(user_id, {"notified_vip": True, "in_vip": True})
+    except: pass
 
 @router.message(F.chat.id == VIP_GROUP_ID, F.photo | F.video | F.document)
 async def vip_group_activity(message: Message):
@@ -1078,7 +1281,6 @@ async def reject_trade(callback: CallbackQuery):
         
     await callback.message.edit_text("❌ Rechazado." if lang == "es" else "❌ Rejected.")
 
-# AQUÍ ESTÁ LA CORRECCIÓN CLAVE PARA EL FILTRO DEL CHAT (Soporta ambos idiomas)
 @router.message(StateFilter(BotStates.chatting), ~F.text.in_(["🤝 Proponer Intercambio", "🤝 Propose Trade", "❌ Desconectar", "❌ Disconnect"]))
 async def relay_msg(message: Message):
     target = active_chats.get(message.from_user.id)
