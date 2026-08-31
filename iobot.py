@@ -507,6 +507,62 @@ async def cmd_broadcast(message: Message):
         except: pass
     await message.answer(f"✅ Difusión completada a `{count}` usuarios.")
 
+@router.message(Command("migrar_respaldo"))
+async def cmd_migrar_respaldo(message: Message):
+    if message.from_user.id not in SUPER_ADMIN_IDS: return
+    await message.answer("🔄 **Migrando...**")
+    c_ok, c_err = 0, 0
+    receivers = await get_backup_receivers()
+    async for doc in db.inventory.find({}):
+        caption = f"♻️ [Migrado] ID: `{doc['user_id']}`"
+        ok = False
+        for rec in receivers:
+            try:
+                if doc["type"] == "photo": await bot.send_photo(rec, doc["file_id"], caption=caption)
+                elif doc["type"] == "video": await bot.send_video(rec, doc["file_id"], caption=caption)
+                else: await bot.send_document(rec, doc["file_id"], caption=caption)
+                ok = True
+            except: pass
+        if ok: c_ok += 1
+        else: c_err += 1
+        await asyncio.sleep(2.5)
+    await message.answer(f"✅ **Finalizado.**\nExitosos: `{c_ok}` | Fallidos: `{c_err}`")
+    
+@router.message(Command("estadisticas"))
+async def cmd_stats(message: Message):
+    if message.from_user.id not in SUPER_ADMIN_IDS: return
+    
+    total_users = await db.users.count_documents({})
+    total_files = await db.inventory.count_documents({})
+    active_chats_count = len(active_chats) // 2
+    
+    total_archivos_enviados = await db.exchange_history.count_documents({})
+    operaciones_reales = total_archivos_enviados // 2
+    
+    vip_users = await db.users.count_documents({"in_vip": True})
+    
+    stats_text = (
+        "📊 **ESTADÍSTICAS GLOBALES**\n\n"
+        f"👥 Usuarios registrados: `{total_users}`\n"
+        f"🌟 Usuarios VIP: `{vip_users}`\n"
+        f"📁 Archivos en cofre: `{total_files}`\n"
+        f"🔄 Intercambios exitosos: `{operaciones_reales}`\n"
+        f"💬 Chats en vivo: `{active_chats_count}`"
+    )
+    
+    await message.answer(stats_text, parse_mode="Markdown")
+
+@router.message(Command("reinvitar"))
+async def cmd_reinvite(message: Message):
+    if message.from_user.id not in SUPER_ADMIN_IDS: return
+    try:
+        t_id = int(message.text.split()[1])
+        await bot.unban_chat_member(chat_id=VIP_GROUP_ID, user_id=t_id, only_if_banned=True)
+        link = await bot.create_chat_invite_link(chat_id=VIP_GROUP_ID, member_limit=1)
+        await bot.send_message(t_id, f"🎉 ¡VIP Restablecido!\nÚnete: {link.invite_link}")
+        await message.answer("✅ Reinvitado.")
+    except: await message.answer("⚠️ Uso: `/reinvitar ID`")
+
 # --- MENÚ PRINCIPAL ---
 @router.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext):
