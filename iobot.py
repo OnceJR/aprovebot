@@ -212,7 +212,7 @@ async def handle_webapp(request):
             }
             * { box-sizing: border-box; margin: 0; padding: 0; font-family: 'Poppins', sans-serif; }
             body { background: var(--bg); color: var(--text); padding: 16px; padding-bottom: 24px; }
-            .header { text-align: center; margin-bottom: 20px; margin-top: 10px; display: flex; justify-content: center; gap: 10px; }
+            .header { text-align: center; margin-bottom: 20px; margin-top: 10px; display: flex; justify-content: center; align-items: center; gap: 10px; }
             .header h1 { font-size: 24px; font-weight: 800; color: var(--text-strong); text-transform: uppercase; }
             .header-icon { font-size: 28px; color: var(--accent); }
             .tabs { display: flex; background: var(--card-bg); border-radius: 14px; padding: 6px; margin-bottom: 24px; overflow-x: auto; border: 1px solid var(--card-border); scrollbar-width: none; }
@@ -225,12 +225,16 @@ async def handle_webapp(request):
             .btn-main { background: var(--accent); color: #fff; border: none; border-radius: 12px; padding: 14px; width: 100%; font-size: 15px; font-weight: 700; cursor: pointer; }
             .btn-outline { background: transparent; border: 2px solid var(--accent); color: var(--accent); }
             .btn-danger { background: rgba(248, 81, 73, 0.1); color: var(--danger); border: 1px solid var(--danger); }
+            .copy-btn { background: rgba(88, 166, 255, 0.1); border: 1px solid rgba(88, 166, 255, 0.3); color: var(--accent); padding: 6px 12px; border-radius: 8px; font-size: 12px; font-weight: 600; cursor: pointer; transition: all 0.2s; display: inline-flex; align-items: center; gap: 6px; margin-top: 10px; }
+            .copy-btn:active { background: var(--accent); color: #fff; }
             .input-group { margin-bottom: 12px; }
-            input[type="text"] { width: 100%; padding: 14px; border-radius: 12px; border: 1px solid var(--card-border); background: rgba(0,0,0,0.2); color: #fff; font-family: 'Poppins'; }
+            input[type="text"] { width: 100%; padding: 14px; border-radius: 12px; border: 1px solid var(--card-border); background: rgba(0,0,0,0.2); color: #fff; font-family: 'Poppins'; outline: none;}
+            input[type="text"]:focus { border-color: var(--accent); }
             .progress-bg { background: rgba(255,255,255,0.05); border-radius: 10px; height: 14px; width: 100%; }
-            .progress-fill { background: var(--gradient-gold); height: 100%; width: 0%; border-radius: 10px; }
+            .progress-fill { background: var(--gradient-gold); height: 100%; width: 0%; border-radius: 10px; transition: width 0.8s ease-in-out; }
             .chests-container { display: flex; justify-content: center; gap: 15px; margin: 20px 0; }
-            .chest-wrapper { width: 90px; height: 90px; cursor: pointer; position: relative; }
+            .chest-wrapper { width: 90px; height: 90px; cursor: pointer; position: relative; transition: transform 0.2s;}
+            .chest-wrapper:active { transform: scale(0.95); }
             .chest-wrapper.disabled { opacity: 0.5; filter: grayscale(100%); pointer-events: none; }
             .chest-img { width: 100%; height: 100%; object-fit: contain; }
             .list-item { background: rgba(255,255,255,0.03); padding: 16px; border-radius: 12px; margin-bottom: 12px; border: 1px solid var(--card-border); }
@@ -254,7 +258,7 @@ async def handle_webapp(request):
             </div>
             <div class="card">
                 <div class="card-title">Referidos (<span id="ref-count">0</span>/3)</div>
-                <button class="btn-main btn-outline" onclick="copyRefLink()">Copiar Link Invitación</button>
+                <button class="btn-main btn-outline" onclick="copyRefLink()"><i class="fa-solid fa-link"></i> Copiar Link Invitación</button>
             </div>
         </div>
 
@@ -270,10 +274,10 @@ async def handle_webapp(request):
             <div class="card">
                 <div class="card-title">Publicar Oferta</div>
                 <div class="input-group"><input type="text" id="offer-input" placeholder="Ofrezco X busco Y..." maxlength="120"></div>
-                <button class="btn-main" onclick="postOffer()" id="btn-post-offer">Publicar</button>
-                <div id="offer-cooldown" style="color:var(--danger); display:none; margin-top:10px;">Debe esperar para publicar.</div>
+                <button class="btn-main" onclick="postOffer()" id="btn-post-offer"><i class="fa-solid fa-paper-plane"></i> Publicar</button>
+                <div id="offer-cooldown" style="color:var(--danger); display:none; margin-top:10px; font-size: 12px; text-align: center;">Debe esperar para publicar.</div>
             </div>
-            <div class="card"><div class="card-title">Mercado</div><div id="offers-list">Cargando...</div></div>
+            <div class="card"><div class="card-title">Mercado En Vivo</div><div id="offers-list">Cargando...</div></div>
         </div>
 
         <div id="rank" class="section">
@@ -285,7 +289,7 @@ async def handle_webapp(request):
                 <div class="card-title">Tu Caja Fuerte</div>
                 <p>📷 Fotos: <strong id="photo-count">--</strong> | 🎥 Videos: <strong id="video-count">--</strong></p>
                 <br>
-                <button class="btn-main btn-danger" onclick="clearInventory()">Vaciar Inventario</button>
+                <button class="btn-main btn-danger" onclick="clearInventory()"><i class="fa-solid fa-trash-can"></i> Vaciar Inventario</button>
             </div>
         </div>
 
@@ -298,11 +302,38 @@ async def handle_webapp(request):
             let reqHeaders = { "Content-Type": "application/json", "Authorization": tg.initData || "" };
 
             function switchTab(tabId, el) {
+                tg.HapticFeedback.impactOccurred('light');
                 document.querySelectorAll('.section').forEach(s => s.classList.remove('active'));
                 document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
                 document.getElementById(tabId).classList.add('active');
                 el.classList.add('active');
             }
+
+            // --- SISTEMA DE PORTAPAPELES UNIVERSAL ---
+            function copyToClipboard(text, successMessage) {
+                tg.HapticFeedback.impactOccurred('medium');
+                let temp = document.createElement("input");
+                temp.value = text;
+                document.body.appendChild(temp);
+                temp.select();
+                try {
+                    document.execCommand("copy");
+                    tg.showAlert(successMessage + "\\n\\n" + text);
+                } catch (err) {
+                    tg.showAlert("No se pudo copiar automáticamente. Cópialo manualmente:\\n\\n" + text);
+                }
+                document.body.removeChild(temp);
+            }
+
+            function copyRefLink() {
+                let link = `https://t.me/${botUsername}?start=${userId}`;
+                copyToClipboard(link, "✅ Link copiado al portapapeles. ¡Envíalo a tus amigos!");
+            }
+
+            function copyOfferId(targetId) {
+                copyToClipboard(targetId, "✅ ID copiado.\\n\\nVuelve al menú del bot y selecciona '🆔 Conectar ID' para pegarlo.");
+            }
+            // -----------------------------------------
 
             let chestsContainer = document.getElementById('chests-container');
             let isBonusReady = false;
@@ -314,7 +345,6 @@ async def handle_webapp(request):
                     let w = document.createElement('div');
                     w.className = `chest-wrapper ${ready ? '' : 'disabled'}`;
                     w.onclick = () => ready ? openChest(w) : null;
-                    // FIX 1: URL de imagen de cofre cerrado más estable
                     w.innerHTML = `<img src="https://img.icons8.com/color/96/treasure-chest.png" class="chest-img">`;
                     chestsContainer.appendChild(w);
                 }
@@ -335,7 +365,6 @@ async def handle_webapp(request):
                         timeLeft--;
                         if (timeLeft <= 0) updateBonusUI(0);
                         else {
-                            // FIX 2: Redondeo correcto para horas, minutos y segundos
                             let h = Math.floor(timeLeft / 3600);
                             let m = Math.floor((timeLeft % 3600) / 60);
                             let s = Math.floor(timeLeft % 60);
@@ -347,20 +376,31 @@ async def handle_webapp(request):
 
             async function openChest(el) {
                 if(!isBonusReady) return;
+                tg.HapticFeedback.impactOccurred('heavy');
                 document.querySelectorAll('.chest-wrapper').forEach(w => w.classList.add('disabled'));
                 document.getElementById("bonus-status").innerText = "Abriendo...";
+                
                 try {
                     let res = await fetch(`/api/bonus?id=${userId}`, { method: "POST", headers: reqHeaders, body: "{}" });
                     let data = await res.json();
+                    
                     if(data.success) {
                         el.classList.remove('disabled');
-                        // FIX 1.1: URL de imagen de cofre abierto más estable
                         el.querySelector('.chest-img').src = "https://img.icons8.com/color/96/open-box.png";
-                        confetti({ particleCount: 100, spread: 70, origin: { y: 0.6 } });
-                        tg.showAlert(`🎉 Ganaste ${data.bonus} Puntos de Reputación.`);
+                        confetti({ particleCount: 120, spread: 80, origin: { y: 0.6 } });
+                        tg.showAlert(`🎉 ¡Felicidades! Ganaste ${data.bonus} Puntos de Reputación.`);
                         loadData();
-                    } else tg.showAlert("⚠️ Debes esperar.");
-                } catch(e) { tg.showAlert("Error de red."); loadData(); }
+                    } else {
+                        tg.showAlert("⚠️ Aún debes esperar el tiempo indicado.");
+                        loadData();
+                    }
+                } catch(e) { 
+                    // FIX: Reiniciar UI de cofres si hay error de red
+                    tg.showAlert("❌ Error de conexión al servidor."); 
+                    document.querySelectorAll('.chest-wrapper').forEach(w => w.classList.remove('disabled'));
+                    document.getElementById("bonus-status").innerText = "¡Toca un cofre!";
+                    loadData(); 
+                }
             }
 
             async function loadData() {
@@ -389,42 +429,64 @@ async def handle_webapp(request):
                     }
                     
                     let rHTML = "";
-                    data.leaderboard.forEach((u, i) => rHTML += `<div class="list-item"><strong>#${i+1}</strong> ID: ${u.id} - ${u.rep} Pts</div>`);
-                    document.getElementById("ranking-list").innerHTML = rHTML || '<div style="text-align:center;color:var(--hint);">Aún no hay datos.</div>';
+                    data.leaderboard.forEach((u, i) => {
+                        let icon = i === 0 ? "👑" : i === 1 ? "🥈" : i === 2 ? "🥉" : `<strong>#${i+1}</strong>`;
+                        rHTML += `<div class="list-item" style="display:flex; justify-content:space-between;"><span>${icon} ID: ${u.id}</span><strong>${u.rep} Pts</strong></div>`;
+                    });
+                    document.getElementById("ranking-list").innerHTML = rHTML || '<div style="text-align:center;color:var(--hint); font-size:14px;">Aún no hay datos.</div>';
 
                     let oHTML = "";
-                    data.offers.forEach(o => oHTML += `<div class="list-item"><strong>${o.name}</strong><br>${o.text}<br><button onclick="tg.showAlert('Copia este ID en el bot: ${o.user_id}')" style="margin-top:10px;padding:5px;">Ver ID</button></div>`);
-                    document.getElementById("offers-list").innerHTML = oHTML || '<div style="text-align:center;color:var(--hint);">El mercado está vacío.</div>';
-                } catch(e) { console.error("Error loading data"); }
+                    data.offers.forEach(o => {
+                        oHTML += `<div class="list-item">
+                                    <div style="font-weight:700; font-size:14px; margin-bottom:4px;"><i class="fa-solid fa-circle-user"></i> ${o.name}</div>
+                                    <div style="font-size:13px; line-height:1.4;">${o.text}</div>
+                                    <button onclick="copyOfferId('${o.user_id}')" class="copy-btn"><i class="fa-regular fa-copy"></i> Copiar ID</button>
+                                  </div>`;
+                    });
+                    document.getElementById("offers-list").innerHTML = oHTML || '<div style="text-align:center;color:var(--hint); font-size:14px;">El mercado está vacío.</div>';
+                } catch(e) { console.error("Error loading data", e); }
             }
 
             async function postOffer() {
                 let val = document.getElementById('offer-input').value.trim();
-                if(val.length < 10) return tg.showAlert("⚠️ Oferta muy corta (min. 10 letras).");
+                if(val.length < 10) return tg.showAlert("⚠️ Oferta muy corta (min. 10 letras). Detalla qué ofreces y qué buscas.");
+                
+                let btn = document.getElementById("btn-post-offer");
+                btn.disabled = true;
+                btn.innerText = "Publicando...";
+
                 try {
                     let res = await fetch(`/api/offer?id=${userId}`, { method: "POST", headers: reqHeaders, body: JSON.stringify({ text: val, name: user?.first_name || "Anónimo" }) });
                     let data = await res.json();
+                    
                     if(data.success) {
                         document.getElementById('offer-input').value = "";
-                        tg.showAlert("✅ Publicado con éxito.");
-                    } else { tg.showAlert(data.error); }
-                } catch(e) { tg.showAlert("Error."); }
+                        tg.HapticFeedback.notificationOccurred('success');
+                        tg.showAlert("✅ Publicado con éxito en el mercado.");
+                    } else { 
+                        tg.showAlert(data.error); 
+                    }
+                } catch(e) { 
+                    tg.showAlert("❌ Error de red al publicar."); 
+                }
+                
+                btn.innerHTML = '<i class="fa-solid fa-paper-plane"></i> Publicar';
                 loadData();
             }
 
             async function clearInventory() {
-                tg.showConfirm("¿Vaciar todas tus fotos y videos?", async (ok) => {
+                tg.showConfirm("⚠️ ¿Vaciar todas tus fotos y videos permanentemente?", async (ok) => {
                     if(ok) {
-                        await fetch(`/api/clear?id=${userId}`, { method: "POST", headers: reqHeaders });
-                        tg.showAlert("Caja fuerte vaciada.");
-                        loadData();
+                        try {
+                            await fetch(`/api/clear?id=${userId}`, { method: "POST", headers: reqHeaders });
+                            tg.HapticFeedback.notificationOccurred('success');
+                            tg.showAlert("🗑️ Caja fuerte vaciada.");
+                            loadData();
+                        } catch(e) {
+                            tg.showAlert("❌ Error al vaciar inventario.");
+                        }
                     }
                 });
-            }
-
-            function copyRefLink() {
-                let link = `https://t.me/${botUsername}?start=${userId}`;
-                tg.showAlert(`Tu link:\n\n${link}`);
             }
 
             initChests(false);
