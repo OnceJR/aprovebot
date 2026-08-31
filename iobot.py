@@ -7,7 +7,7 @@ import hmac
 import hashlib
 import json
 from urllib.parse import unquote, parse_qsl
-
+from aiogram.exceptions import TelegramRetryAfter
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.filters import Command, CommandStart, StateFilter
 from aiogram.fsm.context import FSMContext
@@ -1054,20 +1054,32 @@ async def accept_trade(callback: CallbackQuery):
     await bot.send_message(s_id, msg_proc_s)
     
     for f in files_s[:amt]:
-        try:
-            await bot.forward_message(chat_id=u_id, from_chat_id=s_id, message_id=f["message_id"])
-            await db.exchange_history.insert_one({"sender_id": s_id, "receiver_id": u_id, "file_unique_id": f["file_unique_id"]})
-        except Exception as e: 
-            logging.error(f"Error al reenviar mensaje ID {f['message_id']}: {e}")
-        await asyncio.sleep(0.05)
+        while True:
+            try:
+                await bot.forward_message(chat_id=u_id, from_chat_id=s_id, message_id=f["message_id"])
+                await db.exchange_history.insert_one({"sender_id": s_id, "receiver_id": u_id, "file_unique_id": f["file_unique_id"]})
+                break # El envío fue exitoso, salimos del bucle while
+            except TelegramRetryAfter as e:
+                logging.warning(f"⚠️ Telegram pide esperar {e.retry_after}s (Antispam)...")
+                await asyncio.sleep(e.retry_after) # Espera el castigo de Telegram y reintenta
+            except Exception as e: 
+                logging.error(f"Error al reenviar mensaje ID {f['message_id']}: {e}")
+                break # Ocurrió otro error (ej. el usuario borró la foto original), salimos
+        await asyncio.sleep(0.15) # Pausa más amplia para evitar activar el filtro antispam
         
     for f in files_r[:amt]:
-        try:
-            await bot.forward_message(chat_id=s_id, from_chat_id=u_id, message_id=f["message_id"])
-            await db.exchange_history.insert_one({"sender_id": u_id, "receiver_id": s_id, "file_unique_id": f["file_unique_id"]})
-        except Exception as e: 
-            logging.error(f"Error al reenviar mensaje ID {f['message_id']}: {e}")
-        await asyncio.sleep(0.05)
+        while True:
+            try:
+                await bot.forward_message(chat_id=s_id, from_chat_id=u_id, message_id=f["message_id"])
+                await db.exchange_history.insert_one({"sender_id": u_id, "receiver_id": s_id, "file_unique_id": f["file_unique_id"]})
+                break
+            except TelegramRetryAfter as e:
+                logging.warning(f"⚠️ Telegram pide esperar {e.retry_after}s (Antispam)...")
+                await asyncio.sleep(e.retry_after)
+            except Exception as e: 
+                logging.error(f"Error al reenviar mensaje ID {f['message_id']}: {e}")
+                break
+        await asyncio.sleep(0.15)
         
     # --- Reputación Automática ---
     await db.users.update_one({"_id": u_id}, {"$inc": {"reputation": 1}})
