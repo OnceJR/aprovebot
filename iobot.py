@@ -1067,6 +1067,7 @@ async def accept_trade(callback: CallbackQuery):
         except: await db.inventory.delete_one({"file_unique_id": f["file_unique_id"]})
         await asyncio.sleep(0.05)
         
+    # --- Reputación Automática ---
     await db.users.update_one({"_id": u_id}, {"$inc": {"reputation": 1}})
     await db.users.update_one({"_id": s_id}, {"$inc": {"reputation": 1}})
     await check_vip_status(u_id)
