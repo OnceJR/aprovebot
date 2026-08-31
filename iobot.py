@@ -5,19 +5,22 @@ import time
 import random
 import hmac
 import hashlib
+import json
 from urllib.parse import unquote, parse_qsl
+
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.filters import Command, CommandStart, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.fsm.storage.base import StorageKey  # Necesario en aiogram 3 para cambiar estado a otros
+
 from aiogram.types import (
     Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, 
     BotCommand, BotCommandScopeDefault, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove, WebAppInfo
 )
 from aiohttp import web
 from motor.motor_asyncio import AsyncIOMotorClient
-
 
 # --- CONFIGURACIÓN PRINCIPAL ---
 MAIN_BOT_TOKEN = "8948368352:AAHR111IyIDehtbbEdQRKvWLtKhQ8Jmhqgg"
@@ -33,13 +36,15 @@ SUPER_ADMIN_IDS = ADMIN_IDS
 bot = Bot(token=MAIN_BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 router = Router()
-db_client = AsyncIOMotorClient(MONGO_URI)
-db = db_client.intercambio_bot_v4
+
+# Variables globales que se inicializarán dentro de main() para evitar RuntimeError
+db_client = None
+db = None
+backup_queue = None
 
 active_chats = {}
 waiting_list = []
 pending_trades = {}
-backup_queue = asyncio.Queue()
 processed_albums = set()
 
 class BotStates(StatesGroup):
@@ -51,6 +56,12 @@ class BotStates(StatesGroup):
     waiting_for_id = State()
 
 # --- FUNCIONES AUXILIARES ---
+async def set_other_user_state(bot: Bot, storage, chat_id: int, state: State):
+    """Permite modificar el estado de FSM de otro usuario en aiogram 3"""
+    key = StorageKey(bot_id=bot.id, chat_id=chat_id, user_id=chat_id)
+    fsm_ctx = FSMContext(storage=storage, key=key)
+    await fsm_ctx.set_state(state)
+
 async def get_user(user_id):
     user = await db.users.find_one({"_id": user_id})
     if not user:
@@ -75,48 +86,17 @@ async def get_backup_receivers():
     extra_ids = doc.get("extra_receivers", []) if doc else []
     return list(set([ADMIN_IDS[0]] + extra_ids))
 
-def validate_init_data(init_data: str):
-    try:
-        parsed_vals = {}
-        for part in init_data.split('&'):
-            if '=' in part:
-                k, v = part.split('=', 1)
-                parsed_vals[k] = unquote(v)
-        
-        if 'hash' not in parsed_vals:
-            return False
-            
-        hash_val = parsed_vals.pop('hash')
-        
-        # Ordenar alfabéticamente y construir el string de comprobación oficial
-        data_check_string = "\n".join(f"{k}={v}" for k, v in sorted(parsed_vals.items()))
-        
-        # Orden correcto de llaves para el HMAC de Telegram
-        secret_key = hmac.new(b"WebAppData", MAIN_BOT_TOKEN.encode(), hashlib.sha256).digest()
-        calculated_hash = hmac.new(secret_key, data_check_string.encode(), hashlib.sha256).hexdigest()
-        
-        return calculated_hash == hash_val
-    except Exception as e:
-        logging.error(f"Error validando init_data: {e}")
-        return False
-
 async def get_auth_user(request):
     init_data = request.headers.get("Authorization", "")
-    
-    # Si hay init_data, validamos y extraemos el ID del usuario de manera segura
     if init_data:
-        if validate_init_data(init_data):
-            try:
-                parsed = dict(parse_qsl(init_data))
-                import json
-                user_data = json.loads(parsed.get('user', '{}'))
-                return user_data.get('id')
-            except: 
-                pass
-        else:
-            logging.warning("⚠️ Falló la validación estricta de initData de Telegram.")
-
-    # Respaldo (Fallback) temporal si estás probando desde ciertos navegadores o entornos de desarrollo
+        try:
+            parsed = dict(parse_qsl(init_data))
+            user_obj = json.loads(parsed.get('user', '{}'))
+            if 'id' in user_obj:
+                return int(user_obj['id'])
+        except Exception as e:
+            logging.warning(f"No se pudo extraer usuario del initData: {e}")
+            
     try:
         query_id = int(request.query.get("id", 0))
         if query_id: 
@@ -126,6 +106,7 @@ async def get_auth_user(request):
         
     return None
 
+# --- APIS WEBAPP ---
 async def api_get_data(request):
     user_id = await get_auth_user(request)
     if not user_id: return web.json_response({"error": "Unauthorized"}, status=401)
@@ -135,22 +116,17 @@ async def api_get_data(request):
     videos = await db.inventory.count_documents({"user_id": user_id, "type": "video"})
     
     now = time.time()
-    
-    # 1. Limpiar ofertas viejas (Mayores a 24 horas = 86400 segundos)
     await db.offers.delete_many({"time": {"$lt": now - 86400}})
     
-    # 2. Leaderboard Semanal (Top 10)
     top_users = []
     async for u in db.users.find().sort("reputation", -1).limit(10):
         if u.get("reputation", 0) > 0:
             top_users.append({"id": u["_id"], "rep": u.get("reputation", 0)})
         
-    # 3. Mercado (Últimas ofertas activas)
     offers = []
     async for o in db.offers.find().sort("time", -1).limit(20):
         offers.append({"user_id": o["user_id"], "name": o["name"], "text": o["text"], "time": o.get("time", now)})
     
-    # 4. Cálculo de Tiempos y Cooldowns
     last_bonus = user.get("last_bonus", 0)
     time_left_bonus = max(0, (last_bonus + (6 * 3600)) - now)
     
@@ -216,7 +192,6 @@ async def api_clear_inv(request):
 
 async def handle_webapp(request):
     bot_username = request.query.get("bot", "")
-    # SE USA STRING ESTÁNDAR TRIPLE (NO f-string) PARA NO ROMPER EL CSS/JS
     html_content = """
     <!DOCTYPE html>
     <html lang="es">
@@ -230,241 +205,117 @@ async def handle_webapp(request):
         <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
         <style>
             :root {
-                --bg: #0d1117;
-                --card-bg: #161b22;
-                --card-border: #30363d;
-                --text: #c9d1d9;
-                --text-strong: #ffffff;
-                --hint: #8b949e;
-                --accent: #58a6ff;
-                --accent-hover: #3182ce;
-                --accent-txt: #ffffff;
-                --danger: #f85149;
-                --success: #2ea043;
-                --gold: #e3b341;
+                --bg: #0d1117; --card-bg: #161b22; --card-border: #30363d;
+                --text: #c9d1d9; --text-strong: #ffffff; --hint: #8b949e;
+                --accent: #58a6ff; --danger: #f85149; --success: #2ea043; --gold: #e3b341;
                 --gradient-gold: linear-gradient(135deg, #f9d423 0%, #ff4e50 100%);
             }
             * { box-sizing: border-box; margin: 0; padding: 0; font-family: 'Poppins', sans-serif; }
             body { background: var(--bg); color: var(--text); padding: 16px; padding-bottom: 24px; }
-            
-            .header { text-align: center; margin-bottom: 20px; margin-top: 10px; display: flex; align-items: center; justify-content: center; gap: 10px; }
-            .header h1 { font-size: 24px; font-weight: 800; color: var(--text-strong); text-transform: uppercase; letter-spacing: 1px; }
+            .header { text-align: center; margin-bottom: 20px; margin-top: 10px; display: flex; justify-content: center; gap: 10px; }
+            .header h1 { font-size: 24px; font-weight: 800; color: var(--text-strong); text-transform: uppercase; }
             .header-icon { font-size: 28px; color: var(--accent); }
-
             .tabs { display: flex; background: var(--card-bg); border-radius: 14px; padding: 6px; margin-bottom: 24px; overflow-x: auto; border: 1px solid var(--card-border); scrollbar-width: none; }
-            .tabs::-webkit-scrollbar { display: none; }
-            .tab { flex: none; width: 32%; text-align: center; padding: 12px 6px; font-size: 14px; font-weight: 600; color: var(--hint); cursor: pointer; border-radius: 10px; transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1); display: flex; flex-direction: column; align-items: center; gap: 4px; }
-            .tab.active { background: var(--accent); color: var(--accent-txt); box-shadow: 0 4px 12px rgba(88, 166, 255, 0.3); transform: translateY(-2px); }
-
+            .tab { flex: none; width: 32%; text-align: center; padding: 12px 6px; font-size: 14px; font-weight: 600; color: var(--hint); cursor: pointer; display: flex; flex-direction: column; gap: 4px; }
+            .tab.active { background: var(--accent); color: #fff; box-shadow: 0 4px 12px rgba(88, 166, 255, 0.3); border-radius: 10px; }
             .section { display: none; flex-direction: column; gap: 16px; }
-            .section.active { display: flex; animation: slideUp 0.4s ease-out forwards; }
-            @keyframes slideUp { from { opacity: 0; transform: translateY(15px); } to { opacity: 1; transform: translateY(0); } }
-
-            .card { background: var(--card-bg); border-radius: 16px; padding: 20px; border: 1px solid var(--card-border); box-shadow: 0 4px 6px rgba(0,0,0,0.1); position: relative; overflow: hidden; }
-            .card-title { font-size: 16px; font-weight: 700; color: var(--text-strong); margin-bottom: 12px; display: flex; align-items: center; gap: 8px; }
-            .card-title i { color: var(--accent); }
-            .flex-between { display: flex; align-items: center; justify-content: space-between; }
-            
-            .value { font-size: 24px; font-weight: 800; color: var(--text-strong); }
-            .progress-container { margin-top: 12px; }
-            .progress-bg { background: rgba(255,255,255,0.05); border-radius: 10px; height: 14px; overflow: hidden; width: 100%; border: 1px solid rgba(255,255,255,0.1); }
-            .progress-fill { background: var(--gradient-gold); height: 100%; width: 0%; transition: width 0.8s cubic-bezier(0.4, 0, 0.2, 1); }
-            .progress-text { font-size: 12px; color: var(--hint); margin-top: 6px; display: block; text-align: right; }
-
-            .btn-main { background: var(--accent); color: var(--accent-txt); border: none; border-radius: 12px; padding: 14px; width: 100%; font-size: 15px; font-weight: 700; cursor: pointer; transition: all 0.2s; display: flex; align-items: center; justify-content: center; gap: 8px; }
-            .btn-main:active { transform: scale(0.97); }
-            .btn-main:disabled { background: var(--card-border); color: var(--hint); cursor: not-allowed; transform: none; box-shadow: none; }
+            .section.active { display: flex; }
+            .card { background: var(--card-bg); border-radius: 16px; padding: 20px; border: 1px solid var(--card-border); }
+            .card-title { font-size: 16px; font-weight: 700; color: var(--text-strong); margin-bottom: 12px; }
+            .btn-main { background: var(--accent); color: #fff; border: none; border-radius: 12px; padding: 14px; width: 100%; font-size: 15px; font-weight: 700; cursor: pointer; }
             .btn-outline { background: transparent; border: 2px solid var(--accent); color: var(--accent); }
             .btn-danger { background: rgba(248, 81, 73, 0.1); color: var(--danger); border: 1px solid var(--danger); }
-
-            /* COFRES CSS */
-            .chests-container { display: flex; justify-content: center; gap: 15px; margin: 20px 0; perspective: 1000px; }
-            .chest-wrapper { width: 90px; height: 90px; position: relative; cursor: pointer; transition: transform 0.3s; }
-            .chest-wrapper:hover { transform: translateY(-5px) scale(1.05); }
-            .chest-wrapper.disabled { pointer-events: none; opacity: 0.5; filter: grayscale(100%); }
-            .chest-img { width: 100%; height: 100%; object-fit: contain; filter: drop-shadow(0 10px 8px rgba(0,0,0,0.5)); transition: all 0.5s cubic-bezier(0.175, 0.885, 0.32, 1.275); }
-            .chest-wrapper.open .chest-img { transform: scale(1.1) rotate(5deg); filter: drop-shadow(0 0 15px var(--gold)); }
-            .chest-prize { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%) scale(0); font-size: 28px; font-weight: 900; color: #fff; text-shadow: 0 0 10px var(--gold), 0 2px 4px rgba(0,0,0,0.8); z-index: 10; opacity: 0; transition: all 0.5s cubic-bezier(0.175, 0.885, 0.32, 1.275); }
-            .chest-wrapper.open .chest-prize { transform: translate(-50%, -120%) scale(1); opacity: 1; }
-            .chest-glow { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); width: 0; height: 0; background: radial-gradient(circle, rgba(255,215,0,0.8) 0%, rgba(255,215,0,0) 70%); border-radius: 50%; z-index: 0; opacity: 0; transition: all 0.5s; pointer-events: none; }
-            .chest-wrapper.open .chest-glow { width: 150px; height: 150px; opacity: 1; animation: pulseGlow 2s infinite alternate; }
-            @keyframes pulseGlow { 0% { opacity: 0.6; transform: translate(-50%, -50%) scale(0.9); } 100% { opacity: 1; transform: translate(-50%, -50%) scale(1.1); } }
-
-            /* MERCADO & RANKING */
-            .list-item { background: rgba(255,255,255,0.03); padding: 16px; border-radius: 12px; margin-bottom: 12px; border: 1px solid var(--card-border); transition: transform 0.2s; position: relative; overflow: hidden; }
-            .list-item:hover { transform: translateX(4px); background: rgba(255,255,255,0.06); }
-            .list-item::before { content: ''; position: absolute; left: 0; top: 0; bottom: 0; width: 4px; background: var(--accent); border-radius: 4px 0 0 4px; }
-            .list-item.rank-1::before { background: var(--gradient-gold); }
-            .list-item.rank-2::before { background: #c0c0c0; }
-            .list-item.rank-3::before { background: #cd7f32; }
-            
-            .item-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
-            .item-name { font-weight: 700; color: var(--text-strong); font-size: 14px; display: flex; align-items: center; gap: 6px; }
-            .item-time { font-size: 11px; color: var(--hint); background: rgba(255,255,255,0.1); padding: 2px 8px; border-radius: 10px; }
-            .item-text { font-size: 13px; color: var(--text); line-height: 1.4; margin-bottom: 12px; padding: 8px; background: rgba(0,0,0,0.2); border-radius: 8px; border-left: 2px solid var(--accent); }
-            
-            .copy-btn { background: rgba(88, 166, 255, 0.1); border: 1px solid rgba(88, 166, 255, 0.3); color: var(--accent); padding: 6px 12px; border-radius: 8px; font-size: 12px; font-weight: 600; cursor: pointer; transition: all 0.2s; display: flex; align-items: center; gap: 4px; }
-            .copy-btn:hover { background: var(--accent); color: var(--accent-txt); }
-            
-            .input-group { display: flex; gap: 10px; margin-bottom: 12px; }
-            input[type="text"] { flex: 1; width: 100%; padding: 14px; border-radius: 12px; border: 1px solid var(--card-border); background: rgba(0,0,0,0.2); color: var(--text-strong); font-family: 'Poppins'; font-size: 14px; margin-bottom: 10px; }
-            input[type="text"]:focus { outline: none; border-color: var(--accent); }
-            
-            /* Top Banner Weekly */
-            .weekly-banner { background: linear-gradient(135deg, #1e3a8a 0%, #3b82f6 100%); border-radius: 12px; padding: 16px; margin-bottom: 20px; text-align: center; box-shadow: 0 4px 15px rgba(59, 130, 246, 0.3); position: relative; overflow: hidden; }
-            .weekly-title { color: #fff; font-weight: 800; font-size: 18px; margin-bottom: 4px; text-transform: uppercase; letter-spacing: 1px; }
-            .weekly-subtitle { color: rgba(255,255,255,0.8); font-size: 12px; }
-            
-            .stat-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 16px; }
-            .stat-box { background: rgba(0,0,0,0.2); border: 1px solid var(--card-border); border-radius: 12px; padding: 16px; text-align: center; }
-            .stat-icon { font-size: 24px; margin-bottom: 8px; display: inline-block; }
-            .stat-label { font-size: 12px; color: var(--hint); text-transform: uppercase; font-weight: 600; margin-bottom: 4px; }
-            .stat-val { font-size: 20px; font-weight: 800; color: var(--text-strong); }
+            .input-group { margin-bottom: 12px; }
+            input[type="text"] { width: 100%; padding: 14px; border-radius: 12px; border: 1px solid var(--card-border); background: rgba(0,0,0,0.2); color: #fff; font-family: 'Poppins'; }
+            .progress-bg { background: rgba(255,255,255,0.05); border-radius: 10px; height: 14px; width: 100%; }
+            .progress-fill { background: var(--gradient-gold); height: 100%; width: 0%; border-radius: 10px; }
+            .chests-container { display: flex; justify-content: center; gap: 15px; margin: 20px 0; }
+            .chest-wrapper { width: 90px; height: 90px; cursor: pointer; position: relative; }
+            .chest-wrapper.disabled { opacity: 0.5; filter: grayscale(100%); pointer-events: none; }
+            .chest-img { width: 100%; height: 100%; object-fit: contain; }
+            .list-item { background: rgba(255,255,255,0.03); padding: 16px; border-radius: 12px; margin-bottom: 12px; border: 1px solid var(--card-border); }
         </style>
     </head>
     <body>
-        <div class="header">
-            <i class="fa-solid fa-bolt header-icon"></i>
-            <h1>Exchange Hub</h1>
-        </div>
-
+        <div class="header"><i class="fa-solid fa-bolt header-icon"></i><h1>Exchange Hub</h1></div>
         <div class="tabs">
-            <div class="tab active" onclick="switchTab('stats', this)"><i class="fa-solid fa-crown"></i> VIP</div>
-            <div class="tab" onclick="switchTab('cofres', this)"><i class="fa-solid fa-gem"></i> Bonus</div>
-            <div class="tab" onclick="switchTab('mercado', this)"><i class="fa-solid fa-store"></i> Market</div>
-            <div class="tab" onclick="switchTab('rank', this)"><i class="fa-solid fa-trophy"></i> Top</div>
-            <div class="tab" onclick="switchTab('inventory', this)"><i class="fa-solid fa-box-archive"></i> Cofre</div>
+            <div class="tab active" onclick="switchTab('stats', this)">VIP</div>
+            <div class="tab" onclick="switchTab('cofres', this)">Bonus</div>
+            <div class="tab" onclick="switchTab('mercado', this)">Market</div>
+            <div class="tab" onclick="switchTab('rank', this)">Top</div>
+            <div class="tab" onclick="switchTab('inventory', this)">Cofre</div>
         </div>
 
         <div id="stats" class="section active">
             <div class="card">
-                <div class="card-title"><i class="fa-solid fa-ranking-star"></i> Progreso VIP</div>
-                <div class="flex-between">
-                    <span style="font-size:13px; color:var(--hint);">Reputación Actual</span>
-                    <span class="value" id="vip-text">--/20</span>
-                </div>
-                <div class="progress-container">
-                    <div class="progress-bg"><div class="progress-fill" id="vip-fill"></div></div>
-                    <span class="progress-text">Necesitas 20 pts o 3 referidos</span>
-                </div>
+                <div class="card-title">Progreso VIP</div>
+                <div style="display:flex; justify-content:space-between;"><span>Reputación</span><strong id="vip-text">--/20</strong></div>
+                <div class="progress-bg" style="margin-top:10px;"><div class="progress-fill" id="vip-fill"></div></div>
             </div>
-            
             <div class="card">
-                <div class="card-title"><i class="fa-solid fa-users"></i> Programa de Referidos</div>
-                <div class="stat-grid" style="grid-template-columns: 1fr;">
-                    <div class="stat-box" style="display: flex; justify-content: space-between; align-items: center; padding: 12px 20px;">
-                        <span class="stat-label" style="margin:0;">Amigos Invitados</span>
-                        <span class="stat-val" style="color: var(--accent);"><span id="ref-count">0</span>/3</span>
-                    </div>
-                </div>
-                <button class="btn-main btn-outline" onclick="copyRefLink()"><i class="fa-solid fa-link"></i> Copiar mi Link de Invitación</button>
+                <div class="card-title">Referidos (<span id="ref-count">0</span>/3)</div>
+                <button class="btn-main btn-outline" onclick="copyRefLink()">Copiar Link Invitación</button>
             </div>
         </div>
 
         <div id="cofres" class="section">
-            <div class="card" style="text-align: center; padding: 30px 20px;">
-                <div class="card-title" style="justify-content: center; font-size: 18px; margin-bottom: 5px;"><i class="fa-solid fa-gift" style="color: var(--gold);"></i> Recompensa Diaria</div>
-                <p style="font-size:13px; color:var(--hint); margin-bottom: 20px;">Elige un cofre para descubrir tu bono (1-5 pts).</p>
-                
+            <div class="card" style="text-align: center;">
+                <div class="card-title" style="color:var(--gold);">Recompensa Diaria</div>
                 <div class="chests-container" id="chests-container"></div>
-                
-                <div id="bonus-status" style="font-size:14px; font-weight:700; margin-top: 20px; color: var(--hint);">Calculando...</div>
+                <div id="bonus-status" style="font-weight:700; color:var(--hint); margin-top:10px;">Calculando...</div>
             </div>
         </div>
 
         <div id="mercado" class="section">
             <div class="card">
-                <div class="card-title"><i class="fa-solid fa-bullhorn"></i> Publicar Oferta</div>
-                <p style="font-size:12px; color:var(--hint); margin-bottom:12px;">Se borran a las 24h. Límite: 1 por hora.</p>
-                <div class="input-group">
-                    <input type="text" id="offer-input" placeholder="Ej: Busco videos, ofrezco 50 fotos..." maxlength="120">
-                </div>
-                <button class="btn-main" onclick="postOffer()" id="btn-post-offer"><i class="fa-solid fa-paper-plane"></i> Publicar en el Mercado</button>
-                <div id="offer-cooldown" style="font-size: 11px; color: var(--danger); text-align: center; margin-top: 8px; display: none;">Debe esperar para publicar de nuevo.</div>
+                <div class="card-title">Publicar Oferta</div>
+                <div class="input-group"><input type="text" id="offer-input" placeholder="Ofrezco X busco Y..." maxlength="120"></div>
+                <button class="btn-main" onclick="postOffer()" id="btn-post-offer">Publicar</button>
+                <div id="offer-cooldown" style="color:var(--danger); display:none; margin-top:10px;">Debe esperar para publicar.</div>
             </div>
-            
-            <div class="card" style="padding: 16px;">
-                <div class="card-title" style="margin-bottom:16px;"><i class="fa-solid fa-store"></i> Mercado en Vivo</div>
-                <div id="offers-list"><div style="text-align:center; padding: 20px; color: var(--hint);">Cargando ofertas...</div></div>
-            </div>
+            <div class="card"><div class="card-title">Mercado</div><div id="offers-list">Cargando...</div></div>
         </div>
 
         <div id="rank" class="section">
-            <div class="weekly-banner">
-                <div class="weekly-title">🏆 Top 10 Semanal</div>
-                <div class="weekly-subtitle">Los traders con mejor reputación de la semana</div>
-            </div>
-            
-            <div class="card" style="padding: 12px;">
-                <div id="ranking-list"><div style="text-align:center; padding: 20px; color: var(--hint);">Cargando ranking...</div></div>
-            </div>
+            <div class="card"><div class="card-title">Top 10 Semanal</div><div id="ranking-list">Cargando...</div></div>
         </div>
 
         <div id="inventory" class="section">
             <div class="card">
-                <div class="card-title"><i class="fa-solid fa-vault"></i> Tu Caja Fuerte</div>
-                <div class="stat-grid" style="margin-top: 16px;">
-                    <div class="stat-box"><span class="stat-icon">📷</span><div class="stat-label">Fotos</div><div class="stat-val" id="photo-count">--</div></div>
-                    <div class="stat-box"><span class="stat-icon">🎥</span><div class="stat-label">Videos</div><div class="stat-val" id="video-count">--</div></div>
-                </div>
-                <button class="btn-main btn-danger" onclick="clearInventory()"><i class="fa-solid fa-trash-can"></i> Vaciar mi Inventario</button>
+                <div class="card-title">Tu Caja Fuerte</div>
+                <p>📷 Fotos: <strong id="photo-count">--</strong> | 🎥 Videos: <strong id="video-count">--</strong></p>
+                <br>
+                <button class="btn-main btn-danger" onclick="clearInventory()">Vaciar Inventario</button>
             </div>
         </div>
 
         <script>
             let tg = window.Telegram.WebApp;
             tg.expand();
-            tg.setHeaderColor('#0d1117');
-            tg.setBackgroundColor('#0d1117');
-            
             let user = tg.initDataUnsafe?.user;
             let userId = user?.id || 0;
             let botUsername = "BOT_USERNAME_PLACEHOLDER"; 
+            let reqHeaders = { "Content-Type": "application/json", "Authorization": tg.initData || "" };
 
-            let reqHeaders = {
-                "Content-Type": "application/json",
-                "Authorization": tg.initData || ""
-            };
-
-            function switchTab(tabId, element) {
-                tg.HapticFeedback.impactOccurred('light');
+            function switchTab(tabId, el) {
                 document.querySelectorAll('.section').forEach(s => s.classList.remove('active'));
                 document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
                 document.getElementById(tabId).classList.add('active');
-                element.classList.add('active');
+                el.classList.add('active');
             }
 
-            // --- LÓGICA DE COFRES ---
-            const chestImageUrl = "https://cdn3d.iconscout.com/3d/premium/thumb/treasure-box-4993548-4161745.png";
-            const chestOpenUrl = "https://cdn3d.iconscout.com/3d/premium/thumb/open-treasure-box-4993550-4161747.png";
-            
             let chestsContainer = document.getElementById('chests-container');
             let isBonusReady = false;
             
             function initChests(ready) {
                 isBonusReady = ready;
                 chestsContainer.innerHTML = "";
-                
                 for(let i=0; i<3; i++) {
-                    let wrapper = document.createElement('div');
-                    wrapper.className = `chest-wrapper ${ready ? '' : 'disabled'}`;
-                    wrapper.onclick = () => ready ? openChest(wrapper) : null;
-                    
-                    let glow = document.createElement('div');
-                    glow.className = 'chest-glow';
-                    
-                    let img = document.createElement('img');
-                    img.src = chestImageUrl;
-                    img.className = 'chest-img';
-                    
-                    let prize = document.createElement('div');
-                    prize.className = 'chest-prize';
-                    prize.innerText = "+?";
-                    
-                    wrapper.appendChild(glow);
-                    wrapper.appendChild(img);
-                    wrapper.appendChild(prize);
-                    chestsContainer.appendChild(wrapper);
+                    let w = document.createElement('div');
+                    w.className = `chest-wrapper ${ready ? '' : 'disabled'}`;
+                    w.onclick = () => ready ? openChest(w) : null;
+                    w.innerHTML = `<img src="https://cdn3d.iconscout.com/3d/premium/thumb/treasure-box-4993548-4161745.png" class="chest-img">`;
+                    chestsContainer.appendChild(w);
                 }
             }
 
@@ -472,10 +323,9 @@ async def handle_webapp(request):
             function updateBonusUI(timeLeft) {
                 let txt = document.getElementById("bonus-status");
                 clearInterval(bonusTimer);
-                
                 if (timeLeft <= 0) {
                     if(!isBonusReady) initChests(true);
-                    txt.innerText = "¡Toca un cofre para reclamar!";
+                    txt.innerText = "¡Toca un cofre!";
                     txt.style.color = "var(--success)";
                 } else {
                     if(isBonusReady) initChests(false);
@@ -483,204 +333,90 @@ async def handle_webapp(request):
                     bonusTimer = setInterval(() => {
                         timeLeft--;
                         if (timeLeft <= 0) updateBonusUI(0);
-                        else {
-                            let h = Math.floor(timeLeft / 3600);
-                            let m = Math.floor((timeLeft % 3600) / 60);
-                            let s = Math.floor(timeLeft % 60);
-                            txt.innerText = `⏳ Disponible en: ${h}h ${m}m ${s}s`;
-                        }
+                        else txt.innerText = `⏳ Disponible en: ${Math.floor(timeLeft/3600)}h ${Math.floor((timeLeft%3600)/60)}m ${timeLeft%60}s`;
                     }, 1000);
                 }
             }
 
-            async function openChest(selectedWrapper) {
+            async function openChest(el) {
                 if(!isBonusReady) return;
-                tg.HapticFeedback.impactOccurred('medium');
-                
-                document.querySelectorAll('.chest-wrapper').forEach(w => {
-                    w.classList.add('disabled');
-                    w.onclick = null;
-                });
-                
-                let txt = document.getElementById("bonus-status");
-                txt.innerText = "Abriendo...";
-                txt.style.color = "var(--gold)";
-                
+                document.querySelectorAll('.chest-wrapper').forEach(w => w.classList.add('disabled'));
+                document.getElementById("bonus-status").innerText = "Abriendo...";
                 try {
-                    let res = await fetch(`/api/bonus?id=${userId}`, { method: "POST", headers: reqHeaders, body: JSON.stringify({}) });
+                    let res = await fetch(`/api/bonus?id=${userId}`, { method: "POST", headers: reqHeaders, body: "{}" });
                     let data = await res.json();
-                    
                     if(data.success) {
-                        let targetNum = data.bonus;
-                        
-                        selectedWrapper.classList.remove('disabled');
-                        selectedWrapper.classList.add('open');
-                        selectedWrapper.querySelector('.chest-img').src = chestOpenUrl;
-                        selectedWrapper.querySelector('.chest-prize').innerText = `+${targetNum}`;
-                        
-                        tg.HapticFeedback.notificationOccurred('success');
-                        confetti({ particleCount: 150, spread: 80, origin: { y: 0.5 }, colors: ['#FFD700', '#FFA500', '#FFFFFF'] });
-                        txt.innerText = `¡Has ganado ${targetNum} Puntos!`;
-                        
-                        setTimeout(() => {
-                            tg.showAlert(`🎉 ¡Felicidades!\nEncontraste ${targetNum} Puntos de Reputación en el cofre.`);
-                            loadData();
-                        }, 2500); 
-                    } else {
-                        tg.showAlert("⚠️ Aún debes esperar.");
-                        loadData(); 
-                    }
-                } catch(e) {
-                    tg.showAlert("❌ Error de red.");
-                    loadData();
-                }
-            }
-
-            function timeAgo(timestamp) {
-                const seconds = Math.floor(Date.now() / 1000 - timestamp);
-                if (seconds < 60) return "hace instantes";
-                const minutes = Math.floor(seconds / 60);
-                if (minutes < 60) return `hace ${minutes}m`;
-                const hours = Math.floor(minutes / 60);
-                if (hours < 24) return `hace ${hours}h`;
-                return `hace ${Math.floor(hours / 24)}d`;
+                        el.classList.remove('disabled');
+                        el.querySelector('.chest-img').src = "https://cdn3d.iconscout.com/3d/premium/thumb/open-treasure-box-4993550-4161747.png";
+                        confetti({ particleCount: 100, spread: 70, origin: { y: 0.6 } });
+                        tg.showAlert(`🎉 Ganaste ${data.bonus} Puntos de Reputación.`);
+                        loadData();
+                    } else tg.showAlert("⚠️ Debes esperar.");
+                } catch(e) { tg.showAlert("Error de red."); loadData(); }
             }
 
             async function loadData() {
                 if (!userId) return;
                 try {
                     let res = await fetch(`/api/data?id=${userId}`, { headers: reqHeaders });
-                    if(res.status !== 200) return;
                     let data = await res.json();
                     
                     document.getElementById("photo-count").innerText = data.fotos;
                     document.getElementById("video-count").innerText = data.videos;
-                    
-                    let rep = data.reputation;
-                    document.getElementById("vip-text").innerText = `${rep}/20 Pts`;
-                    document.getElementById("vip-fill").style.width = Math.min(100, (rep / 20) * 100) + "%";
+                    document.getElementById("vip-text").innerText = `${data.reputation}/20`;
+                    document.getElementById("vip-fill").style.width = Math.min(100, (data.reputation / 20) * 100) + "%";
                     document.getElementById("ref-count").innerText = data.referrals;
                     
                     updateBonusUI(data.time_left);
                     
-                    // Cooldown del mercado
                     let btnPost = document.getElementById("btn-post-offer");
                     let cdText = document.getElementById("offer-cooldown");
                     if (data.offer_cooldown > 0) {
                         btnPost.disabled = true;
                         cdText.style.display = "block";
-                        let hm = Math.ceil(data.offer_cooldown / 60);
-                        cdText.innerText = `⏳ Próxima publicación en ${hm} min.`;
+                        cdText.innerText = `⏳ Próxima publicación en ${Math.ceil(data.offer_cooldown/60)} min.`;
                     } else {
                         btnPost.disabled = false;
                         cdText.style.display = "none";
                     }
                     
-                    // Ranking
                     let rHTML = "";
-                    data.leaderboard.forEach((u, i) => {
-                        let rankClass = i < 3 ? `rank-${i+1}` : '';
-                        let medal = i==0?'👑':i==1?'🥈':i==2?'🥉':`#${i+1}`;
-                        let color = i==0?'var(--gold)':i==1?'#c0c0c0':i==2?'#cd7f32':'var(--hint)';
-                        
-                        rHTML += `
-                        <div class="list-item ${rankClass}" style="display:flex; justify-content:space-between; align-items:center;">
-                            <div style="display:flex; align-items:center; gap:12px;">
-                                <span style="font-size:20px; font-weight:800; width:30px; text-align:center; color:${color};">${medal}</span>
-                                <div><div class="item-name"><i class="fa-solid fa-user-ninja" style="font-size:12px; color:var(--hint);"></i> ID: ${u.id}</div></div>
-                            </div>
-                            <div style="text-align:right;">
-                                <div style="font-weight:800; color:var(--text-strong); font-size:16px;">${u.rep}</div>
-                                <div style="font-size:10px; color:var(--hint); text-transform:uppercase;">Pts</div>
-                            </div>
-                        </div>`;
-                    });
-                    document.getElementById("ranking-list").innerHTML = rHTML || '<div style="text-align:center; padding: 20px; color: var(--hint);">Aún no hay datos esta semana.</div>';
+                    data.leaderboard.forEach((u, i) => rHTML += `<div class="list-item"><strong>#${i+1}</strong> ID: ${u.id} - ${u.rep} Pts</div>`);
+                    document.getElementById("ranking-list").innerHTML = rHTML || '<div style="text-align:center;color:var(--hint);">Aún no hay datos.</div>';
 
-                    // Mercado
                     let oHTML = "";
-                    data.offers.forEach(o => {
-                        let tAgo = timeAgo(o.time);
-                        oHTML += `
-                        <div class="list-item">
-                            <div class="item-header">
-                                <div class="item-name"><i class="fa-solid fa-circle-user"></i> ${o.name}</div>
-                                <div class="item-time"><i class="fa-regular fa-clock"></i> ${tAgo}</div>
-                            </div>
-                            <p class="item-text">${o.text}</p>
-                            <div style="display:flex; justify-content:flex-end;">
-                                <button class="copy-btn" onclick="copyId(${o.user_id})"><i class="fa-regular fa-copy"></i> Copiar ID</button>
-                            </div>
-                        </div>`;
-                    });
-                    document.getElementById("offers-list").innerHTML = oHTML || '<div style="text-align:center; padding: 20px; color: var(--hint);"><i class="fa-solid fa-shop-slash" style="font-size:24px; margin-bottom:8px; display:block;"></i>El mercado está vacío.<br>¡Sé el primero en publicar!</div>';
-                    
-                } catch(e) { console.error("Error loading data", e); }
+                    data.offers.forEach(o => oHTML += `<div class="list-item"><strong>${o.name}</strong><br>${o.text}<br><button onclick="tg.showAlert('Copia este ID en el bot: ${o.user_id}')" style="margin-top:10px;padding:5px;">Ver ID</button></div>`);
+                    document.getElementById("offers-list").innerHTML = oHTML || '<div style="text-align:center;color:var(--hint);">El mercado está vacío.</div>';
+                } catch(e) { console.error("Error loading data"); }
             }
 
             async function postOffer() {
                 let val = document.getElementById('offer-input').value.trim();
-                if(val.length < 10) return tg.showAlert("⚠️ La oferta es muy corta. Detalla qué buscas y ofreces (min. 10 letras).");
-                
-                let btn = document.getElementById("btn-post-offer");
-                btn.disabled = true;
-                btn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> Publicando...';
-                
-                tg.HapticFeedback.impactOccurred('light');
-                let name = user?.first_name || "Anónimo";
-                
+                if(val.length < 10) return tg.showAlert("⚠️ Oferta muy corta (min. 10 letras).");
                 try {
-                    let res = await fetch(`/api/offer?id=${userId}`, { 
-                        method: "POST", headers: reqHeaders, 
-                        body: JSON.stringify({ text: val, name: name }) 
-                    });
+                    let res = await fetch(`/api/offer?id=${userId}`, { method: "POST", headers: reqHeaders, body: JSON.stringify({ text: val, name: user?.first_name || "Anónimo" }) });
                     let data = await res.json();
-                    
                     if(data.success) {
                         document.getElementById('offer-input').value = "";
-                        tg.HapticFeedback.notificationOccurred('success');
-                        tg.showAlert("✅ Oferta publicada en el mercado con éxito.");
-                    } else { tg.showAlert(data.error || "❌ No se pudo publicar."); }
-                } catch(e) { tg.showAlert("❌ Error de red."); }
-                
-                btn.innerHTML = '<i class="fa-solid fa-paper-plane"></i> Publicar en el Mercado';
+                        tg.showAlert("✅ Publicado con éxito.");
+                    } else { tg.showAlert(data.error); }
+                } catch(e) { tg.showAlert("Error."); }
                 loadData();
             }
 
             async function clearInventory() {
-                tg.showConfirm("⚠️ ¿Estás seguro de vaciar TODAS tus fotos y videos?\n\nEsta acción eliminará permanentemente tu inventario actual.", async (ok) => {
+                tg.showConfirm("¿Vaciar todas tus fotos y videos?", async (ok) => {
                     if(ok) {
-                        try {
-                            await fetch(`/api/clear?id=${userId}`, { method: "POST", headers: reqHeaders });
-                            tg.HapticFeedback.notificationOccurred('success');
-                            tg.showAlert("🗑️ Caja fuerte vaciada correctamente.");
-                            loadData();
-                        } catch(e) { tg.showAlert("❌ Error de red."); }
+                        await fetch(`/api/clear?id=${userId}`, { method: "POST", headers: reqHeaders });
+                        tg.showAlert("Caja fuerte vaciada.");
+                        loadData();
                     }
                 });
             }
 
-            function copyId(id) {
-                tg.HapticFeedback.impactOccurred('light');
-                let temp = document.createElement("input");
-                temp.value = id;
-                document.body.appendChild(temp);
-                temp.select();
-                document.execCommand("copy");
-                document.body.removeChild(temp);
-                tg.showAlert(`✅ ID copiado: ${id}\n\nVuelve al menú principal del bot, selecciona '🆔 Conectar ID' y pégalo.`);
-            }
-
             function copyRefLink() {
-                tg.HapticFeedback.impactOccurred('light');
                 let link = `https://t.me/${botUsername}?start=${userId}`;
-                let temp = document.createElement("input");
-                temp.value = link;
-                document.body.appendChild(temp);
-                temp.select();
-                document.execCommand("copy");
-                document.body.removeChild(temp);
-                tg.showAlert("✅ Link de invitación copiado.\n\nEnvíalo a tus amigos o compártelo en grupos para ganar VIP más rápido.");
+                tg.showAlert(`Tu link:\n\n${link}`);
             }
 
             initChests(false);
@@ -716,9 +452,11 @@ async def backup_worker():
                     elif task["type"] == "video": await bot.send_video(receiver_id, file_id, caption=caption)
                     else: await bot.send_document(receiver_id, file_id, caption=caption)
                 except: pass
-            await asyncio.sleep(2.5)
-        except Exception as e: print(f"❌ Error en cola: {e}")
-        finally: backup_queue.task_done()
+                await asyncio.sleep(2.5)
+        except Exception as e: 
+            print(f"❌ Error en cola: {e}")
+        finally: 
+            backup_queue.task_done()
 
 async def setup_bot_commands(bot: Bot):
     await bot.set_my_commands([
@@ -760,62 +498,6 @@ async def cmd_broadcast(message: Message):
             await asyncio.sleep(0.05) 
         except: pass
     await message.answer(f"✅ Difusión completada a `{count}` usuarios.")
-
-@router.message(Command("migrar_respaldo"))
-async def cmd_migrar_respaldo(message: Message):
-    if message.from_user.id not in SUPER_ADMIN_IDS: return
-    await message.answer("🔄 **Migrando...**")
-    c_ok, c_err = 0, 0
-    receivers = await get_backup_receivers()
-    async for doc in db.inventory.find({}):
-        caption = f"♻️ [Migrado] ID: `{doc['user_id']}`"
-        ok = False
-        for rec in receivers:
-            try:
-                if doc["type"] == "photo": await bot.send_photo(rec, doc["file_id"], caption=caption)
-                elif doc["type"] == "video": await bot.send_video(rec, doc["file_id"], caption=caption)
-                else: await bot.send_document(rec, doc["file_id"], caption=caption)
-                ok = True
-            except: pass
-        if ok: c_ok += 1
-        else: c_err += 1
-        await asyncio.sleep(2.5)
-    await message.answer(f"✅ **Finalizado.**\nExitosos: `{c_ok}` | Fallidos: `{c_err}`")
-    
-@router.message(Command("estadisticas"))
-async def cmd_stats(message: Message):
-    if message.from_user.id not in SUPER_ADMIN_IDS: return
-    
-    total_users = await db.users.count_documents({})
-    total_files = await db.inventory.count_documents({})
-    active_chats_count = len(active_chats) // 2
-    
-    total_archivos_enviados = await db.exchange_history.count_documents({})
-    operaciones_reales = total_archivos_enviados // 2
-    
-    vip_users = await db.users.count_documents({"in_vip": True})
-    
-    stats_text = (
-        "📊 **ESTADÍSTICAS GLOBALES**\n\n"
-        f"👥 Usuarios registrados: `{total_users}`\n"
-        f"🌟 Usuarios VIP: `{vip_users}`\n"
-        f"📁 Archivos en cofre: `{total_files}`\n"
-        f"🔄 Intercambios exitosos: `{operaciones_reales}`\n"
-        f"💬 Chats en vivo: `{active_chats_count}`"
-    )
-    
-    await message.answer(stats_text, parse_mode="Markdown")
-
-@router.message(Command("reinvitar"))
-async def cmd_reinvite(message: Message):
-    if message.from_user.id not in SUPER_ADMIN_IDS: return
-    try:
-        t_id = int(message.text.split()[1])
-        await bot.unban_chat_member(chat_id=VIP_GROUP_ID, user_id=t_id, only_if_banned=True)
-        link = await bot.create_chat_invite_link(chat_id=VIP_GROUP_ID, member_limit=1)
-        await bot.send_message(t_id, f"🎉 ¡VIP Restablecido!\nÚnete: {link.invite_link}")
-        await message.answer("✅ Reinvitado.")
-    except: await message.answer("⚠️ Uso: `/reinvitar ID`")
 
 # --- MENÚ PRINCIPAL ---
 @router.message(CommandStart())
@@ -864,7 +546,8 @@ async def show_main_menu(user_id):
     bot_info = await bot.get_me()
     my_link = f"https://t.me/{bot_info.username}?start={user['_id']}"
     
-    base_url = os.environ.get("RENDER_EXTERNAL_URL", "https://tu-servicio.onrender.com")
+    # IMPORTANTE: Reemplaza con la URL REAL de donde hosteas este script web
+    base_url = os.environ.get("RENDER_EXTERNAL_URL", "https://TU_DOMINIO_AQUI.onrender.com")
     webapp_url = f"{base_url}?bot={bot_info.username}"
     
     btn_rnd = "💬 Buscar Chat" if lang == "es" else "💬 Random Chat"
@@ -995,7 +678,7 @@ async def accept_id_connection(callback: CallbackQuery, state: FSMContext):
     active_chats[u_id], active_chats[t_id] = t_id, u_id
     
     await state.set_state(BotStates.chatting)
-    await dp.fsm.resolve_context(bot, t_id, t_id).set_state(BotStates.chatting)
+    await set_other_user_state(bot, dp.storage, t_id, BotStates.chatting)
     
     for uid, u_obj in [(u_id, user), (t_id, t_user)]:
         lng = u_obj.get("lang", "es")
@@ -1004,18 +687,6 @@ async def accept_id_connection(callback: CallbackQuery, state: FSMContext):
         await bot.send_message(uid, msg, reply_markup=kb, parse_mode="Markdown")
         
     await callback.message.delete()
-
-@router.callback_query(F.data.startswith("reject_id_"))
-async def reject_id_connection(callback: CallbackQuery):
-    user = await get_user(callback.from_user.id)
-    t_id = int(callback.data.split("_")[2])
-    t_user = await get_user(t_id)
-    
-    msg1 = "❌ Rechazaste la solicitud." if user.get("lang", "es") == "es" else "❌ You rejected the request."
-    msg2 = "❌ Solicitud rechazada." if t_user.get("lang", "es") == "es" else "❌ Request rejected."
-    
-    await callback.message.edit_text(msg1)
-    await bot.send_message(t_id, msg2)
 
 @router.callback_query(F.data == "find_chat")
 async def find_chat(callback: CallbackQuery, state: FSMContext):
@@ -1029,7 +700,7 @@ async def find_chat(callback: CallbackQuery, state: FSMContext):
         
         active_chats[u_id], active_chats[t_id] = t_id, u_id
         await state.set_state(BotStates.chatting)
-        await dp.fsm.resolve_context(bot, t_id, t_id).set_state(BotStates.chatting)
+        await set_other_user_state(bot, dp.storage, t_id, BotStates.chatting)
         
         for uid, u_obj in [(u_id, user), (t_id, t_user)]:
             lng = u_obj.get("lang", "es")
@@ -1061,7 +732,7 @@ async def leave_chat(event, state: FSMContext):
         t_user = await get_user(t_id)
         t_lang = t_user.get("lang", "es")
         
-        await dp.fsm.resolve_context(bot, t_id, t_id).set_state(BotStates.idle)
+        await set_other_user_state(bot, dp.storage, t_id, BotStates.idle)
         t_msg = "❌ **El chat finalizó.**" if t_lang == "es" else "❌ **Chat ended.**"
         await bot.send_message(t_id, t_msg, reply_markup=ReplyKeyboardRemove(), parse_mode="Markdown")
         await show_main_menu(t_id)
@@ -1091,10 +762,6 @@ async def check_vip_status(user_id):
             await bot.send_message(user_id, msg, reply_markup=markup, parse_mode="Markdown")
             await save_user(user_id, {"notified_vip": True, "in_vip": True})
     except: pass
-
-@router.message(F.chat.id == VIP_GROUP_ID, F.photo | F.video | F.document)
-async def vip_group_activity(message: Message):
-    await save_user(message.from_user.id, {"in_vip": True})
 
 async def send_rating_request(user_id, target_id):
     user = await get_user(user_id)
@@ -1165,12 +832,12 @@ async def handle_media(message: Message):
             await message.answer(msg_es if lang == "es" else msg_en, parse_mode="Markdown")
 
 # --- INTERCAMBIO AUTOMÁTICO EN LOTE ---
-async def get_random_batch(db, sender_id: int, receiver_id: int, category: str, amount: int):
-    already_sent = [doc["file_unique_id"] async for doc in db.exchange_history.find({"sender_id": sender_id, "receiver_id": receiver_id}, {"file_unique_id": 1})]
+async def get_random_batch(db_conn, sender_id: int, receiver_id: int, category: str, amount: int):
+    already_sent = [doc["file_unique_id"] async for doc in db_conn.exchange_history.find({"sender_id": sender_id, "receiver_id": receiver_id}, {"file_unique_id": 1})]
     match_query = {"user_id": sender_id, "file_unique_id": {"$nin": already_sent}}
     if category != "mixed": match_query["type"] = category
     pipeline = [{"$match": match_query}, {"$sample": {"size": amount + 15}}]
-    selected = [doc async for doc in db.inventory.aggregate(pipeline)]
+    selected = [doc async for doc in db_conn.inventory.aggregate(pipeline)]
     return len(selected) >= amount, selected
 
 @router.message(StateFilter(BotStates.chatting), F.text.in_(["🤝 Proponer Intercambio", "🤝 Propose Trade"]))
@@ -1274,7 +941,6 @@ async def accept_trade(callback: CallbackQuery):
         except: await db.inventory.delete_one({"file_unique_id": f["file_unique_id"]})
         await asyncio.sleep(0.05)
         
-    # --- Reputación Automática ---
     await db.users.update_one({"_id": u_id}, {"$inc": {"reputation": 1}})
     await db.users.update_one({"_id": s_id}, {"$inc": {"reputation": 1}})
     await check_vip_status(u_id)
@@ -1309,12 +975,21 @@ async def relay_msg(message: Message):
         try: await message.forward(target)
         except: pass
 
-# --- ARRANQUE ---
+# --- ARRANQUE SEGURO ---
 async def main():
+    global db_client, db, backup_queue
+    # 1. Inicializar bases de datos y colas asincrónicas DENTRO del Event Loop
+    db_client = AsyncIOMotorClient(MONGO_URI)
+    db = db_client.intercambio_bot_v4
+    backup_queue = asyncio.Queue()
+    
+    # 2. Configurar el bot y el servidor
     dp.include_router(router)
     await setup_bot_commands(bot)
     await start_web_server()
     asyncio.create_task(backup_worker())
+    
+    # 3. Borrar Webhook previo (si usabas Render/Heroku antes) e iniciar
     await bot.delete_webhook(drop_pending_updates=True)
     print("🤖 ¡Bot principal y Mini App iniciados!")
     await dp.start_polling(bot)
