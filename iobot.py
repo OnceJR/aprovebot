@@ -1057,14 +1057,16 @@ async def accept_trade(callback: CallbackQuery):
         try:
             await bot.forward_message(chat_id=u_id, from_chat_id=s_id, message_id=f["message_id"])
             await db.exchange_history.insert_one({"sender_id": s_id, "receiver_id": u_id, "file_unique_id": f["file_unique_id"]})
-        except: await db.inventory.delete_one({"file_unique_id": f["file_unique_id"]})
+        except Exception as e: 
+            logging.error(f"Error al reenviar mensaje ID {f['message_id']}: {e}")
         await asyncio.sleep(0.05)
         
     for f in files_r[:amt]:
         try:
             await bot.forward_message(chat_id=s_id, from_chat_id=u_id, message_id=f["message_id"])
             await db.exchange_history.insert_one({"sender_id": u_id, "receiver_id": s_id, "file_unique_id": f["file_unique_id"]})
-        except: await db.inventory.delete_one({"file_unique_id": f["file_unique_id"]})
+        except Exception as e: 
+            logging.error(f"Error al reenviar mensaje ID {f['message_id']}: {e}")
         await asyncio.sleep(0.05)
         
     # --- Reputación Automática ---
