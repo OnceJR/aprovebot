@@ -314,7 +314,8 @@ async def handle_webapp(request):
                     let w = document.createElement('div');
                     w.className = `chest-wrapper ${ready ? '' : 'disabled'}`;
                     w.onclick = () => ready ? openChest(w) : null;
-                    w.innerHTML = `<img src="https://cdn3d.iconscout.com/3d/premium/thumb/treasure-box-4993548-4161745.png" class="chest-img">`;
+                    // FIX 1: URL de imagen de cofre cerrado más estable
+                    w.innerHTML = `<img src="https://img.icons8.com/color/96/treasure-chest.png" class="chest-img">`;
                     chestsContainer.appendChild(w);
                 }
             }
@@ -333,7 +334,13 @@ async def handle_webapp(request):
                     bonusTimer = setInterval(() => {
                         timeLeft--;
                         if (timeLeft <= 0) updateBonusUI(0);
-                        else txt.innerText = `⏳ Disponible en: ${Math.floor(timeLeft/3600)}h ${Math.floor((timeLeft%3600)/60)}m ${timeLeft%60}s`;
+                        else {
+                            // FIX 2: Redondeo correcto para horas, minutos y segundos
+                            let h = Math.floor(timeLeft / 3600);
+                            let m = Math.floor((timeLeft % 3600) / 60);
+                            let s = Math.floor(timeLeft % 60);
+                            txt.innerText = `⏳ Disponible en: ${h}h ${m}m ${s}s`;
+                        }
                     }, 1000);
                 }
             }
@@ -347,7 +354,8 @@ async def handle_webapp(request):
                     let data = await res.json();
                     if(data.success) {
                         el.classList.remove('disabled');
-                        el.querySelector('.chest-img').src = "https://cdn3d.iconscout.com/3d/premium/thumb/open-treasure-box-4993550-4161747.png";
+                        // FIX 1.1: URL de imagen de cofre abierto más estable
+                        el.querySelector('.chest-img').src = "https://img.icons8.com/color/96/open-box.png";
                         confetti({ particleCount: 100, spread: 70, origin: { y: 0.6 } });
                         tg.showAlert(`🎉 Ganaste ${data.bonus} Puntos de Reputación.`);
                         loadData();
