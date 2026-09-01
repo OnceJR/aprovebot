@@ -116,7 +116,7 @@ async def api_live_ping(request):
     # 1. Registrar al usuario como espectador activo
     active_viewers[user_id] = now
     
-    # 2. Limpiar usuarios que cerraron la app (no han enviado ping en más de 45 seg)
+    # 2. Limpiar usuarios inactivos
     for uid in list(active_viewers.keys()):
         if now - active_viewers[uid] > 45:
             del active_viewers[uid]
@@ -125,7 +125,7 @@ async def api_live_ping(request):
     
     # 3. Sumar tiempo y revisar si gana el premio
     user = await get_user(user_id)
-    current_time = user.get("watch_time", 0) + 30 # Sumamos 30 segundos
+    current_time = user.get("watch_time", 0) + 30 
     await db.users.update_one({"_id": user_id}, {"$set": {"watch_time": current_time}})
     
     won = False
@@ -137,7 +137,10 @@ async def api_live_ping(request):
             invite = await bot.create_chat_invite_link(chat_id=VIP_GROUP_ID, member_limit=1)
             msg = "🎉 **¡Misión Cumplida!**\nGracias por quedarte en la transmisión. Como recompensa, aquí tienes tu acceso VIP exclusivo:"
             markup = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🌟 Entrar al VIP", url=invite.invite_link)]])
-            await safe_send_message(user_id, msg, reply_markup=markup, parse_mode="Markdown")
+            
+            # Usamos bot.send_message en lugar de safe_send_message
+            await bot.send_message(user_id, msg, reply_markup=markup, parse_mode="Markdown")
+            
         except Exception as e:
             logging.error(f"Error enviando VIP por stream: {e}")
 
@@ -721,11 +724,12 @@ async def cmd_broadcast(message: Message):
     count = 0
     async for user in db.users.find():
         try:
-            await bot.send_message(user["_id"], f"📢 **Aviso:**\n\n{text}", parse_mode="Markdown")
+            # Cambiado a HTML para que reconozca las etiquetas <b> y el aviso salga en negrita correcta
+            await bot.send_message(user["_id"], f"📢 <b>Aviso:</b>\n\n{text}", parse_mode="HTML")
             count += 1
             await asyncio.sleep(0.05) 
         except: pass
-    await message.answer(f"✅ Difusión completada a `{count}` usuarios.")
+    await message.answer(f"✅ Difusión completada a <code>{count}</code> usuarios.", parse_mode="HTML")
 
 @router.message(Command("migrar_respaldo"))
 async def cmd_migrar_respaldo(message: Message):
