@@ -46,6 +46,7 @@ active_chats = {}
 waiting_list = []
 pending_trades = {}
 processed_albums = set()
+active_viewers = {}  # Diccionario para guardar {user_id: timestamp_del_ultimo_ping}
 
 class BotStates(StatesGroup):
     idle = State()
@@ -107,6 +108,154 @@ async def get_auth_user(request):
     return None
 
 # --- APIS WEBAPP ---
+async def api_live_ping(request):
+    user_id = await get_auth_user(request)
+    if not user_id: return web.json_response({"error": "Unauthorized"}, status=401)
+    
+    now = time.time()
+    # 1. Registrar al usuario como espectador activo
+    active_viewers[user_id] = now
+    
+    # 2. Limpiar usuarios que cerraron la app (no han enviado ping en más de 45 seg)
+    for uid in list(active_viewers.keys()):
+        if now - active_viewers[uid] > 45:
+            del active_viewers[uid]
+            
+    viewers_count = len(active_viewers)
+    
+    # 3. Sumar tiempo y revisar si gana el premio
+    user = await get_user(user_id)
+    current_time = user.get("watch_time", 0) + 30 # Sumamos 30 segundos
+    await db.users.update_one({"_id": user_id}, {"$set": {"watch_time": current_time}})
+    
+    won = False
+    # Si alcanzó los 600 segundos (10 minutos) y NO tiene VIP
+    if current_time >= 600 and not user.get("in_vip"):
+        won = True
+        await save_user(user_id, {"notified_vip": True, "in_vip": True})
+        try:
+            invite = await bot.create_chat_invite_link(chat_id=VIP_GROUP_ID, member_limit=1)
+            msg = "🎉 **¡Misión Cumplida!**\nGracias por quedarte en la transmisión. Como recompensa, aquí tienes tu acceso VIP exclusivo:"
+            markup = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🌟 Entrar al VIP", url=invite.invite_link)]])
+            await safe_send_message(user_id, msg, reply_markup=markup, parse_mode="Markdown")
+        except Exception as e:
+            logging.error(f"Error enviando VIP por stream: {e}")
+
+    return web.json_response({"success": True, "viewers": viewers_count, "watch_time": current_time, "won": won})
+
+async def handle_live_webapp(request):
+    bot_username = request.query.get("bot", "")
+    html_content = """
+    <!DOCTYPE html>
+    <html lang="es">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>Evento En Vivo</title>
+        <script src="https://telegram.org/js/telegram-web-app.js"></script>
+        <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
+        <script src="https://cdn.jsdelivr.net/npm/canvas-confetti@1.6.0/dist/confetti.browser.min.js"></script>
+        <link href="https://fonts.googleapis.com/css2?family=Poppins:wght@400;600;700&display=swap" rel="stylesheet">
+        <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+        <style>
+            :root { --bg: #0d1117; --card-bg: #161b22; --accent: #f85149; --text: #ffffff; }
+            * { box-sizing: border-box; margin: 0; padding: 0; font-family: 'Poppins', sans-serif; }
+            body { background: var(--bg); color: var(--text); padding: 16px; }
+            .header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px; }
+            .live-badge { background: var(--accent); padding: 4px 10px; border-radius: 6px; font-weight: 700; font-size: 14px; animation: pulse 2s infinite; }
+            .viewers { background: rgba(255,255,255,0.1); padding: 4px 10px; border-radius: 6px; font-size: 14px; display: flex; gap: 6px; align-items: center; }
+            @keyframes pulse { 0% { opacity: 1; } 50% { opacity: 0.5; } 100% { opacity: 1; } }
+            
+            .video-wrapper { background: #000; border-radius: 12px; overflow: hidden; margin-bottom: 20px; border: 1px solid #30363d; box-shadow: 0 4px 15px rgba(248, 81, 73, 0.2); }
+            video { width: 100%; aspect-ratio: 16/9; display: block; }
+            
+            .mission-card { background: var(--card-bg); padding: 15px; border-radius: 12px; border: 1px solid #30363d; }
+            .mission-title { font-weight: 700; font-size: 15px; margin-bottom: 10px; text-align: center; }
+            .progress-bg { background: rgba(255,255,255,0.05); height: 20px; border-radius: 10px; position: relative; overflow: hidden; }
+            .progress-fill { background: linear-gradient(90deg, #f85149, #ff7b72); height: 100%; width: 0%; transition: width 1s linear; }
+            .time-text { position: absolute; width: 100%; text-align: center; top: 0; left: 0; font-size: 12px; line-height: 20px; font-weight: 700; text-shadow: 1px 1px 2px #000; }
+            .success-msg { color: #3fb950; font-weight: 700; text-align: center; display: none; margin-top: 10px; }
+        </style>
+    </head>
+    <body>
+        <div class="header">
+            <div class="live-badge"><i class="fa-solid fa-tower-broadcast"></i> EN VIVO</div>
+            <div class="viewers"><i class="fa-solid fa-eye"></i> <span id="viewer-count">...</span></div>
+        </div>
+
+        <div class="video-wrapper">
+            <!-- REPRODUCTOR HLS -->
+            <video id="video-player" controls playsinline autoplay></video>
+        </div>
+
+        <div class="mission-card" id="mission-card">
+            <div class="mission-title">🎁 Recompensa: Acceso VIP</div>
+            <p style="font-size: 12px; color: #8b949e; text-align: center; margin-bottom: 10px;">Mira la transmisión por 10 minutos para reclamarlo.</p>
+            <div class="progress-bg">
+                <div class="progress-fill" id="progress-bar"></div>
+                <div class="time-text" id="time-text">0 / 10 Minutos</div>
+            </div>
+            <div class="success-msg" id="success-msg">¡Misión completada! Revisa el bot. 🎉</div>
+        </div>
+
+        <script>
+            let tg = window.Telegram.WebApp;
+            tg.expand();
+            let userId = tg.initDataUnsafe?.user?.id || 0;
+            let reqHeaders = { "Content-Type": "application/json", "Authorization": tg.initData || "" };
+            
+            // 1. INICIAR VIDEO STREAM
+            let video = document.getElementById('video-player');
+            let videoSrc = 'https://stream.mux.com/re2DCw5QBp3Rta2SmZ00ToB63OBqWB007MH01a015nihuRQ.m3u8'; // <-- PON TU LINK .m3u8 AQUÍ
+            
+            if (Hls.isSupported()) {
+                let hls = new Hls();
+                hls.loadSource(videoSrc);
+                hls.attachMedia(video);
+            } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
+                video.src = videoSrc;
+            }
+
+            // 2. SISTEMA DE "LATIDOS" (PING)
+            const TARGET_TIME = 600; // 600 segundos = 10 minutos
+            
+            async function sendPing() {
+                if(!userId) return;
+                try {
+                    let res = await fetch(`/api/live_ping?id=${userId}`, { method: "POST", headers: reqHeaders, body: "{}" });
+                    let data = await res.json();
+                    
+                    if(data.success) {
+                        // Actualizar contadores visuales
+                        document.getElementById('viewer-count').innerText = data.viewers;
+                        
+                        let progress = Math.min(100, (data.watch_time / TARGET_TIME) * 100);
+                        document.getElementById('progress-bar').style.width = progress + "%";
+                        
+                        let mins = Math.floor(data.watch_time / 60);
+                        document.getElementById('time-text').innerText = `${mins} / 10 Minutos`;
+
+                        // Si ganó
+                        if(data.won || data.watch_time >= TARGET_TIME) {
+                            document.getElementById('success-msg').style.display = 'block';
+                            if(data.won) {
+                                tg.HapticFeedback.notificationOccurred('success');
+                                confetti({ particleCount: 150, spread: 90, origin: { y: 0.6 } });
+                            }
+                        }
+                    }
+                } catch(e) { console.error("Error pingeando servidor"); }
+            }
+
+            // Enviar primer latido de inmediato, luego cada 30 segundos
+            sendPing();
+            setInterval(sendPing, 30000);
+        </script>
+    </body>
+    </html>
+    """
+    return web.Response(text=html_content, content_type="text/html")
+
 async def api_get_data(request):
     user_id = await get_auth_user(request)
     if not user_id: return web.json_response({"error": "Unauthorized"}, status=401)
@@ -499,7 +648,16 @@ async def handle_webapp(request):
 
 async def start_web_server():
     app = web.Application()
+    
+    # Ruta principal del panel de control
     app.router.add_get("/", handle_webapp)
+    
+    # --- NUEVAS RUTAS PARA EL EN VIVO ---
+    app.router.add_get("/live", handle_live_webapp)
+    app.router.add_post("/api/live_ping", api_live_ping)
+    # ------------------------------------
+    
+    # APIs del sistema general
     app.router.add_get("/api/data", api_get_data)
     app.router.add_post("/api/bonus", api_claim_bonus)
     app.router.add_post("/api/offer", api_post_offer)
@@ -675,7 +833,10 @@ async def show_main_menu(user_id):
     # IMPORTANTE: Reemplaza con la URL REAL de donde hosteas este script web
     base_url = os.environ.get("RENDER_EXTERNAL_URL", "https://TU_DOMINIO_AQUI.onrender.com")
     webapp_url = f"{base_url}?bot={bot_info.username}"
+    live_url = f"{base_url}/live?bot={bot_info.username}" # Ruta para la Mini App del En Vivo
     
+    # --- Configuración Bilingüe de Botones ---
+    btn_live = "🔴 EN VIVO - ¡Gana VIP Gratis! 🎁" if lang == "es" else "🔴 LIVE - Earn Free VIP! 🎁"
     btn_rnd = "💬 Buscar Chat" if lang == "es" else "💬 Random Chat"
     btn_id = "🆔 Conectar ID" if lang == "es" else "🆔 Connect ID"
     btn_prof = "👤 Mi Perfil" if lang == "es" else "👤 My Profile"
@@ -683,18 +844,30 @@ async def show_main_menu(user_id):
     btn_panel = "✨ Abrir Panel de Control" if lang == "es" else "✨ Open Dashboard"
     
     markup = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=btn_live, web_app=WebAppInfo(url=live_url))],
         [InlineKeyboardButton(text=btn_panel, web_app=WebAppInfo(url=webapp_url))],
         [InlineKeyboardButton(text=btn_rnd, callback_data="find_chat"), InlineKeyboardButton(text=btn_id, callback_data="connect_id")],
         [InlineKeyboardButton(text=btn_prof, callback_data="my_profile"), InlineKeyboardButton(text="⚙️ Idioma / Language", callback_data="change_lang")],
         [InlineKeyboardButton(text=btn_share, url=f"https://t.me/share/url?url={my_link}")]
     ])
     
+    # --- Textos con formato HTML (Más estable y estético) ---
     if lang == "es":
-        txt = "👋 **¡Bienvenido a la red de intercambio!**\n\n⚠️ **REQUISITO CLAVE:** Sube material propio a este chat para poder hacer intercambios. ¡Sin videos o fotos en tu inventario, no podrás recibir nada!\n\nUtiliza la nueva **Mini App** para reclamar tu bonus diario y ver tu progreso VIP. 🚀"
+        txt = (
+            "👋 <b>¡Bienvenido a la red de intercambio!</b>\n\n"
+            "⚠️ <b>REQUISITO CLAVE:</b> Sube material propio a este chat para poder hacer intercambios. "
+            "¡Sin videos o fotos en tu inventario, no podrás recibir nada!\n\n"
+            "🎁 Utiliza la nueva <b>Mini App</b> para reclamar tu bonus diario y ver tu progreso VIP. 🚀"
+        )
     else:
-        txt = "👋 **Welcome to the exchange network!**\n\n⚠️ **KEY REQUIREMENT:** Upload your own media to this chat to be able to trade. Without videos or photos in your inventory, you won't receive anything!\n\nUse the new **Mini App** to claim your daily bonus and check your VIP progress. 🚀"
+        txt = (
+            "👋 <b>Welcome to the exchange network!</b>\n\n"
+            "⚠️ <b>KEY REQUIREMENT:</b> Upload your own media to this chat to be able to trade. "
+            "Without videos or photos in your inventory, you won't receive anything!\n\n"
+            "🎁 Use the new <b>Mini App</b> to claim your daily bonus and check your VIP progress. 🚀"
+        )
         
-    await bot.send_message(chat_id=user_id, text=txt, reply_markup=markup, parse_mode="Markdown")
+    await bot.send_message(chat_id=user_id, text=txt, reply_markup=markup, parse_mode="HTML")
 
 @router.message(Command("help"))
 async def cmd_help(message: Message):
@@ -1053,31 +1226,52 @@ async def accept_trade(callback: CallbackQuery):
     await callback.message.edit_text(msg_proc)
     await bot.send_message(s_id, msg_proc_s)
     
+    # --- AVISO DE RETRASO PARA LOTES GRANDES ---
+    if amt >= 20:
+        aviso_es = "⏳ **Enviando lote masivo...**\nPor seguridad, los archivos se enviarán uno por uno. Esto puede demorar un poco, ¡paciencia!"
+        aviso_en = "⏳ **Sending massive batch...**\nFor security reasons, files will be sent one by one. This may take a bit, please be patient!"
+        await bot.send_message(u_id, aviso_es if lang == "es" else aviso_en, parse_mode="Markdown")
+        await bot.send_message(s_id, aviso_es if s_lang == "es" else aviso_en, parse_mode="Markdown")
+    # -------------------------------------------
+    
     for f in files_s[:amt]:
         while True:
             try:
-                await bot.forward_message(chat_id=u_id, from_chat_id=s_id, message_id=f["message_id"])
+                # Envío directo por file_id (Adiós al error de forward_message)
+                if f["type"] == "photo":
+                    await bot.send_photo(chat_id=u_id, photo=f["file_id"])
+                elif f["type"] == "video":
+                    await bot.send_video(chat_id=u_id, video=f["file_id"])
+                else:
+                    await bot.send_document(chat_id=u_id, document=f["file_id"])
+                    
                 await db.exchange_history.insert_one({"sender_id": s_id, "receiver_id": u_id, "file_unique_id": f["file_unique_id"]})
-                break # El envío fue exitoso, salimos del bucle while
+                break 
             except TelegramRetryAfter as e:
                 logging.warning(f"⚠️ Telegram pide esperar {e.retry_after}s (Antispam)...")
-                await asyncio.sleep(e.retry_after) # Espera el castigo de Telegram y reintenta
+                await asyncio.sleep(e.retry_after) 
             except Exception as e: 
-                logging.error(f"Error al reenviar mensaje ID {f['message_id']}: {e}")
-                break # Ocurrió otro error (ej. el usuario borró la foto original), salimos
-        await asyncio.sleep(0.15) # Pausa más amplia para evitar activar el filtro antispam
+                logging.error(f"Error enviando archivo a ID {u_id}: {e}")
+                break 
+        await asyncio.sleep(0.15) 
         
     for f in files_r[:amt]:
         while True:
             try:
-                await bot.forward_message(chat_id=s_id, from_chat_id=u_id, message_id=f["message_id"])
+                if f["type"] == "photo":
+                    await bot.send_photo(chat_id=s_id, photo=f["file_id"])
+                elif f["type"] == "video":
+                    await bot.send_video(chat_id=s_id, video=f["file_id"])
+                else:
+                    await bot.send_document(chat_id=s_id, document=f["file_id"])
+                    
                 await db.exchange_history.insert_one({"sender_id": u_id, "receiver_id": s_id, "file_unique_id": f["file_unique_id"]})
                 break
             except TelegramRetryAfter as e:
                 logging.warning(f"⚠️ Telegram pide esperar {e.retry_after}s (Antispam)...")
                 await asyncio.sleep(e.retry_after)
             except Exception as e: 
-                logging.error(f"Error al reenviar mensaje ID {f['message_id']}: {e}")
+                logging.error(f"Error enviando archivo a ID {s_id}: {e}")
                 break
         await asyncio.sleep(0.15)
         
