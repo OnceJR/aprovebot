@@ -209,7 +209,7 @@ async def handle_live_webapp(request):
             
             // 1. INICIAR VIDEO STREAM
             let video = document.getElementById('video-player');
-            let videoSrc = 'https://stream.mux.com/re2DCw5QBp3Rta2SmZ00ToB63OBqWB007MH01a015nihuRQ.m3u8'; // <-- PON TU LINK .m3u8 AQUÍ
+            let videoSrc = 'https://live.adultiptv.net/compilation.m3u8'; // <-- PON TU LINK .m3u8 AQUÍ
             
             if (Hls.isSupported()) {
                 let hls = new Hls();
