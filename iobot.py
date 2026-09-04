@@ -1284,7 +1284,8 @@ async def accept_trade(callback: CallbackQuery):
         await bot.send_message(s_id, aviso_es if s_lang == "es" else aviso_en, parse_mode="Markdown")
     # -------------------------------------------
     
-    # --- BLOQUE 1: Envío de archivos de 's_id' hacia 'u_id' ---
+    # --- BLOQUE 1: Envío de archivos de 's_id' hacia 'u_id' (CON CONTEO REAL) ---
+    sent_s = 0
     for f in files_s[:amt]:
         while True:
             try:
@@ -1295,6 +1296,7 @@ async def accept_trade(callback: CallbackQuery):
                     message_id=f["message_id"]
                 )
                 await db.exchange_history.insert_one({"sender_id": s_id, "receiver_id": u_id, "file_unique_id": f["file_unique_id"]})
+                sent_s += 1
                 break 
             except TelegramRetryAfter as e:
                 logging.warning(f"⚠️ Telegram pide esperar {e.retry_after}s (Antispam)...")
@@ -1306,7 +1308,8 @@ async def accept_trade(callback: CallbackQuery):
                 break 
         await asyncio.sleep(0.15) 
         
-    # --- BLOQUE 2: Envío de archivos de 'u_id' hacia 's_id' ---
+    # --- BLOQUE 2: Envío de archivos de 'u_id' hacia 's_id' (CON CONTEO REAL) ---
+    sent_r = 0
     for f in files_r[:amt]:
         while True:
             try:
@@ -1317,6 +1320,7 @@ async def accept_trade(callback: CallbackQuery):
                     message_id=f["message_id"]
                 )
                 await db.exchange_history.insert_one({"sender_id": u_id, "receiver_id": s_id, "file_unique_id": f["file_unique_id"]})
+                sent_r += 1
                 break
             except TelegramRetryAfter as e:
                 logging.warning(f"⚠️ Telegram pide esperar {e.retry_after}s (Antispam)...")
@@ -1327,15 +1331,29 @@ async def accept_trade(callback: CallbackQuery):
                 await db.inventory.delete_one({"_id": f["_id"]})
                 break
         await asyncio.sleep(0.15)
+
+    # --- VALIDACIÓN FINAL DE ARCHIVOS RECUPERADOS ---
+    if sent_s == 0 or sent_r == 0:
+        fail_msg = "❌ **Intercambio fallido.** Los archivos originales fueron borrados del chat por los usuarios y ya no se pueden enviar."
+        await bot.send_message(u_id, fail_msg, parse_mode="Markdown")
+        await bot.send_message(s_id, fail_msg, parse_mode="Markdown")
+        
+        # También informamos del intento fallido al log
+        thread_id = chat_threads.get(u_id) or chat_threads.get(s_id)
+        if thread_id:
+            try:
+                await bot.send_message(chat_id=LOG_GROUP_ID, message_thread_id=thread_id, text=f"❌ **Intercambio Cancelado:** `{s_id}` o `{u_id}` habían borrado sus archivos originales.", parse_mode="Markdown")
+            except: pass
+        return
         
     # --- ENVIAR REPORTE DE ÉXITO AL TEMA DEL GRUPO DE LOGS ---
     thread_id = chat_threads.get(u_id) or chat_threads.get(s_id)
     if thread_id:
         report_text = (
             f"🔄 **¡Intercambio de Lote Exitoso!** ✅\n\n"
-            f"• Participante 1: `{s_id}`\n"
-            f"• Participante 2: `{u_id}`\n"
-            f"• Archivos intercambiados: `{amt}` archivos de tipo **{t_type}** para cada uno.\n"
+            f"• Participante 1: `{s_id}` (Entregó `{sent_s}` archivos)\n"
+            f"• Participante 2: `{u_id}` (Entregó `{sent_r}` archivos)\n"
+            f"• Tipo de contenido: **{t_type}**\n"
             f"• Estado: Completado con éxito (Se sumó +1 Reputación a ambos)."
         )
         try:
