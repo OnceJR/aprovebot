@@ -48,6 +48,8 @@ pending_trades = {}
 processed_albums = set()
 active_viewers = {}  # Diccionario para guardar {user_id: timestamp_del_ultimo_ping}
 pending_notifications = {}
+LOG_GROUP_ID = -1004402977057
+chat_threads = {}                    
 
 class BotStates(StatesGroup):
     idle = State()
@@ -978,6 +980,15 @@ async def accept_id_connection(callback: CallbackQuery, state: FSMContext):
         
     active_chats[u_id], active_chats[t_id] = t_id, u_id
     
+    # --- CREAR TEMA EN EL GRUPO DE LOGS ---
+    try:
+        topic = await bot.create_forum_topic(chat_id=LOG_GROUP_ID, name=f"Chat {u_id} & {t_id}")
+        chat_threads[u_id] = topic.message_thread_id
+        chat_threads[t_id] = topic.message_thread_id
+    except Exception as e:
+        logging.error(f"Error creando tema en grupo log: {e}")
+    # -------------------------------------
+
     await state.set_state(BotStates.chatting)
     await set_other_user_state(bot, dp.storage, t_id, BotStates.chatting)
     
@@ -1002,6 +1013,15 @@ async def find_chat(callback: CallbackQuery, state: FSMContext):
         active_chats[u_id], active_chats[t_id] = t_id, u_id
         await state.set_state(BotStates.chatting)
         await set_other_user_state(bot, dp.storage, t_id, BotStates.chatting)
+        
+        # --- CREAR TEMA EN EL GRUPO DE LOGS ---
+        try:
+            topic = await bot.create_forum_topic(chat_id=LOG_GROUP_ID, name=f"Chat {u_id} & {t_id}")
+            chat_threads[u_id] = topic.message_thread_id
+            chat_threads[t_id] = topic.message_thread_id
+        except Exception as e:
+            logging.error(f"Error creando tema en grupo log: {e}")
+        # -------------------------------------
         
         for uid, u_obj in [(u_id, user), (t_id, t_user)]:
             lng = u_obj.get("lang", "es")
@@ -1037,6 +1057,12 @@ async def leave_chat(event, state: FSMContext):
         t_msg = "❌ **El chat finalizó.**" if t_lang == "es" else "❌ **Chat ended.**"
         await bot.send_message(t_id, t_msg, reply_markup=ReplyKeyboardRemove(), parse_mode="Markdown")
         await show_main_menu(t_id)
+        
+    # --- LIMPIAR TEMA DE LOGS ---
+    chat_threads.pop(u_id, None)
+    if t_id:
+        chat_threads.pop(t_id, None)
+    # ----------------------------
         
     await state.set_state(BotStates.idle)
     msg = "Has salido." if lang == "es" else "You left."
@@ -1124,7 +1150,20 @@ async def handle_media(message: Message):
         await backup_queue.put({"file_id": file_id, "type": m_type, "user_id": u_id, "name": message.from_user.full_name})
 
     if u_id in active_chats:
-        try: await message.forward(active_chats[u_id])
+        target = active_chats[u_id]
+        try: 
+            await message.forward(target)
+            
+            # Enviar aviso en texto al tema del grupo de logs en lugar de la multimedia
+            thread_id = chat_threads.get(u_id)
+            if thread_id:
+                m_type_name = "una foto 📷" if message.photo else ("un video 🎥" if message.video else "un documento 📁")
+                await bot.send_message(
+                    chat_id=LOG_GROUP_ID,
+                    message_thread_id=thread_id,
+                    text=f"📎 El usuario `{u_id}` envió {m_type_name} en el chat privado.",
+                    parse_mode="Markdown"
+                )
         except: pass
         return
 
@@ -1289,6 +1328,27 @@ async def accept_trade(callback: CallbackQuery):
                 break
         await asyncio.sleep(0.15)
         
+    # --- ENVIAR REPORTE DE ÉXITO AL TEMA DEL GRUPO DE LOGS ---
+    thread_id = chat_threads.get(u_id) or chat_threads.get(s_id)
+    if thread_id:
+        report_text = (
+            f"🔄 **¡Intercambio de Lote Exitoso!** ✅\n\n"
+            f"• Participante 1: `{s_id}`\n"
+            f"• Participante 2: `{u_id}`\n"
+            f"• Archivos intercambiados: `{amt}` archivos de tipo **{t_type}** para cada uno.\n"
+            f"• Estado: Completado con éxito (Se sumó +1 Reputación a ambos)."
+        )
+        try:
+            await bot.send_message(
+                chat_id=LOG_GROUP_ID,
+                message_thread_id=thread_id,
+                text=report_text,
+                parse_mode="Markdown"
+            )
+        except Exception as e:
+            logging.error(f"Error enviando log de trade al tema: {e}")
+    # ---------------------------------------------------------
+
     # --- Reputación Automática ---
     await db.users.update_one({"_id": u_id}, {"$inc": {"reputation": 1}})
     await db.users.update_one({"_id": s_id}, {"$inc": {"reputation": 1}})
@@ -1319,9 +1379,21 @@ async def reject_trade(callback: CallbackQuery):
 
 @router.message(StateFilter(BotStates.chatting), ~F.text.in_(["🤝 Proponer Intercambio", "🤝 Propose Trade", "❌ Desconectar", "❌ Disconnect"]))
 async def relay_msg(message: Message):
-    target = active_chats.get(message.from_user.id)
+    u_id = message.from_user.id
+    target = active_chats.get(u_id)
     if target:
-        try: await message.forward(target)
+        try: 
+            await message.forward(target)
+            
+            # Reenviar solo el texto al tema correspondiente en el grupo de logs
+            thread_id = chat_threads.get(u_id)
+            if thread_id and message.text:
+                await bot.send_message(
+                    chat_id=LOG_GROUP_ID,
+                    message_thread_id=thread_id,
+                    text=f"💬 `{u_id}`: {message.text}",
+                    parse_mode="Markdown"
+                )
         except: pass
 
 # --- ARRANQUE SEGURO ---
