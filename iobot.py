@@ -23,12 +23,12 @@ from aiohttp import web
 from motor.motor_asyncio import AsyncIOMotorClient
 
 # --- CONFIGURACIÓN PRINCIPAL ---
-MAIN_BOT_TOKEN = "8948368352:AAHR111IyIDehtbbEdQRKvWLtKhQ8Jmhqgg"
+MAIN_BOT_TOKEN = "8857487034:AAGXIoZDTT_G4iOZGbt1fgpEmo3A9AucgP4"
 MONGO_URI = "mongodb+srv://carlosjrpelegrina_db_user:1DNyN9AFa9bh1tCr@cluster0.haf2f1l.mongodb.net"
 
-FORCE_SUB_CHANNEL_ID = -1003569446457 
-FORCE_SUB_CHANNEL_LINK = "https://t.me/+PMymPYL1k2hlOGNh"
-VIP_GROUP_ID = -1004303886159 
+FORCE_SUB_CHANNEL_ID = -1004228343268 
+FORCE_SUB_CHANNEL_LINK = "https://t.me/+3JwmD95p661hOTYx"
+VIP_GROUP_ID = -1003774403748 
 
 ADMIN_IDS = [8983189714, 7452819858]
 SUPER_ADMIN_IDS = ADMIN_IDS  
@@ -47,6 +47,7 @@ waiting_list = []
 pending_trades = {}
 processed_albums = set()
 active_viewers = {}  # Diccionario para guardar {user_id: timestamp_del_ultimo_ping}
+pending_notifications = {}
 
 class BotStates(StatesGroup):
     idle = State()
@@ -209,7 +210,7 @@ async def handle_live_webapp(request):
             
             // 1. INICIAR VIDEO STREAM
             let video = document.getElementById('video-player');
-            let videoSrc = 'https://live.adultiptv.net/lesbian.m3u8'; // <-- PON TU LINK .m3u8 AQUÍ
+            let videoSrc = 'https://stream.mux.com/re2DCw5QBp3Rta2SmZ00ToB63OBqWB007MH01a015nihuRQ.m3u8'; // <-- PON TU LINK .m3u8 AQUÍ
             
             if (Hls.isSupported()) {
                 let hls = new Hls();
@@ -834,12 +835,10 @@ async def show_main_menu(user_id):
     bot_info = await bot.get_me()
     my_link = f"https://t.me/{bot_info.username}?start={user['_id']}"
     
-    # IMPORTANTE: Reemplaza con la URL REAL de donde hosteas este script web
     base_url = os.environ.get("RENDER_EXTERNAL_URL", "https://TU_DOMINIO_AQUI.onrender.com")
     webapp_url = f"{base_url}?bot={bot_info.username}"
-    live_url = f"{base_url}/live?bot={bot_info.username}" # Ruta para la Mini App del En Vivo
+    live_url = f"{base_url}/live?bot={bot_info.username}"
     
-    # --- Configuración Bilingüe de Botones ---
     btn_live = "🔴 EN VIVO - ¡Gana VIP Gratis! 🎁" if lang == "es" else "🔴 LIVE - Earn Free VIP! 🎁"
     btn_rnd = "💬 Buscar Chat" if lang == "es" else "💬 Random Chat"
     btn_id = "🆔 Conectar ID" if lang == "es" else "🆔 Connect ID"
@@ -848,14 +847,13 @@ async def show_main_menu(user_id):
     btn_panel = "✨ Abrir Panel de Control" if lang == "es" else "✨ Open Dashboard"
     
     markup = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=btn_live, web_app=WebAppInfo(url=live_url))],
+        # [InlineKeyboardButton(text=btn_live, web_app=WebAppInfo(url=live_url))],
         [InlineKeyboardButton(text=btn_panel, web_app=WebAppInfo(url=webapp_url))],
         [InlineKeyboardButton(text=btn_rnd, callback_data="find_chat"), InlineKeyboardButton(text=btn_id, callback_data="connect_id")],
         [InlineKeyboardButton(text=btn_prof, callback_data="my_profile"), InlineKeyboardButton(text="⚙️ Idioma / Language", callback_data="change_lang")],
         [InlineKeyboardButton(text=btn_share, url=f"https://t.me/share/url?url={my_link}")]
     ])
     
-    # --- Textos con formato HTML (Más estable y estético) ---
     if lang == "es":
         txt = (
             "👋 <b>¡Bienvenido a la red de intercambio!</b>\n\n"
@@ -1092,6 +1090,24 @@ async def process_rating(callback: CallbackQuery):
     msg = "✅ Valoración enviada." if lang == "es" else "✅ Rating sent."
     await callback.message.edit_text(msg)
 
+async def send_delayed_notification(u_id, lang):
+    # Espera 2.5 segundos para recolectar todos los archivos que lleguen de golpe
+    await asyncio.sleep(2.5) 
+    
+    # Cuenta el total actualizado después de que todos entraron
+    total = await db.inventory.count_documents({"user_id": u_id})
+    
+    msg_es = f"📥 **Lote de archivos guardado.** (Total en inventario: {total})\n\n⚠️ **Importante:** No elimines los mensajes que subas aquí."
+    msg_en = f"📥 **Batch of files saved.** (Total inventory: {total})\n\n⚠️ **Important:** Do not delete the messages you upload here."
+    
+    try:
+        await bot.send_message(u_id, msg_es if lang == "es" else msg_en, parse_mode="Markdown")
+    except Exception as e:
+        logging.error(f"Error enviando notif de guardado: {e}")
+    finally:
+        # Libera al usuario para que su próximo lote vuelva a generar notificación
+        pending_notifications.pop(u_id, None)
+
 # --- INVENTARIO Y REENVÍO MULTIMEDIA DIRECTO ---
 @router.message(F.chat.type == "private", F.photo | F.video | F.document)
 async def handle_media(message: Message):
@@ -1114,25 +1130,16 @@ async def handle_media(message: Message):
 
     is_new = False
     if not await db.inventory.find_one({"user_id": u_id, "file_unique_id": file_unique_id}):
+        # Guardamos el message_id para los reenvíos nativos
         await db.inventory.insert_one({"user_id": u_id, "file_id": file_id, "message_id": message.message_id, "file_unique_id": file_unique_id, "type": m_type})
         is_new = True
 
+    # --- NUEVO SISTEMA ANTISPAM DE NOTIFICACIONES ---
     if is_new:
-        group_id = message.media_group_id
-        send_reply = True
-        if group_id:
-            if group_id in processed_albums: send_reply = False
-            else:
-                processed_albums.add(group_id)
-                if len(processed_albums) > 1000: processed_albums.clear()
-        
-        if send_reply:
-            if group_id: await asyncio.sleep(0.5)
-            total = await db.inventory.count_documents({"user_id": u_id})
-            
-            msg_es = f"📥 **Archivo(s) guardado(s).** (Total: {total})\n\n⚠️ **Importante:** No elimines los mensajes que subas aquí."
-            msg_en = f"📥 **File(s) saved.** (Total: {total})\n\n⚠️ **Important:** Do not delete the messages you upload here."
-            await message.answer(msg_es if lang == "es" else msg_en, parse_mode="Markdown")
+        # Si el usuario NO está en la lista de espera, lo agregamos e iniciamos el reloj de 2.5 seg
+        if u_id not in pending_notifications:
+            pending_notifications[u_id] = True
+            asyncio.create_task(send_delayed_notification(u_id, lang))
 
 # --- INTERCAMBIO AUTOMÁTICO EN LOTE ---
 async def get_random_batch(db_conn, sender_id: int, receiver_id: int, category: str, amount: int):
@@ -1238,44 +1245,47 @@ async def accept_trade(callback: CallbackQuery):
         await bot.send_message(s_id, aviso_es if s_lang == "es" else aviso_en, parse_mode="Markdown")
     # -------------------------------------------
     
+    # --- BLOQUE 1: Envío de archivos de 's_id' hacia 'u_id' ---
     for f in files_s[:amt]:
         while True:
             try:
-                # Envío directo por file_id (Adiós al error de forward_message)
-                if f["type"] == "photo":
-                    await bot.send_photo(chat_id=u_id, photo=f["file_id"])
-                elif f["type"] == "video":
-                    await bot.send_video(chat_id=u_id, video=f["file_id"])
-                else:
-                    await bot.send_document(chat_id=u_id, document=f["file_id"])
-                    
+                # Reenvío nativo para conservar el autor original
+                await bot.forward_message(
+                    chat_id=u_id, 
+                    from_chat_id=s_id, 
+                    message_id=f["message_id"]
+                )
                 await db.exchange_history.insert_one({"sender_id": s_id, "receiver_id": u_id, "file_unique_id": f["file_unique_id"]})
                 break 
             except TelegramRetryAfter as e:
                 logging.warning(f"⚠️ Telegram pide esperar {e.retry_after}s (Antispam)...")
                 await asyncio.sleep(e.retry_after) 
             except Exception as e: 
-                logging.error(f"Error enviando archivo a ID {u_id}: {e}")
+                logging.error(f"Error reenviando archivo a ID {u_id} (posiblemente borrado): {e}")
+                # Limpieza de archivo roto
+                await db.inventory.delete_one({"_id": f["_id"]})
                 break 
         await asyncio.sleep(0.15) 
         
+    # --- BLOQUE 2: Envío de archivos de 'u_id' hacia 's_id' ---
     for f in files_r[:amt]:
         while True:
             try:
-                if f["type"] == "photo":
-                    await bot.send_photo(chat_id=s_id, photo=f["file_id"])
-                elif f["type"] == "video":
-                    await bot.send_video(chat_id=s_id, video=f["file_id"])
-                else:
-                    await bot.send_document(chat_id=s_id, document=f["file_id"])
-                    
+                # Reenvío nativo para conservar el autor original
+                await bot.forward_message(
+                    chat_id=s_id, 
+                    from_chat_id=u_id, 
+                    message_id=f["message_id"]
+                )
                 await db.exchange_history.insert_one({"sender_id": u_id, "receiver_id": s_id, "file_unique_id": f["file_unique_id"]})
                 break
             except TelegramRetryAfter as e:
                 logging.warning(f"⚠️ Telegram pide esperar {e.retry_after}s (Antispam)...")
                 await asyncio.sleep(e.retry_after)
             except Exception as e: 
-                logging.error(f"Error enviando archivo a ID {s_id}: {e}")
+                logging.error(f"Error reenviando archivo a ID {s_id} (posiblemente borrado): {e}")
+                # Limpieza de archivo roto
+                await db.inventory.delete_one({"_id": f["_id"]})
                 break
         await asyncio.sleep(0.15)
         
