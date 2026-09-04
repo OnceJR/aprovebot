@@ -23,11 +23,11 @@ from aiohttp import web
 from motor.motor_asyncio import AsyncIOMotorClient
 
 # --- CONFIGURACIÓN PRINCIPAL ---
-MAIN_BOT_TOKEN = "8857487034:AAGXIoZDTT_G4iOZGbt1fgpEmo3A9AucgP4"
+MAIN_BOT_TOKEN = "8955570052:AAHPc8UBk9eLwAiTcDRJpSPWv3k82dukGbw"
 MONGO_URI = "mongodb+srv://carlosjrpelegrina_db_user:1DNyN9AFa9bh1tCr@cluster0.haf2f1l.mongodb.net"
 
-FORCE_SUB_CHANNEL_ID = -1004228343268 
-FORCE_SUB_CHANNEL_LINK = "https://t.me/+3JwmD95p661hOTYx"
+FORCE_SUB_CHANNEL_ID = -1004335363720 
+FORCE_SUB_CHANNEL_LINK = "https://t.me/+MZu_KDUrpdJmYTNh"
 VIP_GROUP_ID = -1003774403748 
 
 ADMIN_IDS = [8983189714, 7452819858]
