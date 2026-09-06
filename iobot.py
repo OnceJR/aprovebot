@@ -1329,90 +1329,92 @@ async def accept_trade(callback: CallbackQuery):
     await callback.message.edit_text(msg_proc)
     await bot.send_message(s_id, msg_proc_s)
     
-    # --- AVISO DE RETRASO PARA LOTES GRANDES ---
     if amt >= 20:
         aviso_es = "⏳ **Enviando lote masivo...**\nPor seguridad, los archivos se enviarán uno por uno. Esto puede demorar un poco, ¡paciencia!"
         aviso_en = "⏳ **Sending massive batch...**\nFor security reasons, files will be sent one by one. This may take a bit, please be patient!"
         await bot.send_message(u_id, aviso_es if lang == "es" else aviso_en, parse_mode="Markdown")
         await bot.send_message(s_id, aviso_es if s_lang == "es" else aviso_en, parse_mode="Markdown")
-    # -------------------------------------------
     
-    # --- BLOQUE 1: Envío de archivos de 's_id' hacia 'u_id' ---
-    for f in files_s[:amt]:
-        while True:
+    # --- SISTEMA 1 A 1 (PING-PONG) CON ARCHIVOS DE REPUESTO ---
+    sent_s = 0
+    sent_r = 0
+    
+    iter_s = iter(files_s)
+    iter_r = iter(files_r)
+    
+    for _ in range(amt):
+        # 1. Participante 1 (s_id) intenta enviar un archivo válido
+        success_s = False
+        for f in iter_s:
             try:
-                # Reenvío nativo para conservar el autor original
-                await bot.forward_message(
-                    chat_id=u_id, 
-                    from_chat_id=s_id, 
-                    message_id=f["message_id"]
-                )
+                await bot.forward_message(chat_id=u_id, from_chat_id=s_id, message_id=f["message_id"])
                 await db.exchange_history.insert_one({"sender_id": s_id, "receiver_id": u_id, "file_unique_id": f["file_unique_id"]})
+                success_s = True
                 break 
             except TelegramRetryAfter as e:
-                logging.warning(f"⚠️ Telegram pide esperar {e.retry_after}s (Antispam)...")
                 await asyncio.sleep(e.retry_after) 
-            except Exception as e: 
-                logging.error(f"Error reenviando archivo a ID {u_id} (posiblemente borrado): {e}")
-                # Limpieza de archivo roto
+            except Exception: 
                 await db.inventory.delete_one({"_id": f["_id"]})
-                break 
-        await asyncio.sleep(0.15) 
         
-    # --- BLOQUE 2: Envío de archivos de 'u_id' hacia 's_id' ---
-    for f in files_r[:amt]:
-        while True:
+        if not success_s:
+            break
+            
+        # 2. Participante 2 (u_id) intenta enviar un archivo válido
+        success_r = False
+        for f in iter_r:
             try:
-                # Reenvío nativo para conservar el autor original
-                await bot.forward_message(
-                    chat_id=s_id, 
-                    from_chat_id=u_id, 
-                    message_id=f["message_id"]
-                )
+                await bot.forward_message(chat_id=s_id, from_chat_id=u_id, message_id=f["message_id"])
                 await db.exchange_history.insert_one({"sender_id": u_id, "receiver_id": s_id, "file_unique_id": f["file_unique_id"]})
+                success_r = True
                 break
             except TelegramRetryAfter as e:
-                logging.warning(f"⚠️ Telegram pide esperar {e.retry_after}s (Antispam)...")
                 await asyncio.sleep(e.retry_after)
-            except Exception as e: 
-                logging.error(f"Error reenviando archivo a ID {s_id} (posiblemente borrado): {e}")
-                # Limpieza de archivo roto
+            except Exception: 
                 await db.inventory.delete_one({"_id": f["_id"]})
-                break
+                
+        if not success_r:
+            sent_s += 1
+            break
+            
+        sent_s += 1
+        sent_r += 1
         await asyncio.sleep(0.15)
+
+    if sent_s == 0 and sent_r == 0:
+        fail_msg = "❌ **Intercambio fallido.** Los archivos originales fueron borrados del chat."
+        await bot.send_message(u_id, fail_msg, parse_mode="Markdown")
+        await bot.send_message(s_id, fail_msg, parse_mode="Markdown")
         
-    # --- ENVIAR REPORTE DE ÉXITO AL TEMA DEL GRUPO DE LOGS ---
+        thread_id = chat_threads.get(u_id) or chat_threads.get(s_id)
+        if thread_id:
+            try: await bot.send_message(chat_id=LOG_GROUP_ID, message_thread_id=thread_id, text="❌ **Intercambio Cancelado:** Archivos borrados.", parse_mode="Markdown")
+            except: pass
+        return
+        
     thread_id = chat_threads.get(u_id) or chat_threads.get(s_id)
     if thread_id:
         report_text = (
-            f"🔄 **¡Intercambio de Lote Exitoso!** ✅\n\n"
-            f"• Participante 1: `{s_id}`\n"
-            f"• Participante 2: `{u_id}`\n"
-            f"• Archivos intercambiados: `{amt}` archivos de tipo **{t_type}** para cada uno.\n"
-            f"• Estado: Completado con éxito (Se sumó +1 Reputación a ambos)."
+            f"🔄 **¡Intercambio Finalizado!** ✅\n\n"
+            f"• Participante 1: `{s_id}` (Entregó `{sent_s}` archivos)\n"
+            f"• Participante 2: `{u_id}` (Entregó `{sent_r}` archivos)\n"
+            f"• Tipo de contenido: **{t_type}**\n"
+            f"• Estado: {'Equivalente (1 a 1)' if sent_s == sent_r else 'Equilibrado por archivos faltantes'}."
         )
-        try:
-            await bot.send_message(
-                chat_id=LOG_GROUP_ID,
-                message_thread_id=thread_id,
-                text=report_text,
-                parse_mode="Markdown"
-            )
-        except Exception as e:
-            logging.error(f"Error enviando log de trade al tema: {e}")
-    # ---------------------------------------------------------
+        try: await bot.send_message(chat_id=LOG_GROUP_ID, message_thread_id=thread_id, text=report_text, parse_mode="Markdown")
+        except: pass
 
-    # --- Reputación Automática ---
     await db.users.update_one({"_id": u_id}, {"$inc": {"reputation": 1}})
     await db.users.update_one({"_id": s_id}, {"$inc": {"reputation": 1}})
     await check_vip_status(u_id)
     await check_vip_status(s_id)
     
-    ok_es = "🎉 **¡Intercambio finalizado!**\n⭐ *Se sumó +1 punto de reputación a tu perfil.*\n\nGuarda el contenido en Mensajes Guardados."
-    ok_en = "🎉 **Trade completed!**\n⭐ *+1 reputation point added to your profile.*\n\nSave the content in Saved Messages."
-    
-    await bot.send_message(u_id, ok_es if lang == "es" else ok_en, parse_mode="Markdown")
-    await bot.send_message(s_id, ok_es if s_lang == "es" else ok_en, parse_mode="Markdown")
+    ok_es_u = f"🎉 **¡Intercambio finalizado!**\n📥 Recibiste **{sent_s}** archivos.\n⭐ *Se sumó +1 punto de reputación.*"
+    ok_en_u = f"🎉 **Trade completed!**\n📥 You received **{sent_s}** files.\n⭐ *+1 reputation point.*"
+    await bot.send_message(u_id, ok_es_u if lang == "es" else ok_en_u, parse_mode="Markdown")
+
+    ok_es_s = f"🎉 **¡Intercambio finalizado!**\n📥 Recibiste **{sent_r}** archivos.\n⭐ *Se sumó +1 punto de reputación.*"
+    ok_en_s = f"🎉 **Trade completed!**\n📥 You received **{sent_r}** files.\n⭐ *+1 reputation point.*"
+    await bot.send_message(s_id, ok_es_s if s_lang == "es" else ok_en_s, parse_mode="Markdown")
     
     await send_rating_request(u_id, s_id)
     await send_rating_request(s_id, u_id)
