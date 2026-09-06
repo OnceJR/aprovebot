@@ -793,15 +793,14 @@ async def cmd_reinvite(message: Message):
 # --- MENÚ PRINCIPAL ---
 @router.message(CommandStart(), StateFilter("*"))
 async def cmd_start(message: Message, state: FSMContext):
+    await state.clear() # <-- Agrégala aquí al inicio
     user_id = message.from_user.id
     args = message.text.split(maxsplit=1)
     
     # --- LIMPIEZA DE CHATS FANTASMA ---
-    # Si el usuario usa /start mientras buscaba chat, lo sacamos de la lista
     if user_id in waiting_list:
         waiting_list.remove(user_id)
         
-    # Si usa /start mientras chateaba, desconectamos al compañero
     t_id = active_chats.pop(user_id, None)
     if t_id:
         active_chats.pop(t_id, None)
@@ -812,13 +811,10 @@ async def cmd_start(message: Message, state: FSMContext):
         except: pass
         chat_threads.pop(user_id, None)
         chat_threads.pop(t_id, None)
-    # -----------------------------------
     
-    # Obtener al usuario de forma segura
     user = await get_user(user_id)
     lang = user.get("lang", "es") if user else "es"
 
-    # --- CANDADO ANTISPAM DE REFERIDOS ---
     is_first_time = not user.get("started_bot", False)
 
     if len(args) > 1 and args[1].isdigit() and is_first_time:
@@ -831,14 +827,11 @@ async def cmd_start(message: Message, state: FSMContext):
             except Exception as e:
                 logging.error(f"Error procesando referido en /start: {e}")
 
-    # Marcamos que ya inició el bot para prevenir abusos futuros.
     if is_first_time:
         try:
             await save_user(user_id, {"started_bot": True})
         except: pass
-    # -------------------------------------
 
-    # --- VERIFICACIÓN DE CANAL OBLIGATORIO ---
     try:
         has_subbed = await check_force_sub(user_id)
     except Exception:
@@ -847,7 +840,7 @@ async def cmd_start(message: Message, state: FSMContext):
     if not has_subbed:
         btn_join = "📢 Unirse al Canal" if lang == "es" else "📢 Join Channel"
         btn_ver = "✅ Verificar Ingreso" if lang == "es" else "✅ Verify Join"
-        txt_res = "🛑 **Acceso Restringido**\nDebes unirte a nuestro canal para usar el bot." if lang == "es" else "🛑 **Access Restricted**\nYou must join our channel to use the bot."
+        txt_res = "🛑 **Acceso Restringido**\nDebes unirte a nuestro canal para usar el bot." if lang == "es" else "🛑 **Access Restricted**\nYou must join our canal to use the bot."
         
         markup = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text=btn_join, url=FORCE_SUB_CHANNEL_LINK)],
@@ -855,7 +848,6 @@ async def cmd_start(message: Message, state: FSMContext):
         ])
         return await message.answer(txt_res, reply_markup=markup, parse_mode="Markdown")
 
-    # Mostrar el menú de forma segura
     try:
         await show_main_menu(user_id)
     except Exception as e:
