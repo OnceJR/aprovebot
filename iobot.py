@@ -793,7 +793,8 @@ async def cmd_reinvite(message: Message):
 # --- MENÚ PRINCIPAL ---
 @router.message(CommandStart(), StateFilter("*"))
 async def cmd_start(message: Message, state: FSMContext):
-    await state.clear() # <-- Agrégala aquí al inicio
+    print("🚨 ¡EL BOT RECIBIÓ EL COMANDO /START!") # <-- Añade esto temporalmente
+    await state.clear()
     user_id = message.from_user.id
     args = message.text.split(maxsplit=1)
     
