@@ -49,7 +49,7 @@ processed_albums = set()
 active_viewers = {}  # Diccionario para guardar {user_id: timestamp_del_ultimo_ping}
 pending_notifications = {}
 LOG_GROUP_ID = -1004402977057
-chat_threads = {}                    
+chat_threads = {}                  
 
 class BotStates(StatesGroup):
     idle = State()
@@ -791,7 +791,7 @@ async def cmd_reinvite(message: Message):
     except: await message.answer("⚠️ Uso: `/reinvitar ID`")
 
 # --- MENÚ PRINCIPAL ---
-@router.message(CommandStart())
+@router.message(CommandStart(), StateFilter("*"))
 async def cmd_start(message: Message, state: FSMContext):
     user_id = message.from_user.id
     args = message.text.split(maxsplit=1)
