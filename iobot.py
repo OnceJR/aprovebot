@@ -988,7 +988,7 @@ async def ask_for_id(callback: CallbackQuery, state: FSMContext):
     await state.set_state(BotStates.waiting_for_id)
     await callback.message.edit_text(txt, reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=btn, callback_data="back_main")]]), parse_mode="Markdown")
 
-@router.message(StateFilter(BotStates.waiting_for_id))
+@router.message(StateFilter(BotStates.waiting_for_id), ~F.text.startswith("/"))
 async def process_connect_id(message: Message, state: FSMContext):
     user = await get_user(message.from_user.id)
     lang = user.get("lang", "es")
@@ -1432,7 +1432,7 @@ async def reject_trade(callback: CallbackQuery):
         
     await callback.message.edit_text("❌ Rechazado." if lang == "es" else "❌ Rejected.")
 
-@router.message(StateFilter(BotStates.chatting), ~F.text.in_(["🤝 Proponer Intercambio", "🤝 Propose Trade", "❌ Desconectar", "❌ Disconnect"]))
+@router.message(StateFilter(BotStates.chatting), ~F.text.startswith("/"), ~F.text.in_(["🤝 Proponer Intercambio", "🤝 Propose Trade", "❌ Desconectar", "❌ Disconnect"]))
 async def relay_msg(message: Message):
     u_id = message.from_user.id
     target = active_chats.get(u_id)
