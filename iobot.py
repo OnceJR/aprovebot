@@ -23,11 +23,11 @@ from aiohttp import web
 from motor.motor_asyncio import AsyncIOMotorClient
 
 # --- CONFIGURACIÓN PRINCIPAL ---
-MAIN_BOT_TOKEN = "8955570052:AAHPc8UBk9eLwAiTcDRJpSPWv3k82dukGbw"
+MAIN_BOT_TOKEN = "8857487034:AAGXIoZDTT_G4iOZGbt1fgpEmo3A9AucgP4"
 MONGO_URI = "mongodb+srv://carlosjrpelegrina_db_user:1DNyN9AFa9bh1tCr@cluster0.haf2f1l.mongodb.net"
 
-FORCE_SUB_CHANNEL_ID = -1004335363720 
-FORCE_SUB_CHANNEL_LINK = "https://t.me/+MZu_KDUrpdJmYTNh"
+FORCE_SUB_CHANNEL_ID = -1004228343268 
+FORCE_SUB_CHANNEL_LINK = "https://t.me/+3JwmD95p661hOTYx"
 VIP_GROUP_ID = -1003774403748 
 
 ADMIN_IDS = [8983189714, 7452819858]
@@ -795,16 +795,33 @@ async def cmd_reinvite(message: Message):
 async def cmd_start(message: Message, state: FSMContext):
     user_id = message.from_user.id
     args = message.text.split(maxsplit=1)
+    
+    # Obtenemos al usuario (si es nuevo, get_user lo creará en memoria)
     user = await get_user(user_id)
     lang = user.get("lang", "es")
 
-    if len(args) > 1 and args[1].isdigit():
+    # --- CANDADO ANTISPAM DE REFERIDOS ---
+    # Verificamos si es la primera vez absoluta que este usuario inicia el bot
+    is_first_time = not user.get("started_bot", False)
+
+    if len(args) > 1 and args[1].isdigit() and is_first_time:
         inviter_id = int(args[1])
-        if inviter_id != user_id and not await db.users.find_one({"referred_by": user_id}):
+        # Verificamos que no sea él mismo intentando auto-invitarse
+        if inviter_id != user_id:
+            # Registramos quién lo invitó
             await save_user(user_id, {"referred_by": inviter_id})
+            
+            # Le sumamos 1 referido al invitador y revisamos si sube a VIP
             await db.users.update_one({"_id": inviter_id}, {"$inc": {"referrals": 1}})
             await check_vip_status(inviter_id) 
 
+    # Guardamos en la base de datos que este usuario YA usó el bot.
+    # Así, si borra el chat y vuelve a entrar con un enlace, 'is_first_time' será False y no dará puntos.
+    if is_first_time:
+        await save_user(user_id, {"started_bot": True})
+    # -------------------------------------
+
+    # --- VERIFICACIÓN DE CANAL OBLIGATORIO ---
     if not await check_force_sub(user_id):
         btn_join = "📢 Unirse al Canal" if lang == "es" else "📢 Join Channel"
         btn_ver = "✅ Verificar Ingreso" if lang == "es" else "✅ Verify Join"
@@ -1185,8 +1202,16 @@ async def get_random_batch(db_conn, sender_id: int, receiver_id: int, category: 
     already_sent = [doc["file_unique_id"] async for doc in db_conn.exchange_history.find({"sender_id": sender_id, "receiver_id": receiver_id}, {"file_unique_id": 1})]
     match_query = {"user_id": sender_id, "file_unique_id": {"$nin": already_sent}}
     if category != "mixed": match_query["type"] = category
-    pipeline = [{"$match": match_query}, {"$sample": {"size": amount + 15}}]
+    
+    # Creamos un margen gigante de archivos de repuesto. 
+    # Si piden 50, el bot preparará hasta 150 archivos. 
+    # Así, si el usuario borró muchísimos, el bot tendrá de dónde sacar hasta cumplir la meta.
+    safe_amount = (amount * 2) + 50
+    
+    pipeline = [{"$match": match_query}, {"$sample": {"size": safe_amount}}]
     selected = [doc async for doc in db_conn.inventory.aggregate(pipeline)]
+    
+    # Solo comprobamos que tengan al menos la cantidad base solicitada en la BD
     return len(selected) >= amount, selected
 
 @router.message(StateFilter(BotStates.chatting), F.text.in_(["🤝 Proponer Intercambio", "🤝 Propose Trade"]))
@@ -1284,8 +1309,7 @@ async def accept_trade(callback: CallbackQuery):
         await bot.send_message(s_id, aviso_es if s_lang == "es" else aviso_en, parse_mode="Markdown")
     # -------------------------------------------
     
-    # --- BLOQUE 1: Envío de archivos de 's_id' hacia 'u_id' (CON CONTEO REAL) ---
-    sent_s = 0
+    # --- BLOQUE 1: Envío de archivos de 's_id' hacia 'u_id' ---
     for f in files_s[:amt]:
         while True:
             try:
@@ -1296,7 +1320,6 @@ async def accept_trade(callback: CallbackQuery):
                     message_id=f["message_id"]
                 )
                 await db.exchange_history.insert_one({"sender_id": s_id, "receiver_id": u_id, "file_unique_id": f["file_unique_id"]})
-                sent_s += 1
                 break 
             except TelegramRetryAfter as e:
                 logging.warning(f"⚠️ Telegram pide esperar {e.retry_after}s (Antispam)...")
@@ -1308,8 +1331,7 @@ async def accept_trade(callback: CallbackQuery):
                 break 
         await asyncio.sleep(0.15) 
         
-    # --- BLOQUE 2: Envío de archivos de 'u_id' hacia 's_id' (CON CONTEO REAL) ---
-    sent_r = 0
+    # --- BLOQUE 2: Envío de archivos de 'u_id' hacia 's_id' ---
     for f in files_r[:amt]:
         while True:
             try:
@@ -1320,7 +1342,6 @@ async def accept_trade(callback: CallbackQuery):
                     message_id=f["message_id"]
                 )
                 await db.exchange_history.insert_one({"sender_id": u_id, "receiver_id": s_id, "file_unique_id": f["file_unique_id"]})
-                sent_r += 1
                 break
             except TelegramRetryAfter as e:
                 logging.warning(f"⚠️ Telegram pide esperar {e.retry_after}s (Antispam)...")
@@ -1331,29 +1352,15 @@ async def accept_trade(callback: CallbackQuery):
                 await db.inventory.delete_one({"_id": f["_id"]})
                 break
         await asyncio.sleep(0.15)
-
-    # --- VALIDACIÓN FINAL DE ARCHIVOS RECUPERADOS ---
-    if sent_s == 0 or sent_r == 0:
-        fail_msg = "❌ **Intercambio fallido.** Los archivos originales fueron borrados del chat por los usuarios y ya no se pueden enviar."
-        await bot.send_message(u_id, fail_msg, parse_mode="Markdown")
-        await bot.send_message(s_id, fail_msg, parse_mode="Markdown")
-        
-        # También informamos del intento fallido al log
-        thread_id = chat_threads.get(u_id) or chat_threads.get(s_id)
-        if thread_id:
-            try:
-                await bot.send_message(chat_id=LOG_GROUP_ID, message_thread_id=thread_id, text=f"❌ **Intercambio Cancelado:** `{s_id}` o `{u_id}` habían borrado sus archivos originales.", parse_mode="Markdown")
-            except: pass
-        return
         
     # --- ENVIAR REPORTE DE ÉXITO AL TEMA DEL GRUPO DE LOGS ---
     thread_id = chat_threads.get(u_id) or chat_threads.get(s_id)
     if thread_id:
         report_text = (
             f"🔄 **¡Intercambio de Lote Exitoso!** ✅\n\n"
-            f"• Participante 1: `{s_id}` (Entregó `{sent_s}` archivos)\n"
-            f"• Participante 2: `{u_id}` (Entregó `{sent_r}` archivos)\n"
-            f"• Tipo de contenido: **{t_type}**\n"
+            f"• Participante 1: `{s_id}`\n"
+            f"• Participante 2: `{u_id}`\n"
+            f"• Archivos intercambiados: `{amt}` archivos de tipo **{t_type}** para cada uno.\n"
             f"• Estado: Completado con éxito (Se sumó +1 Reputación a ambos)."
         )
         try:
