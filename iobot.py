@@ -796,33 +796,46 @@ async def cmd_start(message: Message, state: FSMContext):
     user_id = message.from_user.id
     args = message.text.split(maxsplit=1)
     
-    # Obtenemos al usuario (si es nuevo, get_user lo creará en memoria)
+    # 1. Obtener al usuario de forma segura
     user = await get_user(user_id)
+    if not user:
+        # Si por alguna razón get_user falló y devolvió None, le creamos un perfil temporal en memoria
+        # para que el bot no se caiga
+        user = {"lang": "es", "started_bot": False}
+        
     lang = user.get("lang", "es")
 
     # --- CANDADO ANTISPAM DE REFERIDOS ---
-    # Verificamos si es la primera vez absoluta que este usuario inicia el bot
     is_first_time = not user.get("started_bot", False)
 
     if len(args) > 1 and args[1].isdigit() and is_first_time:
         inviter_id = int(args[1])
-        # Verificamos que no sea él mismo intentando auto-invitarse
         if inviter_id != user_id:
-            # Registramos quién lo invitó
-            await save_user(user_id, {"referred_by": inviter_id})
-            
-            # Le sumamos 1 referido al invitador y revisamos si sube a VIP
-            await db.users.update_one({"_id": inviter_id}, {"$inc": {"referrals": 1}})
-            await check_vip_status(inviter_id) 
+            try:
+                # Actualizamos los referidos con cuidado
+                await save_user(user_id, {"referred_by": inviter_id})
+                await db.users.update_one({"_id": inviter_id}, {"$inc": {"referrals": 1}})
+                await check_vip_status(inviter_id) 
+            except Exception as e:
+                logging.error(f"Error procesando referido en /start: {e}")
 
-    # Guardamos en la base de datos que este usuario YA usó el bot.
-    # Así, si borra el chat y vuelve a entrar con un enlace, 'is_first_time' será False y no dará puntos.
+    # Marcamos que ya inició el bot para prevenir abusos futuros.
     if is_first_time:
-        await save_user(user_id, {"started_bot": True})
+        try:
+            await save_user(user_id, {"started_bot": True})
+        except Exception as e:
+            logging.error(f"Error guardando 'started_bot' en /start: {e}")
     # -------------------------------------
 
     # --- VERIFICACIÓN DE CANAL OBLIGATORIO ---
-    if not await check_force_sub(user_id):
+    try:
+        # Envolvemos esto en try-except por si falla la comprobación del canal
+        has_subbed = await check_force_sub(user_id)
+    except Exception as e:
+        logging.error(f"Error en check_force_sub: {e}")
+        has_subbed = True # En caso de error, lo dejamos pasar para no bloquear el bot
+
+    if not has_subbed:
         btn_join = "📢 Unirse al Canal" if lang == "es" else "📢 Join Channel"
         btn_ver = "✅ Verificar Ingreso" if lang == "es" else "✅ Verify Join"
         txt_res = "🛑 **Acceso Restringido**\nDebes unirte a nuestro canal para usar el bot." if lang == "es" else "🛑 **Access Restricted**\nYou must join our channel to use the bot."
@@ -833,8 +846,15 @@ async def cmd_start(message: Message, state: FSMContext):
         ])
         return await message.answer(txt_res, reply_markup=markup, parse_mode="Markdown")
 
-    await show_main_menu(user_id)
-    await state.set_state(BotStates.idle)
+    # 3. Mostrar el menú de forma segura
+    try:
+        await show_main_menu(user_id)
+        await state.set_state(BotStates.idle)
+    except Exception as e:
+        logging.error(f"Error mostrando menú principal: {e}")
+        # Plan de contingencia si show_main_menu falla:
+        await message.answer("✅ Bot iniciado. Usa el menú del teclado." if lang == "es" else "✅ Bot started. Use the keyboard menu.")
+        await state.set_state(BotStates.idle)
 
 @router.callback_query(F.data == "verify_sub")
 async def verify_sub(callback: CallbackQuery):
