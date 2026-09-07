@@ -23,12 +23,12 @@ from aiohttp import web
 from motor.motor_asyncio import AsyncIOMotorClient
 
 # --- CONFIGURACIÓN PRINCIPAL ---
-MAIN_BOT_TOKEN = "8955570052:AAHPc8UBk9eLwAiTcDRJpSPWv3k82dukGbw"
+MAIN_BOT_TOKEN = "8611955705:AAE7qgrs5AX9ogBpFkXJsx6ku_o5PbkUqzo"
 MONGO_URI = "mongodb+srv://carlosjrpelegrina_db_user:1DNyN9AFa9bh1tCr@cluster0.haf2f1l.mongodb.net"
 
-FORCE_SUB_CHANNEL_ID = -1004335363720 
-FORCE_SUB_CHANNEL_LINK = "https://t.me/+MZu_KDUrpdJmYTNh"
-VIP_GROUP_ID = -1003774403748 
+FORCE_SUB_CHANNEL_ID = -1003840733617 
+FORCE_SUB_CHANNEL_LINK = "https://t.me/+EEnz3N7xba43OWNh"
+VIP_GROUP_ID = -1004403174464 
 
 ADMIN_IDS = [8983189714, 7452819858]
 SUPER_ADMIN_IDS = ADMIN_IDS  
@@ -1550,7 +1550,7 @@ async def main():
     global db_client, db, backup_queue
     # 1. Inicializar bases de datos y colas asincrónicas DENTRO del Event Loop
     db_client = AsyncIOMotorClient(MONGO_URI)
-    db = db_client.intercambio_bot_v5
+    db = db_client.intercambio_bot_v6
     backup_queue = asyncio.Queue()
     
     # 2. Configurar el bot y el servidor
