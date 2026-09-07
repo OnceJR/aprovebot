@@ -1036,7 +1036,12 @@ async def change_lang(callback: CallbackQuery):
 
 @router.callback_query(F.data == "my_profile")
 async def show_profile(callback: CallbackQuery):
-    user = await get_user(callback.from_user.id)
+    user_id = callback.from_user.id
+    
+    # Forzar revisión de VIP para desbloquear a los que llegaron a los 3 referidos
+    await check_vip_status(user_id)
+    
+    user = await get_user(user_id)
     lang = user.get("lang", "es")
     uid = user["_id"]
     fotos = await db.inventory.count_documents({"user_id": uid, "type": "photo"})
@@ -1217,8 +1222,11 @@ async def leave_chat(event, state: FSMContext):
 async def check_vip_status(user_id):
     try:
         user = await get_user(user_id)
-        if user.get("notified_vip"): return
+        if user.get("notified_vip"): 
+            return
+            
         if user.get("referrals", 0) >= 3 or user.get("reputation", 0) >= 20:
+            # Creamos el enlace de invitación único para el grupo VIP
             invite = await bot.create_chat_invite_link(chat_id=VIP_GROUP_ID, member_limit=1)
             lang = user.get("lang", "es")
             btn = "🌟 Entrar al VIP" if lang == "es" else "🌟 Join VIP"
@@ -1227,7 +1235,9 @@ async def check_vip_status(user_id):
             markup = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=btn, url=invite.invite_link)]])
             await bot.send_message(user_id, msg, reply_markup=markup, parse_mode="Markdown")
             await save_user(user_id, {"notified_vip": True, "in_vip": True})
-    except: pass
+    except Exception as e:
+        # Esto te imprimirá en la consola si hubo un error de permisos con Telegram
+        logging.error(f"❌ Error crítico en check_vip_status para el usuario {user_id}: {e}")
 
 async def send_rating_request(user_id, target_id):
     user = await get_user(user_id)
