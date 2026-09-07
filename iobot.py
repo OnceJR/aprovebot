@@ -366,43 +366,62 @@ async def handle_webapp(request):
                 --gradient-gold: linear-gradient(135deg, #f9d423 0%, #ff4e50 100%);
             }
             * { box-sizing: border-box; margin: 0; padding: 0; font-family: 'Poppins', sans-serif; }
-            body { background: var(--bg); color: var(--text); padding: 16px; padding-bottom: 24px; }
+            body { background: var(--bg); color: var(--text); padding: 16px; padding-bottom: 24px; max-width: 500px; margin: 0 auto; }
             .header { text-align: center; margin-bottom: 20px; margin-top: 10px; display: flex; justify-content: center; align-items: center; gap: 10px; }
             .header h1 { font-size: 24px; font-weight: 800; color: var(--text-strong); text-transform: uppercase; }
             .header-icon { font-size: 28px; color: var(--accent); }
-            .tabs { display: flex; background: var(--card-bg); border-radius: 14px; padding: 6px; margin-bottom: 24px; overflow-x: auto; border: 1px solid var(--card-border); scrollbar-width: none; }
-            .tab { flex: none; width: 32%; text-align: center; padding: 12px 6px; font-size: 14px; font-weight: 600; color: var(--hint); cursor: pointer; display: flex; flex-direction: column; gap: 4px; }
+            
+            /* Pestañas optimizadas con scroll suave y efecto de desborde visible */
+            .tabs { display: flex; background: var(--card-bg); border-radius: 14px; padding: 6px; margin-bottom: 24px; overflow-x: auto; border: 1px solid var(--card-border); scrollbar-width: none; gap: 6px; -webkit-overflow-scrolling: touch; }
+            .tab { flex: 0 0 28%; text-align: center; padding: 12px 4px; font-size: 13px; font-weight: 600; color: var(--hint); cursor: pointer; display: flex; flex-direction: column; gap: 4px; white-space: nowrap; transition: all 0.2s; }
             .tab.active { background: var(--accent); color: #fff; box-shadow: 0 4px 12px rgba(88, 166, 255, 0.3); border-radius: 10px; }
-            .section { display: none; flex-direction: column; gap: 16px; }
+            
+            .section { display: none; flex-direction: column; gap: 16px; animation: fadeIn 0.3s ease-in-out; }
             .section.active { display: flex; }
+            @keyframes fadeIn { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: translateY(0); } }
+
             .card { background: var(--card-bg); border-radius: 16px; padding: 20px; border: 1px solid var(--card-border); }
-            .card-title { font-size: 16px; font-weight: 700; color: var(--text-strong); margin-bottom: 12px; }
+            .card-title { font-size: 16px; font-weight: 700; color: var(--text-strong); margin-bottom: 12px; display: flex; justify-content: space-between; align-items: center; }
             .btn-main { background: var(--accent); color: #fff; border: none; border-radius: 12px; padding: 14px; width: 100%; font-size: 15px; font-weight: 700; cursor: pointer; }
             .btn-outline { background: transparent; border: 2px solid var(--accent); color: var(--accent); }
             .btn-danger { background: rgba(248, 81, 73, 0.1); color: var(--danger); border: 1px solid var(--danger); }
-            .copy-btn { background: rgba(88, 166, 255, 0.1); border: 1px solid rgba(88, 166, 255, 0.3); color: var(--accent); padding: 6px 12px; border-radius: 8px; font-size: 12px; font-weight: 600; cursor: pointer; transition: all 0.2s; display: inline-flex; align-items: center; gap: 6px; margin-top: 10px; }
-            .copy-btn:active { background: var(--accent); color: #fff; }
+            
+            .action-row { display: flex; gap: 8px; margin-top: 10px; }
+            .action-btn { flex: 1; padding: 8px 12px; border-radius: 8px; font-size: 12px; font-weight: 600; cursor: pointer; display: inline-flex; align-items: center; justify-content: center; gap: 6px; text-decoration: none; border: none; }
+            .btn-connect { background: rgba(88, 166, 255, 0.15); border: 1px solid rgba(88, 166, 255, 0.3); color: var(--accent); }
+            .btn-delete-offer { background: rgba(248, 81, 73, 0.1); border: 1px solid rgba(248, 81, 73, 0.3); color: var(--danger); }
+
             .input-group { margin-bottom: 12px; }
-            input[type="text"] { width: 100%; padding: 14px; border-radius: 12px; border: 1px solid var(--card-border); background: rgba(0,0,0,0.2); color: #fff; font-family: 'Poppins'; outline: none;}
-            input[type="text"]:focus { border-color: var(--accent); }
+            input[type="text"], select { width: 100%; padding: 14px; border-radius: 12px; border: 1px solid var(--card-border); background: rgba(0,0,0,0.2); color: #fff; font-family: 'Poppins'; outline: none;}
+            input[type="text"]:focus, select:focus { border-color: var(--accent); }
+            
             .progress-bg { background: rgba(255,255,255,0.05); border-radius: 10px; height: 14px; width: 100%; }
             .progress-fill { background: var(--gradient-gold); height: 100%; width: 0%; border-radius: 10px; transition: width 0.8s ease-in-out; }
+            
             .chests-container { display: flex; justify-content: center; gap: 15px; margin: 20px 0; }
             .chest-wrapper { width: 90px; height: 90px; cursor: pointer; position: relative; transition: transform 0.2s;}
             .chest-wrapper:active { transform: scale(0.95); }
             .chest-wrapper.disabled { opacity: 0.5; filter: grayscale(100%); pointer-events: none; }
             .chest-img { width: 100%; height: 100%; object-fit: contain; }
+            
             .list-item { background: rgba(255,255,255,0.03); padding: 16px; border-radius: 12px; margin-bottom: 12px; border: 1px solid var(--card-border); }
+            .pill-container { display: flex; gap: 6px; margin-bottom: 14px; overflow-x: auto; }
+            .pill { background: rgba(255,255,255,0.05); border: 1px solid var(--card-border); color: var(--hint); padding: 6px 14px; border-radius: 20px; font-size: 12px; font-weight: 600; cursor: pointer; white-space: nowrap; }
+            .pill.active { background: var(--accent); color: #fff; border-color: var(--accent); }
+            
+            .badge { font-size: 10px; padding: 2px 6px; border-radius: 6px; font-weight: 700; background: rgba(227, 179, 65, 0.15); color: var(--gold); border: 1px solid rgba(227, 179, 65, 0.3); }
         </style>
     </head>
     <body>
         <div class="header"><i class="fa-solid fa-bolt header-icon"></i><h1>Exchange Hub</h1></div>
-        <div class="tabs">
-            <div class="tab active" onclick="switchTab('stats', this)">VIP</div>
-            <div class="tab" onclick="switchTab('cofres', this)">Bonus</div>
-            <div class="tab" onclick="switchTab('mercado', this)">Market</div>
-            <div class="tab" onclick="switchTab('rank', this)">Top</div>
-            <div class="tab" onclick="switchTab('inventory', this)">Cofre</div>
+        
+        <!-- Barra de navegación con desplazamiento y ajuste visual de la cuarta pestaña -->
+        <div class="tabs" id="nav-tabs">
+            <div class="tab active" onclick="switchTab('stats', this)"><i class="fa-solid fa-star"></i> VIP</div>
+            <div class="tab" onclick="switchTab('cofres', this)"><i class="fa-solid fa-box-open"></i> Bonus</div>
+            <div class="tab" onclick="switchTab('mercado', this)"><i class="fa-solid fa-store"></i> Market</div>
+            <div class="tab" onclick="switchTab('rank', this)"><i class="fa-solid fa-trophy"></i> Top</div>
+            <div class="tab" onclick="switchTab('inventory', this)"><i class="fa-solid fa-vault"></i> Cofre</div>
         </div>
 
         <div id="stats" class="section active">
@@ -419,7 +438,7 @@ async def handle_webapp(request):
 
         <div id="cofres" class="section">
             <div class="card" style="text-align: center;">
-                <div class="card-title" style="color:var(--gold);">Recompensa Diaria</div>
+                <div class="card-title" style="color:var(--gold); justify-content:center;">Recompensa Diaria</div>
                 <div class="chests-container" id="chests-container"></div>
                 <div id="bonus-status" style="font-weight:700; color:var(--hint); margin-top:10px;">Calculando...</div>
             </div>
@@ -427,12 +446,32 @@ async def handle_webapp(request):
 
         <div id="mercado" class="section">
             <div class="card">
-                <div class="card-title">Publicar Oferta</div>
-                <div class="input-group"><input type="text" id="offer-input" placeholder="Ofrezco X busco Y..." maxlength="120"></div>
+                <div class="card-title"><i class="fa-solid fa-store"></i> Publicar Oferta</div>
+                <div class="input-group"><input type="text" id="offer-give" placeholder="📦 ¿Qué ofreces? (Ej: 50 Videos)" maxlength="60"></div>
+                <div class="input-group"><input type="text" id="offer-want" placeholder="🎯 ¿Qué buscas? (Ej: 50 Fotos)" maxlength="60"></div>
+                <div class="input-group">
+                    <select id="offer-type">
+                        <option value="mixed">🔀 Categoría: Mixto</option>
+                        <option value="video">🎥 Categoría: Solo Videos</option>
+                        <option value="photo">📷 Categoría: Solo Fotos</option>
+                    </select>
+                </div>
                 <button class="btn-main" onclick="postOffer()" id="btn-post-offer"><i class="fa-solid fa-paper-plane"></i> Publicar</button>
                 <div id="offer-cooldown" style="color:var(--danger); display:none; margin-top:10px; font-size: 12px; text-align: center;">Debe esperar para publicar.</div>
             </div>
-            <div class="card"><div class="card-title">Mercado En Vivo</div><div id="offers-list">Cargando...</div></div>
+            <div class="card">
+                <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:12px;">
+                    <div class="card-title" style="margin-bottom:0;">Mercado En Vivo</div>
+                    <input type="text" id="market-search" placeholder="🔍 Buscar..." oninput="filterOffers()" style="width: 110px; padding: 6px; font-size: 12px; border-radius: 8px;">
+                </div>
+                <div class="pill-container">
+                    <button class="pill active" onclick="setCategoryFilter('all', this)">Todos</button>
+                    <button class="pill" onclick="setCategoryFilter('video', this)">Videos</button>
+                    <button class="pill" onclick="setCategoryFilter('photo', this)">Fotos</button>
+                    <button class="pill" onclick="setCategoryFilter('mixed', this)">Mixto</button>
+                </div>
+                <div id="offers-list">Cargando...</div>
+            </div>
         </div>
 
         <div id="rank" class="section">
@@ -455,6 +494,8 @@ async def handle_webapp(request):
             let userId = user?.id || 0;
             let botUsername = "BOT_USERNAME_PLACEHOLDER"; 
             let reqHeaders = { "Content-Type": "application/json", "Authorization": tg.initData || "" };
+            let allOffers = [];
+            let currentCatFilter = 'all';
 
             function switchTab(tabId, el) {
                 tg.HapticFeedback.impactOccurred('light');
@@ -462,9 +503,10 @@ async def handle_webapp(request):
                 document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
                 document.getElementById(tabId).classList.add('active');
                 el.classList.add('active');
+                // Desplazamiento automático de la barra de pestañas para centrar la seleccionada
+                el.scrollIntoView({ behavior: 'smooth', inline: 'center', block: 'nearest' });
             }
 
-            // --- SISTEMA DE PORTAPAPELES UNIVERSAL ---
             function copyToClipboard(text, successMessage) {
                 tg.HapticFeedback.impactOccurred('medium');
                 let temp = document.createElement("input");
@@ -475,20 +517,15 @@ async def handle_webapp(request):
                     document.execCommand("copy");
                     tg.showAlert(successMessage + "\\n\\n" + text);
                 } catch (err) {
-                    tg.showAlert("No se pudo copiar automáticamente. Cópialo manualmente:\\n\\n" + text);
+                    tg.showAlert("No se pudo copiar.\\n\\n" + text);
                 }
                 document.body.removeChild(temp);
             }
 
             function copyRefLink() {
                 let link = `https://t.me/${botUsername}?start=${userId}`;
-                copyToClipboard(link, "✅ Link copiado al portapapeles. ¡Envíalo a tus amigos!");
+                copyToClipboard(link, "✅ Link copiado al portapapeles.");
             }
-
-            function copyOfferId(targetId) {
-                copyToClipboard(targetId, "✅ ID copiado.\\n\\nVuelve al menú del bot y selecciona '🆔 Conectar ID' para pegarlo.");
-            }
-            // -----------------------------------------
 
             let chestsContainer = document.getElementById('chests-container');
             let isBonusReady = false;
@@ -550,7 +587,6 @@ async def handle_webapp(request):
                         loadData();
                     }
                 } catch(e) { 
-                    // FIX: Reiniciar UI de cofres si hay error de red
                     tg.showAlert("❌ Error de conexión al servidor."); 
                     document.querySelectorAll('.chest-wrapper').forEach(w => w.classList.remove('disabled'));
                     document.getElementById("bonus-status").innerText = "¡Toca un cofre!";
@@ -590,34 +626,78 @@ async def handle_webapp(request):
                     });
                     document.getElementById("ranking-list").innerHTML = rHTML || '<div style="text-align:center;color:var(--hint); font-size:14px;">Aún no hay datos.</div>';
 
-                    let oHTML = "";
-                    data.offers.forEach(o => {
-                        oHTML += `<div class="list-item">
-                                    <div style="font-weight:700; font-size:14px; margin-bottom:4px;"><i class="fa-solid fa-circle-user"></i> ${o.name}</div>
-                                    <div style="font-size:13px; line-height:1.4;">${o.text}</div>
-                                    <button onclick="copyOfferId('${o.user_id}')" class="copy-btn"><i class="fa-regular fa-copy"></i> Copiar ID</button>
-                                  </div>`;
-                    });
-                    document.getElementById("offers-list").innerHTML = oHTML || '<div style="text-align:center;color:var(--hint); font-size:14px;">El mercado está vacío.</div>';
+                    allOffers = data.offers || [];
+                    renderOffers(allOffers);
                 } catch(e) { console.error("Error loading data", e); }
             }
 
-            async function postOffer() {
-                let val = document.getElementById('offer-input').value.trim();
-                if(val.length < 10) return tg.showAlert("⚠️ Oferta muy corta (min. 10 letras). Detalla qué ofreces y qué buscas.");
+            function renderOffers(offers) {
+                let query = document.getElementById("market-search").value.toLowerCase();
+                let oHTML = "";
+                let now = Date.now() / 1000;
                 
+                offers.forEach(o => {
+                    if (currentCatFilter !== 'all' && o.type !== currentCatFilter) return;
+                    if (query && !o.text.toLowerCase().includes(query)) return;
+                    
+                    let timeLeftSecs = Math.max(0, 86400 - (now - o.time));
+                    let hoursLeft = Math.floor(timeLeftSecs / 3600);
+                    
+                    let isOwner = o.user_id == userId;
+                    let directLink = `https://t.me/${botUsername}?start=trade_${o.user_id}`;
+
+                    oHTML += `<div class="list-item" style="display:flex; flex-direction:column; gap:8px;">
+                        <div style="display:flex; justify-content:space-between; align-items:center;">
+                            <span style="font-weight:700; font-size:14px;"><i class="fa-solid fa-circle-user"></i> ${o.name} <span class="badge">⭐ ${o.rep || 0} Pts</span></span>
+                            <span style="font-size:10px; color:var(--hint);">⏳ Expira en ${hoursLeft}h</span>
+                        </div>
+                        <div style="font-size:13px; line-height:1.4; background:rgba(0,0,0,0.2); padding:10px; border-radius:8px;">${o.text}</div>
+                        <div class="action-row">
+                            ${isOwner ? 
+                                `<button onclick="deleteOffer('${o._id}')" class="action-btn btn-delete-offer"><i class="fa-solid fa-trash"></i> Borrar</button>` :
+                                `<a href="${directLink}" class="action-btn btn-connect"><i class="fa-solid fa-comments"></i> Conectar Directo</a>`
+                            }
+                        </div>
+                    </div>`;
+                });
+                document.getElementById("offers-list").innerHTML = oHTML || '<div style="text-align:center;color:var(--hint); font-size:14px;">No hay ofertas disponibles.</div>';
+            }
+
+            function filterOffers() { renderOffers(allOffers); }
+            
+            function setCategoryFilter(cat, el) {
+                document.querySelectorAll('.pill').forEach(p => p.classList.remove('active'));
+                el.classList.add('active');
+                currentCatFilter = cat;
+                renderOffers(allOffers);
+            }
+
+            async function postOffer() {
+                let give = document.getElementById('offer-give').value.trim();
+                let want = document.getElementById('offer-want').value.trim();
+                let type = document.getElementById('offer-type').value;
+                
+                if(give.length < 3 || want.length < 3) return tg.showAlert("⚠️ Detalla claramente qué ofreces y qué buscas.");
+                
+                let combinedText = `🎁 <b>Ofrezco:</b> ${give}\\n🎯 <b>Busco:</b> ${want}`;
                 let btn = document.getElementById("btn-post-offer");
                 btn.disabled = true;
                 btn.innerText = "Publicando...";
 
                 try {
-                    let res = await fetch(`/api/offer?id=${userId}`, { method: "POST", headers: reqHeaders, body: JSON.stringify({ text: val, name: user?.first_name || "Anónimo" }) });
+                    let res = await fetch(`/api/offer?id=${userId}`, { 
+                        method: "POST", 
+                        headers: reqHeaders, 
+                        body: JSON.stringify({ text: combinedText, name: user?.first_name || "Anónimo", type: type }) 
+                    });
                     let data = await res.json();
                     
                     if(data.success) {
-                        document.getElementById('offer-input').value = "";
+                        document.getElementById('offer-give').value = "";
+                        document.getElementById('offer-want').value = "";
                         tg.HapticFeedback.notificationOccurred('success');
                         tg.showAlert("✅ Publicado con éxito en el mercado.");
+                        loadData();
                     } else { 
                         tg.showAlert(data.error); 
                     }
@@ -626,7 +706,23 @@ async def handle_webapp(request):
                 }
                 
                 btn.innerHTML = '<i class="fa-solid fa-paper-plane"></i> Publicar';
-                loadData();
+            }
+
+            async function deleteOffer(offerId) {
+                tg.showConfirm("¿Deseas eliminar tu oferta actual?", async (ok) => {
+                    if (ok) {
+                        try {
+                            let res = await fetch(`/api/offer/delete?id=${userId}&offer_id=${offerId}`, { method: "POST", headers: reqHeaders });
+                            let data = await res.json();
+                            if (data.success) {
+                                tg.HapticFeedback.notificationOccurred('success');
+                                loadData();
+                            } else {
+                                tg.showAlert("No se pudo eliminar.");
+                            }
+                        } catch(e) { tg.showAlert("Error de conexión."); }
+                    }
+                });
             }
 
             async function clearInventory() {
@@ -643,6 +739,11 @@ async def handle_webapp(request):
                     }
                 });
             }
+
+            // Polling en tiempo real cada 35 segundos para actualizar el mercado automáticamente
+            setInterval(() => {
+                if (userId) loadData();
+            }, 35000);
 
             initChests(false);
             loadData();
