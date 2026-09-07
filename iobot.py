@@ -381,7 +381,8 @@ async def handle_webapp(request):
             @keyframes fadeIn { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: translateY(0); } }
 
             .card { background: var(--card-bg); border-radius: 16px; padding: 20px; border: 1px solid var(--card-border); }
-            .card-title { font-size: 16px; font-weight: 700; color: var(--text-strong); margin-bottom: 12px; display: flex; justify-content: space-between; align-items: center; }
+            .card-title { font-size: 16px; font-weight: 700; color: var(--text-strong); margin-bottom: 12px; }
+            .card-title-flex { display: flex; justify-content: space-between; align-items: center; }
             .btn-main { background: var(--accent); color: #fff; border: none; border-radius: 12px; padding: 14px; width: 100%; font-size: 15px; font-weight: 700; cursor: pointer; }
             .btn-outline { background: transparent; border: 2px solid var(--accent); color: var(--accent); }
             .btn-danger { background: rgba(248, 81, 73, 0.1); color: var(--danger); border: 1px solid var(--danger); }
@@ -438,7 +439,7 @@ async def handle_webapp(request):
 
         <div id="cofres" class="section">
             <div class="card" style="text-align: center;">
-                <div class="card-title" style="color:var(--gold); justify-content:center;">Recompensa Diaria</div>
+                <div class="card-title" style="color:var(--gold); text-align:center;">Recompensa Diaria</div>
                 <div class="chests-container" id="chests-container"></div>
                 <div id="bonus-status" style="font-weight:700; color:var(--hint); margin-top:10px;">Calculando...</div>
             </div>
@@ -460,8 +461,8 @@ async def handle_webapp(request):
                 <div id="offer-cooldown" style="color:var(--danger); display:none; margin-top:10px; font-size: 12px; text-align: center;">Debe esperar para publicar.</div>
             </div>
             <div class="card">
-                <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:12px;">
-                    <div class="card-title" style="margin-bottom:0;">Mercado En Vivo</div>
+                <div class="card-title card-title-flex" style="margin-bottom:12px;">
+                    <span>Mercado En Vivo</span>
                     <input type="text" id="market-search" placeholder="🔍 Buscar..." oninput="filterOffers()" style="width: 110px; padding: 6px; font-size: 12px; border-radius: 8px;">
                 </div>
                 <div class="pill-container">
@@ -503,7 +504,6 @@ async def handle_webapp(request):
                 document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
                 document.getElementById(tabId).classList.add('active');
                 el.classList.add('active');
-                // Desplazamiento automático de la barra de pestañas para centrar la seleccionada
                 el.scrollIntoView({ behavior: 'smooth', inline: 'center', block: 'nearest' });
             }
 
