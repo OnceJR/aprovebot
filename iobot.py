@@ -1560,7 +1560,7 @@ async def main():
     global db_client, db, backup_queue
     # 1. Inicializar bases de datos y colas asincrónicas DENTRO del Event Loop
     db_client = AsyncIOMotorClient(MONGO_URI)
-    db = db_client.intercambio_bot_v6
+    db = db_client.intercambio_bot_v7
     backup_queue = asyncio.Queue()
     
     # 2. Configurar el bot y el servidor
