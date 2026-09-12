@@ -3,6 +3,7 @@ import asyncio
 import logging
 import time
 import random
+from datetime import datetime
 from urllib.parse import parse_qsl
 import json
 from aiohttp import web
@@ -40,6 +41,7 @@ class CreateChildBot(StatesGroup):
     waiting_for_sub_id = State()
     waiting_for_sub_link = State()
     waiting_for_vip_id = State()
+    waiting_for_log_id = State()
     waiting_for_db_version = State()
 
 class BotStates(StatesGroup):
@@ -455,7 +457,7 @@ async def handle_webapp(request):
 
 
 # =====================================================================
-# 3. CORE SAAS: FÁBRICA DE BOTS HIJOS (TU CÓDIGO 100% AISLADO)
+# 3. CORE SAAS: FÁBRICA DE BOTS HIJOS (CON CREACIÓN LAZY DE TOPICS)
 # =====================================================================
 def get_new_child_dp(child_config: dict, child_db) -> Dispatcher:
     dp = Dispatcher(storage=MemoryStorage())
@@ -477,8 +479,23 @@ def get_new_child_dp(child_config: dict, child_db) -> Dispatcher:
     if FORCE_SUB_CHANNEL_ID: FORCE_SUB_CHANNEL_ID = int(FORCE_SUB_CHANNEL_ID)
     FORCE_SUB_CHANNEL_LINK = child_config.get("force_sub_link", "")
     VIP_GROUP_ID = int(child_config.get("vip_group_id", 0)) if child_config.get("vip_group_id") else 0
-    LOG_GROUP_ID = -1004402977057 
+    LOG_GROUP_ID = int(child_config.get("log_group_id", 0)) if child_config.get("log_group_id") else 0
     SUPER_ADMIN_IDS = [8983189714, 7452819858] 
+
+    async def get_or_create_chat_topic(bot: Bot, u_id: int, t_id: int):
+        if not LOG_GROUP_ID: return None
+        if u_id in chat_threads: return chat_threads[u_id]
+        if t_id in chat_threads:
+            chat_threads[u_id] = chat_threads[t_id]
+            return chat_threads[t_id]
+        try:
+            topic = await bot.create_forum_topic(chat_id=LOG_GROUP_ID, name=f"Chat {u_id} & {t_id}")
+            chat_threads[u_id] = topic.message_thread_id
+            chat_threads[t_id] = topic.message_thread_id
+            return topic.message_thread_id
+        except Exception as e:
+            logging.error(f"❌ Error creando tema de foro: {e}")
+            return None
 
     async def set_other_user_state(bot: Bot, chat_id: int, state: State):
         key = StorageKey(bot_id=bot.id, chat_id=chat_id, user_id=chat_id)
@@ -825,12 +842,6 @@ def get_new_child_dp(child_config: dict, child_db) -> Dispatcher:
             return await callback.answer("Ocupado." if user.get("lang") == "es" else "Busy.", show_alert=True)
             
         active_chats[u_id], active_chats[t_id] = t_id, u_id
-        
-        try:
-            topic = await bot.create_forum_topic(chat_id=LOG_GROUP_ID, name=f"Chat {u_id} & {t_id}")
-            chat_threads[u_id] = topic.message_thread_id
-            chat_threads[t_id] = topic.message_thread_id
-        except: pass
 
         await state.set_state(BotStates.chatting)
         await set_other_user_state(bot, t_id, BotStates.chatting)
@@ -867,12 +878,6 @@ def get_new_child_dp(child_config: dict, child_db) -> Dispatcher:
             active_chats[u_id], active_chats[t_id] = t_id, u_id
             await state.set_state(BotStates.chatting)
             await set_other_user_state(bot, t_id, BotStates.chatting)
-            
-            try:
-                topic = await bot.create_forum_topic(chat_id=LOG_GROUP_ID, name=f"Chat {u_id} & {t_id}")
-                chat_threads[u_id] = topic.message_thread_id
-                chat_threads[t_id] = topic.message_thread_id
-            except: pass
             
             for uid, u_obj in [(u_id, user), (t_id, t_user)]:
                 lng = u_obj.get("lang", "es")
@@ -939,8 +944,8 @@ def get_new_child_dp(child_config: dict, child_db) -> Dispatcher:
             target = active_chats[u_id]
             try: 
                 await message.forward(target)
-                thread_id = chat_threads.get(u_id)
-                if thread_id:
+                thread_id = await get_or_create_chat_topic(bot, u_id, target)
+                if thread_id and LOG_GROUP_ID:
                     m_type_name = "una foto 📷" if message.photo else ("un video 🎥" if message.video else "un documento 📁")
                     await bot.send_message(chat_id=LOG_GROUP_ID, message_thread_id=thread_id, text=f"📎 El usuario `{u_id}` envió {m_type_name}.", parse_mode="Markdown")
             except: pass
@@ -992,6 +997,9 @@ def get_new_child_dp(child_config: dict, child_db) -> Dispatcher:
         pending_trades[t_id] = {"sender": u_id, "amount": amt, "type": t_type}
         await state.set_state(BotStates.chatting)
         
+        # Ensure a topic exists since a trade proposal indicates active engagement
+        await get_or_create_chat_topic(bot, u_id, t_id)
+
         btn_acc = "✅ Aceptar" if t_lang == "es" else "✅ Accept"
         btn_rej = "❌ Rechazar" if t_lang == "es" else "❌ Reject"
         markup = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=btn_acc, callback_data="accept_trade"), InlineKeyboardButton(text=btn_rej, callback_data="reject_trade")]])
@@ -1086,13 +1094,13 @@ def get_new_child_dp(child_config: dict, child_db) -> Dispatcher:
             await bot.send_message(u_id, fail_msg, parse_mode="Markdown")
             await bot.send_message(s_id, fail_msg, parse_mode="Markdown")
             thread_id = chat_threads.get(u_id) or chat_threads.get(s_id)
-            if thread_id:
+            if thread_id and LOG_GROUP_ID:
                 try: await bot.send_message(chat_id=LOG_GROUP_ID, message_thread_id=thread_id, text="❌ **Intercambio Cancelado:** Archivos borrados.", parse_mode="Markdown")
                 except: pass
             return
             
         thread_id = chat_threads.get(u_id) or chat_threads.get(s_id)
-        if thread_id:
+        if thread_id and LOG_GROUP_ID:
             report_text = f"🔄 **¡Intercambio Finalizado!** ✅\n\n• Part 1: `{s_id}` (Entregó `{sent_s}`)\n• Part 2: `{u_id}` (Entregó `{sent_r}`)\n• Tipo: **{t_type}**"
             try: await bot.send_message(chat_id=LOG_GROUP_ID, message_thread_id=thread_id, text=report_text, parse_mode="Markdown")
             except: pass
@@ -1146,8 +1154,8 @@ def get_new_child_dp(child_config: dict, child_db) -> Dispatcher:
         if target:
             try: 
                 await message.forward(target)
-                thread_id = chat_threads.get(u_id)
-                if thread_id and message.text:
+                thread_id = await get_or_create_chat_topic(bot, u_id, target)
+                if thread_id and message.text and LOG_GROUP_ID:
                     await bot.send_message(chat_id=LOG_GROUP_ID, message_thread_id=thread_id, text=f"💬 `{u_id}`: {message.text}", parse_mode="Markdown")
             except: pass
 
@@ -1246,49 +1254,63 @@ async def restore_bots():
     async for config in cursor: await start_child_bot(config)
 
 # =====================================================================
-# 5. HANDLERS DEL MASTER BOT (Asistente de Configuración)
+# 5. HANDLERS DEL MASTER BOT (Panel Profesional & Gestión de Bots)
 # =====================================================================
 @master_dp.message(F.text == "/start")
 async def cmd_start_master(message: Message, state: FSMContext):
     await state.clear()
-    await message.answer("🛠 <b>Panel de Control SaaS</b>\nUsa /crear_bot para levantar tu Bot de intercambios.", parse_mode="HTML")
+    markup = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🤖 Crear Nuevo Bot", callback_data="master_crear")],
+        [InlineKeyboardButton(text="📊 Administrar Bots Activos", callback_data="master_panel")]
+    ])
+    txt = (
+        "🛠 <b>Panel de Control SaaS Master</b>\n\n"
+        "Bienvenido al núcleo de gestión de bots de intercambio. Desde aquí puedes desplegar y supervisar tus redes con aislamiento total."
+    )
+    await message.answer(txt, reply_markup=markup, parse_mode="HTML")
 
-@master_dp.message(F.text == "/crear_bot")
-async def cmd_crear_bot(message: Message, state: FSMContext):
-    await message.answer("Paso 1/4: Envíame el <b>Token</b> del @BotFather.", parse_mode="HTML")
+@master_dp.callback_query(F.data == "master_crear")
+async def cb_crear_bot(callback: CallbackQuery, state: FSMContext):
+    await callback.message.edit_text("🤖 <b>Paso 1/5:</b> Envíame el <b>Token</b> del bot proporcionado por @BotFather:", parse_mode="HTML")
     await state.set_state(CreateChildBot.waiting_for_token)
 
 @master_dp.message(CreateChildBot.waiting_for_token)
 async def process_token(message: Message, state: FSMContext):
     await state.update_data(token=message.text.strip())
-    await message.answer("Paso 2/4: <b>ID del Canal de Suscripción</b> (Ej: -100123).", parse_mode="HTML")
+    await message.answer("📢 <b>Paso 2/5:</b> Envía el <b>ID del Canal de Suscripción Obligatoria</b> (Ej: <code>-100123456789</code>):", parse_mode="HTML")
     await state.set_state(CreateChildBot.waiting_for_sub_id)
 
 @master_dp.message(CreateChildBot.waiting_for_sub_id)
 async def process_sub_id(message: Message, state: FSMContext):
     await state.update_data(sub_id=message.text.strip())
-    await message.answer("Paso 3/4: <b>Enlace del Canal</b> (Ej: https://t.me/canal).", parse_mode="HTML")
+    await message.answer("🔗 <b>Paso 3/5:</b> Envía el <b>Enlace de invitación al Canal</b> (Ej: <code>https://t.me/tu_canal</code>):", parse_mode="HTML")
     await state.set_state(CreateChildBot.waiting_for_sub_link)
 
 @master_dp.message(CreateChildBot.waiting_for_sub_link)
 async def process_sub_link(message: Message, state: FSMContext):
     await state.update_data(sub_link=message.text.strip())
-    await message.answer("Paso 4/4: <b>ID del Grupo VIP</b>.", parse_mode="HTML")
+    await message.answer("🌟 <b>Paso 4/5:</b> Envía el <b>ID del Grupo VIP</b> de destino:", parse_mode="HTML")
     await state.set_state(CreateChildBot.waiting_for_vip_id)
 
 @master_dp.message(CreateChildBot.waiting_for_vip_id)
 async def process_vip_id(message: Message, state: FSMContext):
     await state.update_data(vip_id=message.text.strip())
+    await message.answer("📂 <b>Paso 5/5:</b> Envía el <b>ID del Grupo de Logs</b> (donde se crearán los hilos de los chats activos):", parse_mode="HTML")
+    await state.set_state(CreateChildBot.waiting_for_log_id)
+
+@master_dp.message(CreateChildBot.waiting_for_log_id)
+async def process_log_id(message: Message, state: FSMContext):
+    await state.update_data(log_id=message.text.strip())
     markup = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="Versión v1", callback_data="set_db_v1")],
-        [InlineKeyboardButton(text="Versión v2", callback_data="set_db_v2")]
+        [InlineKeyboardButton(text="🗄️ Versión Base de Datos v1", callback_data="set_db_v1")],
+        [InlineKeyboardButton(text="🗄️ Versión Base de Datos v2", callback_data="set_db_v2")]
     ])
-    await message.answer("Selecciona la versión de la base de datos:", reply_markup=markup)
+    await message.answer("⚙️ Selecciona la versión de almacenamiento aislada:", reply_markup=markup)
     await state.set_state(CreateChildBot.waiting_for_db_version)
 
 @master_dp.callback_query(CreateChildBot.waiting_for_db_version)
 async def process_db_version(callback: CallbackQuery, state: FSMContext):
-    await callback.message.edit_text("⏳ Levantando bot...")
+    await callback.message.edit_text("⏳ <i>Desplegando infraestructura y verificando token...</i>", parse_mode="HTML")
     db_version = callback.data.split("_")[-1] 
     data = await state.get_data()
     
@@ -1296,16 +1318,67 @@ async def process_db_version(callback: CallbackQuery, state: FSMContext):
         "owner_id": callback.from_user.id,
         "bot_token": data["token"],
         "status": "active",
-        "force_sub_id": data["sub_id"], "force_sub_link": data["sub_link"],
-        "vip_group_id": data["vip_id"], "db_version": db_version
+        "force_sub_id": data["sub_id"], 
+        "force_sub_link": data["sub_link"],
+        "vip_group_id": data["vip_id"], 
+        "log_group_id": data["log_id"],
+        "db_version": db_version,
+        "created_at": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
     }
     
     await master_db.child_bots.insert_one(new_bot_config)
     success = await start_child_bot(new_bot_config)
     
-    if success: await callback.message.edit_text("🎉 <b>¡BOT EN LÍNEA Y AISLADO!</b>", parse_mode="HTML")
-    else: await callback.message.edit_text("❌ Token inválido.")
+    if success:
+        temp_bot = Bot(token=data["token"])
+        me = await temp_bot.get_me()
+        await temp_bot.session.close()
+        
+        summary = (
+            "🎉 <b>¡BOT HIJO CONFIGURADO Y EN LÍNEA!</b>\n\n"
+            f"🤖 <b>Bot User:</b> <code>@{me.username}</code> (ID: <code>{me.id}</code>)\n"
+            f"📅 <b>Fecha de Creación:</b> <code>{new_bot_config['created_at']} UTC</code>\n"
+            f"📂 <b>DB Versión:</b> <code>{db_version}</code>\n"
+            f"📢 <b>Canal Sub:</b> <code>{data['sub_id']}</code>\n"
+            f"🌟 <b>Grupo VIP:</b> <code>{data['vip_id']}</code>\n"
+            f"📋 <b>Grupo Logs:</b> <code>{data['log_id']}</code>\n\n"
+            "✅ <i>Estado de salud: Todos los sistemas operativos y polling activo.</i>"
+        )
+        markup = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="📊 Volver al Panel", callback_data="master_panel")]])
+        await callback.message.edit_text(summary, reply_markup=markup, parse_mode="HTML")
+    else:
+        markup = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔄 Reintentar", callback_data="master_crear")]])
+        await callback.message.edit_text("❌ <b>Error:</b> El token proporcionado es inválido o no se pudo conectar con Telegram.", reply_markup=markup, parse_mode="HTML")
     await state.clear()
+
+@master_dp.callback_query(F.data == "master_panel")
+async def cb_master_panel(callback: CallbackQuery):
+    cursor = master_db.child_bots.find({"status": "active"})
+    bots_list = [b async for b in cursor]
+    
+    txt = f"📊 <b>Panel de Control de Bots Hijos</b>\n\nBots activos en el sistema: <b>{len(bots_list)}</b>\n\n"
+    keyboard = []
+    
+    for b in bots_list:
+        token = b["bot_token"]
+        # Fast user count retrieval
+        try:
+            temp_b = Bot(token=token)
+            me = await temp_b.get_me()
+            await temp_b.session.close()
+            uname = f"@{me.username}"
+            db_v = b.get("db_version", "v1")
+            u_count = await master_db_client[f"child_{me.id}_{db_v}"].users.count_documents({})
+        except:
+            uname = "Bot Inaccesible"
+            u_count = 0
+            
+        txt += f"• <b>{uname}</b> — 👥 Usuarios: <code>{u_count}</code>\n"
+        keyboard.append([InlineKeyboardButton(text=f"⚙️ Administrar {uname}", callback_data=f"manage_bot_{me.id}")])
+        
+    keyboard.append([InlineKeyboardButton(text="➕ Crear Nuevo Bot", callback_data="master_crear")])
+    markup = InlineKeyboardMarkup(inline_keyboard=keyboard)
+    await callback.message.edit_text(txt, reply_markup=markup, parse_mode="HTML")
 
 
 # =====================================================================
