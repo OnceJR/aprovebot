@@ -573,17 +573,19 @@ def get_new_child_dp(child_config: dict, child_db) -> Dispatcher:
         ])
         
         if lang == "es":
-            txt = (
-                "👋 <b>¡Bienvenido a la red de intercambio!</b>\n\n"
-                "⚠️ <b>REQUISITO CLAVE:</b> Sube material propio a este chat para poder hacer intercambios.\n\n"
-                "🚀 Utiliza la <b>Mini App</b> para reclamar tus cofres diarios, ver el radar y reclamar tu VIP."
-            )
-        else:
-            txt = (
-                "👋 <b>Welcome to the exchange network!</b>\n\n"
-                "⚠️ <b>KEY REQUIREMENT:</b> Upload your own media to this chat to be able to trade.\n\n"
-                "🚀 Use the <b>Mini App</b> to claim your daily chests, check the radar, and view VIP status."
-            )
+                txt = (
+                    "👋 <b>¡Bienvenido a la red de intercambio!</b>\n\n"
+                    "⚠️ <b>REQUISITO CLAVE:</b> Sube material propio a este chat para poder hacer intercambios. "
+                    "¡Sin videos o fotos en tu inventario, no podrás recibir nada!\n\n"
+                    "🎁 Utiliza la nueva <b>Mini App</b> para reclamar tu bonus diario y ver tu progreso VIP. 🚀"
+                )
+            else:
+                txt = (
+                    "👋 <b>Welcome to the exchange network!</b>\n\n"
+                    "⚠️ <b>KEY REQUIREMENT:</b> Upload your own media to this chat to be able to trade. "
+                    "Without videos or photos in your inventory, you won't receive anything!\n\n"
+                    "🎁 Use the new <b>Mini App</b> to claim your daily bonus and check your VIP progress. 🚀"
+                )
         await bot.send_message(chat_id=user_id, text=txt, reply_markup=markup, parse_mode="HTML")
 
     @dp.message(Command("add_receiver"))
