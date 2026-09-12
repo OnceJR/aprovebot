@@ -32,10 +32,9 @@ RENDER_URL = os.environ.get("RENDER_EXTERNAL_URL", "https://TU_DOMINIO.onrender.
 
 master_db_client = AsyncIOMotorClient(MASTER_MONGO_URI)
 master_db = master_db_client.saas_master_db
-active_bots_tasks = {} # Estructura: {bot_id: {"bot": bot, "db": db, "queue": queue, ...}}
+active_bots_tasks = {} # Estructura: {bot_id: {"bot": bot, "db": db, "dp": dp, "queue": queue, ...}}
 master_dp = Dispatcher()
 
-# --- ESTADOS FSM ---
 class CreateChildBot(StatesGroup):
     waiting_for_token = State()
     waiting_for_sub_id = State()
@@ -52,7 +51,7 @@ class BotStates(StatesGroup):
     waiting_for_id = State()
 
 # =====================================================================
-# 2. SERVIDOR WEB Y APIS (ADAPTADO PARA SaaS MULTI-TENANT)
+# 2. SERVIDOR WEB Y APIS 
 # =====================================================================
 async def get_auth_user(request):
     init_data = request.headers.get("Authorization", "")
@@ -69,16 +68,14 @@ async def get_auth_user(request):
     return None
 
 def get_child_db(request):
-    bot_id = int(request.query.get("bot_id", 0))
-    if bot_id in active_bots_tasks:
-        return active_bots_tasks[bot_id]["db"]
-    return None
+    try: bot_id = int(request.query.get("bot_id") or 0)
+    except (ValueError, TypeError): bot_id = 0
+    return active_bots_tasks.get(bot_id, {}).get("db")
 
 def get_child_bot(request):
-    bot_id = int(request.query.get("bot_id", 0))
-    if bot_id in active_bots_tasks:
-        return active_bots_tasks[bot_id]["bot"]
-    return None
+    try: bot_id = int(request.query.get("bot_id") or 0)
+    except (ValueError, TypeError): bot_id = 0
+    return active_bots_tasks.get(bot_id, {}).get("bot")
 
 async def api_live_ping(request):
     user_id = await get_auth_user(request)
@@ -86,8 +83,7 @@ async def api_live_ping(request):
     bot = get_child_bot(request)
     if not user_id or not child_db or not bot: return web.json_response({"error": "Unauthorized"}, status=401)
     
-    # Extraemos el diccionario active_viewers desde la RAM del bot hijo
-    dp = active_bots_tasks[bot.id]["polling_task"].get_coro().cr_frame.f_locals['dp']
+    dp = active_bots_tasks[bot.id]["dp"]
     active_viewers = dp["active_viewers"]
     
     now = time.time()
@@ -121,34 +117,59 @@ async def api_live_ping(request):
 async def api_get_data(request):
     user_id = await get_auth_user(request)
     child_db = get_child_db(request)
-    if not user_id or not child_db: return web.json_response({"error": "Unauthorized / Bot Inactivo"}, status=401)
+    bot = get_child_bot(request)
+    if not user_id or not child_db or not bot: return web.json_response({"error": "Unauthorized"}, status=401)
     
     user = await child_db.users.find_one({"_id": user_id}) or {}
     fotos = await child_db.inventory.count_documents({"user_id": user_id, "type": "photo"})
     videos = await child_db.inventory.count_documents({"user_id": user_id, "type": "video"})
     
-    now = time.time()
-    await child_db.offers.delete_many({"time": {"$lt": now - 86400}})
-    
     top_users = []
     async for u in child_db.users.find().sort("reputation", -1).limit(10):
         if u.get("reputation", 0) > 0:
             top_users.append({"id": u["_id"], "rep": u.get("reputation", 0)})
+            
+    # Lógica del Radar en vivo
+    dp = active_bots_tasks[bot.id]["dp"]
+    active_viewers = dp.get("active_viewers", {})
+    waiting_list = dp.get("waiting_list", [])
+    active_chats = dp.get("active_chats", {})
+    
+    online_users = []
+    now = time.time()
+    
+    active_ids = set(active_viewers.keys()) | set(waiting_list) | set(active_chats.keys())
+    
+    for uid in active_ids:
+        if uid == user_id: continue 
         
-    offers = []
-    async for o in child_db.offers.find().sort("time", -1).limit(20):
-        offers.append({"user_id": o["user_id"], "name": o["name"], "text": o["text"], "time": o.get("time", now), "_id": str(o["_id"])})
+        is_recent = (now - active_viewers.get(uid, 0)) < 300 
+        if not is_recent and uid not in waiting_list and uid not in active_chats:
+            continue
+            
+        status = "Libre 🟢"
+        if uid in active_chats:
+            status = "Ocupado 🔴"
+        elif uid in waiting_list:
+            status = "Buscando 🟡"
+            
+        u_data = await child_db.users.find_one({"_id": uid}) or {}
+        
+        online_users.append({
+            "id": uid,
+            "rep": u_data.get("reputation", 0),
+            "status": status,
+            "is_free": status != "Ocupado 🔴"
+        })
     
     last_bonus = user.get("last_bonus", 0)
     time_left_bonus = max(0, (last_bonus + (6 * 3600)) - now)
-    last_offer = user.get("last_offer", 0)
-    time_left_offer = max(0, (last_offer + 3600) - now)
     
     return web.json_response({
         "fotos": fotos, "videos": videos,
         "reputation": user.get("reputation", 0), "referrals": user.get("referrals", 0),
-        "time_left": time_left_bonus, "offer_cooldown": time_left_offer,
-        "leaderboard": top_users, "offers": offers
+        "time_left": time_left_bonus,
+        "leaderboard": top_users, "online_users": online_users
     })
 
 async def api_claim_bonus(request):
@@ -166,27 +187,6 @@ async def api_claim_bonus(request):
     nueva_rep = user.get("reputation", 0) + puntos
     await child_db.users.update_one({"_id": user_id}, {"$set": {"last_bonus": now, "reputation": nueva_rep}}, upsert=True)
     return web.json_response({"success": True, "bonus": puntos, "new_rep": nueva_rep, "time_left": cooldown})
-
-async def api_post_offer(request):
-    user_id = await get_auth_user(request)
-    child_db = get_child_db(request)
-    if not user_id or not child_db: return web.json_response({"error": "Unauthorized"}, status=401)
-    
-    user = await child_db.users.find_one({"_id": user_id}) or {}
-    now = time.time()
-    if now < user.get("last_offer", 0) + 3600:
-        return web.json_response({"success": False, "error": "Espera 1 hora."})
-    
-    data = await request.json()
-    text = data.get("text", "").strip()[:120]
-    name = data.get("name", "Anónimo")
-    type_o = data.get("type", "mixed")
-    
-    if len(text) >= 10:
-        await child_db.offers.insert_one({"user_id": user_id, "name": name, "text": text, "type": type_o, "time": now})
-        await child_db.users.update_one({"_id": user_id}, {"$set": {"last_offer": now}}, upsert=True)
-        return web.json_response({"success": True})
-    return web.json_response({"success": False, "error": "Oferta muy corta."})
 
 async def api_clear_inv(request):
     user_id = await get_auth_user(request)
@@ -233,11 +233,8 @@ async def handle_webapp(request):
             .btn-main { background: var(--accent); color: #fff; border: none; border-radius: 12px; padding: 14px; width: 100%; font-size: 15px; font-weight: 700; cursor: pointer; }
             .btn-outline { background: transparent; border: 2px solid var(--accent); color: var(--accent); }
             .btn-danger { background: rgba(248, 81, 73, 0.1); color: var(--danger); border: 1px solid var(--danger); }
-            .action-row { display: flex; gap: 8px; margin-top: 10px; }
             .action-btn { flex: 1; padding: 8px 12px; border-radius: 8px; font-size: 12px; font-weight: 600; cursor: pointer; display: inline-flex; align-items: center; justify-content: center; gap: 6px; text-decoration: none; border: none; }
             .btn-connect { background: rgba(88, 166, 255, 0.15); border: 1px solid rgba(88, 166, 255, 0.3); color: var(--accent); }
-            .input-group { margin-bottom: 12px; }
-            input[type="text"], select { width: 100%; padding: 14px; border-radius: 12px; border: 1px solid var(--card-border); background: rgba(0,0,0,0.2); color: #fff; font-family: 'Poppins'; outline: none;}
             .progress-bg { background: rgba(255,255,255,0.05); border-radius: 10px; height: 14px; width: 100%; }
             .progress-fill { background: var(--gradient-gold); height: 100%; width: 0%; border-radius: 10px; transition: width 0.8s ease-in-out; }
             .chests-container { display: flex; justify-content: center; gap: 15px; margin: 20px 0; }
@@ -245,9 +242,6 @@ async def handle_webapp(request):
             .chest-wrapper.disabled { opacity: 0.5; filter: grayscale(100%); pointer-events: none; }
             .chest-img { width: 100%; height: 100%; object-fit: contain; }
             .list-item { background: rgba(255,255,255,0.03); padding: 16px; border-radius: 12px; margin-bottom: 12px; border: 1px solid var(--card-border); }
-            .pill-container { display: flex; gap: 6px; margin-bottom: 14px; overflow-x: auto; }
-            .pill { background: rgba(255,255,255,0.05); border: 1px solid var(--card-border); color: var(--hint); padding: 6px 14px; border-radius: 20px; font-size: 12px; font-weight: 600; cursor: pointer; white-space: nowrap; }
-            .pill.active { background: var(--accent); color: #fff; border-color: var(--accent); }
             .badge { font-size: 10px; padding: 2px 6px; border-radius: 6px; font-weight: 700; background: rgba(227, 179, 65, 0.15); color: var(--gold); border: 1px solid rgba(227, 179, 65, 0.3); }
         </style>
     </head>
@@ -257,7 +251,7 @@ async def handle_webapp(request):
         <div class="tabs" id="nav-tabs">
             <div class="tab active" onclick="switchTab('stats', this)"><i class="fa-solid fa-star"></i> VIP</div>
             <div class="tab" onclick="switchTab('cofres', this)"><i class="fa-solid fa-box-open"></i> Bonus</div>
-            <div class="tab" onclick="switchTab('mercado', this)"><i class="fa-solid fa-store"></i> Market</div>
+            <div class="tab" onclick="switchTab('mercado', this)"><i class="fa-solid fa-satellite-dish"></i> Radar</div>
             <div class="tab" onclick="switchTab('rank', this)"><i class="fa-solid fa-trophy"></i> Top</div>
             <div class="tab" onclick="switchTab('inventory', this)"><i class="fa-solid fa-vault"></i> Cofre</div>
         </div>
@@ -284,31 +278,12 @@ async def handle_webapp(request):
 
         <div id="mercado" class="section">
             <div class="card">
-                <div class="card-title"><i class="fa-solid fa-store"></i> Publicar Oferta</div>
-                <div class="input-group"><input type="text" id="offer-give" placeholder="📦 ¿Qué ofreces? (Ej: 50 Videos)" maxlength="60"></div>
-                <div class="input-group"><input type="text" id="offer-want" placeholder="🎯 ¿Qué buscas? (Ej: 50 Fotos)" maxlength="60"></div>
-                <div class="input-group">
-                    <select id="offer-type">
-                        <option value="mixed">🔀 Categoría: Mixto</option>
-                        <option value="video">🎥 Categoría: Solo Videos</option>
-                        <option value="photo">📷 Categoría: Solo Fotos</option>
-                    </select>
-                </div>
-                <button class="btn-main" onclick="postOffer()" id="btn-post-offer"><i class="fa-solid fa-paper-plane"></i> Publicar</button>
-                <div id="offer-cooldown" style="color:var(--danger); display:none; margin-top:10px; font-size: 12px; text-align: center;">Debe esperar para publicar.</div>
-            </div>
-            <div class="card">
                 <div class="card-title card-title-flex" style="margin-bottom:12px;">
-                    <span>Mercado En Vivo</span>
-                    <input type="text" id="market-search" placeholder="🔍 Buscar..." oninput="filterOffers()" style="width: 110px; padding: 6px; font-size: 12px; border-radius: 8px;">
+                    <span><i class="fa-solid fa-satellite-dish"></i> Radar de Usuarios</span>
+                    <button class="btn-main" style="width:auto; padding:6px 12px; font-size:12px;" onclick="loadData()"><i class="fa-solid fa-rotate-right"></i></button>
                 </div>
-                <div class="pill-container">
-                    <button class="pill active" onclick="setCategoryFilter('all', this)">Todos</button>
-                    <button class="pill" onclick="setCategoryFilter('video', this)">Videos</button>
-                    <button class="pill" onclick="setCategoryFilter('photo', this)">Fotos</button>
-                    <button class="pill" onclick="setCategoryFilter('mixed', this)">Mixto</button>
-                </div>
-                <div id="offers-list">Cargando...</div>
+                <p style="font-size:12px; color:var(--hint); margin-bottom:12px;">Aquí verás a los usuarios que están usando el bot o buscando intercambios en este momento.</p>
+                <div id="offers-list">Buscando usuarios en línea...</div>
             </div>
         </div>
 
@@ -333,8 +308,6 @@ async def handle_webapp(request):
             let botUsername = "BOT_USERNAME_PLACEHOLDER"; 
             let botId = "BOT_ID_PLACEHOLDER";
             let reqHeaders = { "Content-Type": "application/json", "Authorization": tg.initData || "" };
-            let allOffers = [];
-            let currentCatFilter = 'all';
 
             function switchTab(tabId, el) {
                 tg.HapticFeedback.impactOccurred('light');
@@ -446,17 +419,6 @@ async def handle_webapp(request):
                     
                     updateBonusUI(data.time_left);
                     
-                    let btnPost = document.getElementById("btn-post-offer");
-                    let cdText = document.getElementById("offer-cooldown");
-                    if (data.offer_cooldown > 0) {
-                        btnPost.disabled = true;
-                        cdText.style.display = "block";
-                        cdText.innerText = `⏳ Próxima publicación en ${Math.ceil(data.offer_cooldown/60)} min.`;
-                    } else {
-                        btnPost.disabled = false;
-                        cdText.style.display = "none";
-                    }
-                    
                     let rHTML = "";
                     data.leaderboard.forEach((u, i) => {
                         let icon = i === 0 ? "👑" : i === 1 ? "🥈" : i === 2 ? "🥉" : `<strong>#${i+1}</strong>`;
@@ -464,84 +426,27 @@ async def handle_webapp(request):
                     });
                     document.getElementById("ranking-list").innerHTML = rHTML || '<div style="text-align:center;color:var(--hint); font-size:14px;">Aún no hay datos.</div>';
 
-                    allOffers = data.offers || [];
-                    renderOffers(allOffers);
+                    renderRadar(data.online_users || []);
                 } catch(e) { console.error("Error loading data", e); }
             }
 
-            function renderOffers(offers) {
-                let query = document.getElementById("market-search").value.toLowerCase();
+            function renderRadar(users) {
                 let oHTML = "";
-                let now = Date.now() / 1000;
-                
-                offers.forEach(o => {
-                    if (currentCatFilter !== 'all' && o.type !== currentCatFilter) return;
-                    if (query && !o.text.toLowerCase().includes(query)) return;
-                    
-                    let timeLeftSecs = Math.max(0, 86400 - (now - o.time));
-                    let hoursLeft = Math.floor(timeLeftSecs / 3600);
-                    let isOwner = o.user_id == userId;
-                    let directLink = `https://t.me/${botUsername}?start=trade_${o.user_id}`;
-
-                    oHTML += `<div class="list-item" style="display:flex; flex-direction:column; gap:8px;">
-                        <div style="display:flex; justify-content:space-between; align-items:center;">
-                            <span style="font-weight:700; font-size:14px;"><i class="fa-solid fa-circle-user"></i> ${o.name} <span class="badge">⭐ ${o.rep || 0} Pts</span></span>
-                            <span style="font-size:10px; color:var(--hint);">⏳ Expira en ${hoursLeft}h</span>
-                        </div>
-                        <div style="font-size:13px; line-height:1.4; background:rgba(0,0,0,0.2); padding:10px; border-radius:8px;">${o.text}</div>
-                        <div class="action-row">
-                            ${isOwner ? 
-                                `<button onclick="tg.showAlert('En desarrollo.')" class="action-btn btn-connect"><i class="fa-solid fa-check"></i> Tu oferta</button>` :
-                                `<a href="${directLink}" class="action-btn btn-connect"><i class="fa-solid fa-comments"></i> Conectar Directo</a>`
-                            }
-                        </div>
-                    </div>`;
-                });
-                document.getElementById("offers-list").innerHTML = oHTML || '<div style="text-align:center;color:var(--hint); font-size:14px;">No hay ofertas disponibles.</div>';
-            }
-
-            function filterOffers() { renderOffers(allOffers); }
-            
-            function setCategoryFilter(cat, el) {
-                document.querySelectorAll('.pill').forEach(p => p.classList.remove('active'));
-                el.classList.add('active');
-                currentCatFilter = cat;
-                renderOffers(allOffers);
-            }
-
-            async function postOffer() {
-                let give = document.getElementById('offer-give').value.trim();
-                let want = document.getElementById('offer-want').value.trim();
-                let type = document.getElementById('offer-type').value;
-                
-                if(give.length < 3 || want.length < 3) return tg.showAlert("⚠️ Detalla claramente qué ofreces y qué buscas.");
-                
-                let combinedText = `🎁 <b>Ofrezco:</b> ${give}\\n🎯 <b>Busco:</b> ${want}`;
-                let btn = document.getElementById("btn-post-offer");
-                btn.disabled = true;
-                btn.innerText = "Publicando...";
-
-                try {
-                    let res = await fetch(`/api/offer?id=${userId}&bot_id=${botId}`, { 
-                        method: "POST", 
-                        headers: reqHeaders, 
-                        body: JSON.stringify({ text: combinedText, name: user?.first_name || "Anónimo", type: type }) 
+                if(users.length === 0) {
+                    oHTML = '<div style="text-align:center;color:var(--hint); font-size:14px; padding: 20px 0;">No hay otros usuarios en línea ahora.</div>';
+                } else {
+                    users.forEach(u => {
+                        let deepLink = `https://t.me/${botUsername}?start=connect_${u.id}`;
+                        oHTML += `<div class="list-item" style="display:flex; justify-content:space-between; align-items:center;">
+                            <div>
+                                <div style="font-weight:700; font-size:14px;"><i class="fa-solid fa-user-astronaut"></i> ID: ${u.id} <span class="badge">⭐ ${u.rep} Pts</span></div>
+                                <div style="font-size:11px; color:var(--hint); margin-top:4px;">Estado: <strong>${u.status}</strong></div>
+                            </div>
+                            ${u.is_free ? `<a href="${deepLink}" onclick="tg.close()" class="action-btn btn-connect" style="text-decoration:none;"><i class="fa-solid fa-link"></i> Conectar</a>` : `<button class="action-btn" style="background:rgba(255,255,255,0.1); color:var(--hint);" disabled>Ocupado</button>`}
+                        </div>`;
                     });
-                    let data = await res.json();
-                    
-                    if(data.success) {
-                        document.getElementById('offer-give').value = "";
-                        document.getElementById('offer-want').value = "";
-                        tg.HapticFeedback.notificationOccurred('success');
-                        tg.showAlert("✅ Publicado con éxito en el mercado.");
-                        loadData();
-                    } else { 
-                        tg.showAlert(data.error); 
-                    }
-                } catch(e) { 
-                    tg.showAlert("❌ Error de red al publicar."); 
                 }
-                btn.innerHTML = '<i class="fa-solid fa-paper-plane"></i> Publicar';
+                document.getElementById("offers-list").innerHTML = oHTML;
             }
 
             async function clearInventory() {
@@ -573,12 +478,9 @@ async def handle_webapp(request):
 # 3. CORE SAAS: FÁBRICA DE BOTS HIJOS (TU CÓDIGO 100% AISLADO)
 # =====================================================================
 def get_new_child_dp(child_config: dict, child_db) -> Dispatcher:
-    """Fábrica de Dispatchers. Crea un ecosistema asíncrono y aislado para cada cliente."""
     dp = Dispatcher(storage=MemoryStorage())
     
-    # ---------------------------------------------------------
     # MEMORIA RAM AISLADA PARA ESTE BOT
-    # ---------------------------------------------------------
     active_chats = {}
     waiting_list = []
     pending_trades = {}
@@ -586,23 +488,21 @@ def get_new_child_dp(child_config: dict, child_db) -> Dispatcher:
     active_viewers = {} 
     pending_notifications = {}
     chat_threads = {} 
-    
-    # Cola de backup exclusiva para este bot
     backup_queue = asyncio.Queue()
+    
     dp["backup_queue"] = backup_queue 
     dp["active_viewers"] = active_viewers
+    dp["active_chats"] = active_chats
+    dp["waiting_list"] = waiting_list
 
     # Variables de Configuración dinámicas (vienen de Mongo)
     FORCE_SUB_CHANNEL_ID = child_config.get("force_sub_id", 0)
     if FORCE_SUB_CHANNEL_ID: FORCE_SUB_CHANNEL_ID = int(FORCE_SUB_CHANNEL_ID)
     FORCE_SUB_CHANNEL_LINK = child_config.get("force_sub_link", "")
     VIP_GROUP_ID = int(child_config.get("vip_group_id", 0)) if child_config.get("vip_group_id") else 0
-    LOG_GROUP_ID = -1004402977057 # Grupo genérico de logs como solicitaste
-    SUPER_ADMIN_IDS = [8983189714, 7452819858] # Los tuyos
+    LOG_GROUP_ID = -1004402977057 
+    SUPER_ADMIN_IDS = [8983189714, 7452819858] 
 
-    # ---------------------------------------------------------
-    # FUNCIONES AUXILIARES (Usan child_db y el bot inyectado)
-    # ---------------------------------------------------------
     async def set_other_user_state(bot: Bot, chat_id: int, state: State):
         key = StorageKey(bot_id=bot.id, chat_id=chat_id, user_id=chat_id)
         fsm_ctx = FSMContext(storage=dp.storage, key=key)
@@ -642,7 +542,7 @@ def get_new_child_dp(child_config: dict, child_db) -> Dispatcher:
                 await bot.send_message(user_id, msg, reply_markup=markup, parse_mode="Markdown")
                 await save_user(user_id, {"notified_vip": True, "in_vip": True})
         except Exception as e:
-            logging.error(f"❌ Error crítico en check_vip_status para el usuario {user_id}: {e}")
+            logging.error(f"❌ Error crítico en check_vip_status: {e}")
 
     async def send_rating_request(user_id, target_id, bot: Bot):
         user = await get_user(user_id)
@@ -662,7 +562,7 @@ def get_new_child_dp(child_config: dict, child_db) -> Dispatcher:
         msg_en = f"📥 **Batch of files saved.** (Total inventory: {total})\n\n⚠️ **Important:** Do not delete the messages you upload here."
         try:
             await bot.send_message(u_id, msg_es if lang == "es" else msg_en, parse_mode="Markdown")
-        except Exception as e: pass
+        except Exception: pass
         finally: pending_notifications.pop(u_id, None)
         
     async def get_random_batch(sender_id: int, receiver_id: int, category: str, amount: int):
@@ -685,7 +585,7 @@ def get_new_child_dp(child_config: dict, child_db) -> Dispatcher:
         btn_id = "🆔 Conectar ID" if lang == "es" else "🆔 Connect ID"
         btn_prof = "👤 Mi Perfil" if lang == "es" else "👤 My Profile"
         btn_share = "🔗 Compartir Link" if lang == "es" else "🔗 Share Link"
-        btn_panel = "✨ Abrir Panel de Control" if lang == "es" else "✨ Open Dashboard"
+        btn_panel = "✨ Abrir App de Intercambio" if lang == "es" else "✨ Open App"
         
         markup = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text=btn_panel, web_app=WebAppInfo(url=webapp_url))],
@@ -699,19 +599,16 @@ def get_new_child_dp(child_config: dict, child_db) -> Dispatcher:
                 "👋 <b>¡Bienvenido a la red de intercambio!</b>\n\n"
                 "⚠️ <b>REQUISITO CLAVE:</b> Sube material propio a este chat para poder hacer intercambios. "
                 "¡Sin videos o fotos en tu inventario, no podrás recibir nada!\n\n"
-                "🎁 Utiliza la nueva <b>Mini App</b> para reclamar tu bonus diario y ver tu progreso VIP. 🚀"
+                "🎁 Utiliza la nueva <b>Mini App</b> para reclamar tu bonus diario y ver el radar de usuarios. 🚀"
             )
         else:
             txt = (
                 "👋 <b>Welcome to the exchange network!</b>\n\n"
                 "⚠️ <b>KEY REQUIREMENT:</b> Upload your own media to this chat to be able to trade.\n\n"
-                "🎁 Use the new <b>Mini App</b> to claim your daily bonus and check your VIP progress. 🚀"
+                "🎁 Use the new <b>Mini App</b> to claim your daily bonus and check the user radar. 🚀"
             )
         await bot.send_message(chat_id=user_id, text=txt, reply_markup=markup, parse_mode="HTML")
 
-    # ---------------------------------------------------------
-    # HANDLERS: ADMIN
-    # ---------------------------------------------------------
     @dp.message(Command("add_receiver"))
     async def cmd_add_receiver(message: Message, bot: Bot):
         if message.from_user.id not in SUPER_ADMIN_IDS: return
@@ -764,20 +661,6 @@ def get_new_child_dp(child_config: dict, child_db) -> Dispatcher:
         )
         await message.answer(stats_text, parse_mode="Markdown")
 
-    @dp.message(Command("reinvitar"))
-    async def cmd_reinvite(message: Message, bot: Bot):
-        if message.from_user.id not in SUPER_ADMIN_IDS or not VIP_GROUP_ID: return
-        try:
-            t_id = int(message.text.split()[1])
-            await bot.unban_chat_member(chat_id=VIP_GROUP_ID, user_id=t_id, only_if_banned=True)
-            link = await bot.create_chat_invite_link(chat_id=VIP_GROUP_ID, member_limit=1)
-            await bot.send_message(t_id, f"🎉 ¡VIP Restablecido!\nÚnete: {link.invite_link}")
-            await message.answer("✅ Reinvitado.")
-        except: await message.answer("⚠️ Uso: `/reinvitar ID`")
-
-    # ---------------------------------------------------------
-    # HANDLERS: USUARIOS Y MENÚS
-    # ---------------------------------------------------------
     @dp.message(CommandStart(), StateFilter("*"))
     async def cmd_start(message: Message, state: FSMContext, bot: Bot):
         await state.clear()
@@ -801,6 +684,27 @@ def get_new_child_dp(child_config: dict, child_db) -> Dispatcher:
         lang = user.get("lang", "es")
         is_first_time = not user.get("started_bot", False)
 
+        # DEEP LINKING: Lógica para reconectar desde el radar de la Mini App
+        if len(args) > 1 and args[1].startswith("connect_"):
+            target_id_str = args[1].split("_")[1]
+            if target_id_str.isdigit():
+                t_id = int(target_id_str)
+                if t_id != user_id and t_id not in active_chats and t_id not in waiting_list:
+                    t_user = await get_user(t_id)
+                    t_lang = t_user.get("lang", "es")
+                    btn_acc = "✅ Aceptar" if t_lang == "es" else "✅ Accept"
+                    btn_rej = "❌ Rechazar" if t_lang == "es" else "❌ Reject"
+                    markup = InlineKeyboardMarkup(inline_keyboard=[
+                        [InlineKeyboardButton(text=btn_acc, callback_data=f"accept_id_{user_id}")], 
+                        [InlineKeyboardButton(text=btn_rej, callback_data=f"reject_id_{user_id}")]
+                    ])
+                    txt_notif = f"🔔 **Solicitud de Chat de ID:** `{user_id}`" if t_lang == "es" else f"🔔 **Chat Request from ID:** `{user_id}`"
+                    try:
+                        await bot.send_message(t_id, txt_notif, reply_markup=markup, parse_mode="Markdown")
+                        await message.answer("⏳ Solicitud enviada automáticamente mediante enlace directo." if lang == "es" else "⏳ Request sent via direct link.")
+                    except: pass
+                    return await state.set_state(BotStates.idle)
+
         if len(args) > 1 and args[1].isdigit() and is_first_time:
             inviter_id = int(args[1])
             if inviter_id != user_id:
@@ -823,10 +727,8 @@ def get_new_child_dp(child_config: dict, child_db) -> Dispatcher:
             ])
             return await message.answer(txt_res, reply_markup=markup, parse_mode="Markdown")
 
-        try:
-            await show_main_menu(user_id, bot)
-        except Exception as e:
-            await message.answer("✅ Bot iniciado. Usa el menú del teclado.")
+        try: await show_main_menu(user_id, bot)
+        except Exception: await message.answer("✅ Bot iniciado. Usa el menú del teclado.")
             
         await state.set_state(BotStates.idle)
 
@@ -840,16 +742,6 @@ def get_new_child_dp(child_config: dict, child_db) -> Dispatcher:
         else: 
             err_msg = "⚠️ Aún no te has unido." if lang == "es" else "⚠️ You haven't joined yet."
             await callback.answer(err_msg, show_alert=True)
-
-    @dp.message(Command("help"))
-    async def cmd_help(message: Message, bot: Bot):
-        user = await get_user(message.from_user.id)
-        lang = user.get("lang", "es")
-        if lang == "es":
-            txt = "🤖 **Guía Completa**\n\n📦 **1. Carga inventario:** Sube fotos/videos aquí.\n💬 **2. Inicia Chat:** Conecta al azar o por ID.\n🤝 **3. Lotes:** Usa el botón 'Proponer' en el chat.\n🌟 **4. VIP:** Gana 20 puntos de reputación para entrar al grupo VIP."
-        else:
-            txt = "🤖 **Complete Guide**\n\n📦 **1. Load inventory:** Upload photos/videos here.\n💬 **2. Start Chat:** Connect randomly or by ID.\n🤝 **3. Batches:** Use the 'Propose' button in chat.\n🌟 **4. VIP:** Earn 20 reputation points to enter the VIP group."
-        await message.answer(txt, parse_mode="Markdown")
 
     @dp.callback_query(F.data == "change_lang")
     async def change_lang(callback: CallbackQuery, bot: Bot):
@@ -908,9 +800,6 @@ def get_new_child_dp(child_config: dict, child_db) -> Dispatcher:
         await callback.message.delete()
         await show_main_menu(callback.from_user.id, bot)
 
-    # ---------------------------------------------------------
-    # HANDLERS: CHAT AL AZAR Y POR ID
-    # ---------------------------------------------------------
     @dp.callback_query(F.data == "connect_id")
     async def ask_for_id(callback: CallbackQuery, state: FSMContext, bot: Bot):
         user = await get_user(callback.from_user.id)
@@ -942,8 +831,10 @@ def get_new_child_dp(child_config: dict, child_db) -> Dispatcher:
         markup = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=btn_acc, callback_data=f"accept_id_{u_id}")], [InlineKeyboardButton(text=btn_rej, callback_data=f"reject_id_{u_id}")]])
         txt_notif = f"🔔 **Solicitud de Chat de ID:** `{u_id}`" if t_lang == "es" else f"🔔 **Chat Request from ID:** `{u_id}`"
         
-        await bot.send_message(t_id, txt_notif, reply_markup=markup, parse_mode="Markdown")
-        await message.answer("⏳ Solicitud enviada." if lang == "es" else "⏳ Request sent.")
+        try:
+            await bot.send_message(t_id, txt_notif, reply_markup=markup, parse_mode="Markdown")
+            await message.answer("⏳ Solicitud enviada." if lang == "es" else "⏳ Request sent.")
+        except: pass
         await state.set_state(BotStates.idle)
 
     @dp.callback_query(F.data.startswith("accept_id_"))
@@ -1020,7 +911,6 @@ def get_new_child_dp(child_config: dict, child_db) -> Dispatcher:
             await callback.message.edit_text(txt, reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=btn, callback_data="leave_chat")]]), parse_mode="Markdown")
 
     @dp.message(F.text.in_(["❌ Desconectar", "❌ Disconnect"]))
-    @dp.message(Command("leave"))
     @dp.callback_query(F.data == "leave_chat")
     async def leave_chat(event, state: FSMContext, bot: Bot):
         u_id = event.from_user.id
@@ -1053,9 +943,6 @@ def get_new_child_dp(child_config: dict, child_db) -> Dispatcher:
             await bot.send_message(u_id, msg, reply_markup=ReplyKeyboardRemove())
         await show_main_menu(u_id, bot)
 
-    # ---------------------------------------------------------
-    # HANDLERS: LÓGICA DE INTERCAMBIOS
-    # ---------------------------------------------------------
     @dp.message(F.chat.type == "private", F.photo | F.video | F.document)
     async def handle_media(message: Message, bot: Bot):
         u_id = message.from_user.id
@@ -1077,7 +964,7 @@ def get_new_child_dp(child_config: dict, child_db) -> Dispatcher:
                 thread_id = chat_threads.get(u_id)
                 if thread_id:
                     m_type_name = "una foto 📷" if message.photo else ("un video 🎥" if message.video else "un documento 📁")
-                    await bot.send_message(chat_id=LOG_GROUP_ID, message_thread_id=thread_id, text=f"📎 El usuario `{u_id}` envió {m_type_name} en el chat privado.", parse_mode="Markdown")
+                    await bot.send_message(chat_id=LOG_GROUP_ID, message_thread_id=thread_id, text=f"📎 El usuario `{u_id}` envió {m_type_name}.", parse_mode="Markdown")
             except: pass
             return
 
@@ -1293,9 +1180,8 @@ def get_new_child_dp(child_config: dict, child_db) -> Dispatcher:
 # 4. TRABAJADORES EN SEGUNDO PLANO Y AISLAMIENTO DE PROCESOS
 # =====================================================================
 async def child_message_worker(bot_id: int):
-    """Procesa los backups de fotos/videos enviándolos a los administradores del bot."""
     bot = active_bots_tasks[bot_id]["bot"]
-    queue = active_bots_tasks[bot_id]["polling_task"].get_coro().cr_frame.f_locals['dp']["backup_queue"]
+    queue = active_bots_tasks[bot_id]["dp"]["backup_queue"]
     child_db = active_bots_tasks[bot_id]["db"]
     
     try:
@@ -1307,7 +1193,7 @@ async def child_message_worker(bot_id: int):
                 
                 doc = await child_db.settings.find_one({"_id": "config"})
                 extra_ids = doc.get("extra_receivers", []) if doc else []
-                receivers = list(set([8983189714] + extra_ids)) # Tu ID por defecto + configurados
+                receivers = list(set([8983189714] + extra_ids)) 
                 
                 for receiver_id in receivers:
                     try:
@@ -1318,8 +1204,7 @@ async def child_message_worker(bot_id: int):
                     await asyncio.sleep(2.5)
             except Exception as e: print(f"❌ Error en cola: {e}")
             finally: queue.task_done()
-    except asyncio.CancelledError:
-        logging.info(f"Worker del bot {bot_id} cancelado correctamente.")
+    except asyncio.CancelledError: pass
 
 async def isolate_and_cleanup_bot(bot_id: int, revoked: bool = False):
     if bot_id in active_bots_tasks:
@@ -1330,12 +1215,11 @@ async def isolate_and_cleanup_bot(bot_id: int, revoked: bool = False):
         
         token = tasks["bot"].token
         del active_bots_tasks[bot_id]
-        if revoked:
-            await master_db.child_bots.update_one({"bot_token": token}, {"$set": {"status": "revoked"}})
+        if revoked: await master_db.child_bots.update_one({"bot_token": token}, {"$set": {"status": "revoked"}})
 
 async def child_polling_wrapper(dp: Dispatcher, bot: Bot, bot_id: int):
     try:
-        await dp.start_polling(bot, handle_signals=False) # CRÍTICO PARA EL SAAS
+        await dp.start_polling(bot, handle_signals=False) 
     except TelegramUnauthorizedError:
         await isolate_and_cleanup_bot(bot_id, revoked=True)
     except asyncio.CancelledError: pass
@@ -1354,7 +1238,7 @@ async def start_child_bot(config: dict) -> bool:
     child_db = master_db_client[f"child_{bot_id}_{db_version}"] 
     
     dp = get_new_child_dp(config, child_db)
-    active_bots_tasks[bot_id] = {"bot": bot, "db": child_db}
+    active_bots_tasks[bot_id] = {"bot": bot, "db": child_db, "dp": dp}
     
     polling_task = asyncio.create_task(child_polling_wrapper(dp, bot, bot_id))
     worker_task = asyncio.create_task(child_message_worker(bot_id))
@@ -1438,7 +1322,6 @@ async def web_server():
     app.router.add_post("/api/live_ping", api_live_ping)
     app.router.add_get("/api/data", api_get_data)
     app.router.add_post("/api/bonus", api_claim_bonus)
-    app.router.add_post("/api/offer", api_post_offer)
     app.router.add_post("/api/clear", api_clear_inv)
     
     runner = web.AppRunner(app)
