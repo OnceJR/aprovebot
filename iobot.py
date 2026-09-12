@@ -2,6 +2,7 @@ import os
 import asyncio
 import logging
 import time
+import random
 from urllib.parse import parse_qsl
 import json
 from aiohttp import web
@@ -50,7 +51,7 @@ class BotStates(StatesGroup):
     waiting_for_id = State()
 
 # =====================================================================
-# 2. SERVIDOR WEB Y APIS
+# 2. SERVIDOR WEB Y APIS (CON COFRES Y RECOMPENSAS DIARIAS)
 # =====================================================================
 async def get_auth_user(request):
     init_data = request.headers.get("Authorization", "")
@@ -126,14 +127,35 @@ async def api_get_data(request):
             "is_free": status != "Ocupado 🔴"
         })
     
+    last_bonus = user.get("last_bonus", 0)
+    time_left_bonus = max(0, (last_bonus + (6 * 3600)) - now)
+    
     return web.json_response({
         "fotos": fotos, 
         "videos": videos,
         "reputation": user.get("reputation", 0), 
         "referrals": user.get("referrals", 0),
+        "time_left": time_left_bonus,
         "leaderboard": top_users, 
         "online_users": online_users
     })
+
+async def api_claim_bonus(request):
+    user_id = await get_auth_user(request)
+    child_db = get_child_db(request)
+    if not user_id or child_db is None: return web.json_response({"error": "Unauthorized"}, status=401)
+    
+    user = await child_db.users.find_one({"_id": user_id}) or {}
+    now = time.time()
+    last_bonus = user.get("last_bonus", 0)
+    cooldown = 6 * 3600
+    if now < last_bonus + cooldown: 
+        return web.json_response({"success": False, "error": "Cooldown active"})
+        
+    puntos = random.randint(1, 5)
+    nueva_rep = user.get("reputation", 0) + puntos
+    await child_db.users.update_one({"_id": user_id}, {"$set": {"last_bonus": now, "reputation": nueva_rep}}, upsert=True)
+    return web.json_response({"success": True, "bonus": puntos, "new_rep": nueva_rep, "time_left": cooldown})
 
 async def api_clear_inv(request):
     user_id = await get_auth_user(request)
@@ -151,6 +173,7 @@ async def handle_webapp(request):
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
         <title>Exchange Panel</title>
         <script src="https://telegram.org/js/telegram-web-app.js"></script>
+        <script src="https://cdn.jsdelivr.net/npm/canvas-confetti@1.6.0/dist/confetti.browser.min.js"></script>
         <link href="https://fonts.googleapis.com/css2?family=Poppins:wght@400;500;600;700;800&display=swap" rel="stylesheet">
         <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
         <style>
@@ -166,7 +189,7 @@ async def handle_webapp(request):
             .header h1 { font-size: 24px; font-weight: 800; color: var(--text-strong); text-transform: uppercase; }
             .header-icon { font-size: 28px; color: var(--accent); }
             .tabs { display: flex; background: var(--card-bg); border-radius: 14px; padding: 6px; margin-bottom: 24px; overflow-x: auto; border: 1px solid var(--card-border); scrollbar-width: none; gap: 6px; -webkit-overflow-scrolling: touch; }
-            .tab { flex: 0 0 25%; text-align: center; padding: 12px 4px; font-size: 13px; font-weight: 600; color: var(--hint); cursor: pointer; display: flex; flex-direction: column; gap: 4px; white-space: nowrap; transition: all 0.2s; }
+            .tab { flex: 0 0 22%; text-align: center; padding: 12px 4px; font-size: 13px; font-weight: 600; color: var(--hint); cursor: pointer; display: flex; flex-direction: column; gap: 4px; white-space: nowrap; transition: all 0.2s; }
             .tab.active { background: var(--accent); color: #fff; box-shadow: 0 4px 12px rgba(88, 166, 255, 0.3); border-radius: 10px; }
             .section { display: none; flex-direction: column; gap: 16px; animation: fadeIn 0.3s ease-in-out; }
             .section.active { display: flex; }
@@ -181,6 +204,12 @@ async def handle_webapp(request):
             .btn-connect { background: rgba(88, 166, 255, 0.15); border: 1px solid rgba(88, 166, 255, 0.3); color: var(--accent); }
             .progress-bg { background: rgba(255,255,255,0.05); border-radius: 10px; height: 14px; width: 100%; }
             .progress-fill { background: var(--gradient-gold); height: 100%; width: 0%; border-radius: 10px; transition: width 0.8s ease-in-out; }
+            .chests-container { display: flex; justify-content: center; gap: 15px; margin: 20px 0; }
+            .chest-wrapper { width: 90px; height: 90px; cursor: pointer; position: relative; transition: transform 0.2s;}
+            .chest-wrapper:hover { transform: scale(1.08); }
+            .chest-wrapper.disabled { opacity: 0.4; filter: grayscale(100%); pointer-events: none; }
+            .chest-img { width: 100%; height: 100%; object-fit: contain; animation: pulseChest 2s infinite ease-in-out; }
+            @keyframes pulseChest { 0%, 100% { transform: scale(1); } 50% { transform: scale(1.03); } }
             .list-item { background: rgba(255,255,255,0.03); padding: 16px; border-radius: 12px; margin-bottom: 12px; border: 1px solid var(--card-border); }
             .badge { font-size: 10px; padding: 2px 6px; border-radius: 6px; font-weight: 700; background: rgba(227, 179, 65, 0.15); color: var(--gold); border: 1px solid rgba(227, 179, 65, 0.3); }
         </style>
@@ -190,6 +219,7 @@ async def handle_webapp(request):
         
         <div class="tabs" id="nav-tabs">
             <div class="tab active" onclick="switchTab('mercado', this)"><i class="fa-solid fa-satellite-dish"></i> Radar</div>
+            <div class="tab" onclick="switchTab('cofres', this)"><i class="fa-solid fa-box-open"></i> Bonus</div>
             <div class="tab" onclick="switchTab('stats', this)"><i class="fa-solid fa-star"></i> VIP</div>
             <div class="tab" onclick="switchTab('rank', this)"><i class="fa-solid fa-trophy"></i> Top</div>
             <div class="tab" onclick="switchTab('inventory', this)"><i class="fa-solid fa-vault"></i> Cofre</div>
@@ -203,6 +233,15 @@ async def handle_webapp(request):
                 </div>
                 <p style="font-size:12px; color:var(--hint); margin-bottom:12px;">Usuarios buscando intercambios en este momento.</p>
                 <div id="offers-list">Buscando usuarios en línea...</div>
+            </div>
+        </div>
+
+        <div id="cofres" class="section">
+            <div class="card" style="text-align: center;">
+                <div class="card-title" style="color:var(--gold); text-align:center;">Recompensa de Cofres</div>
+                <p style="font-size:12px; color:var(--hint); margin-bottom:15px;">Elige un cofre cada 6 horas para ganar entre 1 y 5 puntos de reputación gratis.</p>
+                <div class="chests-container" id="chests-container"></div>
+                <div id="bonus-status" style="font-weight:700; color:var(--hint); margin-top:10px;">Calculando...</div>
             </div>
         </div>
 
@@ -270,6 +309,73 @@ async def handle_webapp(request):
                 copyToClipboard(link, "✅ Link copiado al portapapeles.");
             }
 
+            let chestsContainer = document.getElementById('chests-container');
+            let isBonusReady = false;
+            
+            function initChests(ready) {
+                isBonusReady = ready;
+                chestsContainer.innerHTML = "";
+                for(let i=0; i<3; i++) {
+                    let w = document.createElement('div');
+                    w.className = `chest-wrapper ${ready ? '' : 'disabled'}`;
+                    w.onclick = () => ready ? openChest(w) : null;
+                    w.innerHTML = `<img src="https://img.icons8.com/color/96/treasure-chest.png" class="chest-img">`;
+                    chestsContainer.appendChild(w);
+                }
+            }
+
+            let bonusTimer;
+            function updateBonusUI(timeLeft) {
+                let txt = document.getElementById("bonus-status");
+                clearInterval(bonusTimer);
+                if (timeLeft <= 0) {
+                    if(!isBonusReady) initChests(true);
+                    txt.innerText = "¡Elige un cofre para reclamar!";
+                    txt.style.color = "var(--success)";
+                } else {
+                    if(isBonusReady) initChests(false);
+                    txt.style.color = "var(--hint)";
+                    bonusTimer = setInterval(() => {
+                        timeLeft--;
+                        if (timeLeft <= 0) updateBonusUI(0);
+                        else {
+                            let h = Math.floor(timeLeft / 3600);
+                            let m = Math.floor((timeLeft % 3600) / 60);
+                            let s = Math.floor(timeLeft % 60);
+                            txt.innerText = `⏳ Disponible en: ${h}h ${m}m ${s}s`;
+                        }
+                    }, 1000);
+                }
+            }
+
+            async function openChest(el) {
+                if(!isBonusReady) return;
+                tg.HapticFeedback.impactOccurred('heavy');
+                document.querySelectorAll('.chest-wrapper').forEach(w => w.classList.add('disabled'));
+                document.getElementById("bonus-status").innerText = "Abriendo cofre...";
+                
+                try {
+                    let res = await fetch(`/api/bonus?id=${userId}&bot_id=${botId}`, { method: "POST", headers: reqHeaders, body: "{}" });
+                    let data = await res.json();
+                    
+                    if(data.success) {
+                        el.classList.remove('disabled');
+                        el.querySelector('.chest-img').src = "https://img.icons8.com/color/96/open-box.png";
+                        confetti({ particleCount: 130, spread: 90, origin: { y: 0.6 } });
+                        tg.showAlert(`🎉 ¡Felicidades! Ganaste ${data.bonus} Puntos de Reputación.`);
+                        loadData();
+                    } else {
+                        tg.showAlert("⚠️ Aún debes esperar el tiempo indicado.");
+                        loadData();
+                    }
+                } catch(e) { 
+                    tg.showAlert("❌ Error de conexión al servidor."); 
+                    document.querySelectorAll('.chest-wrapper').forEach(w => w.classList.remove('disabled'));
+                    document.getElementById("bonus-status").innerText = "¡Elige un cofre!";
+                    loadData(); 
+                }
+            }
+
             async function loadData() {
                 if (!userId || !botId) {
                     document.getElementById("offers-list").innerHTML = '<div style="text-align:center;color:var(--danger); font-size:14px; padding: 20px 0;">Error: Faltan credenciales en la URL.</div>';
@@ -287,6 +393,8 @@ async def handle_webapp(request):
                     document.getElementById("vip-text").innerText = `${data.reputation}/20`;
                     document.getElementById("vip-fill").style.width = Math.min(100, (data.reputation / 20) * 100) + "%";
                     document.getElementById("ref-count").innerText = data.referrals;
+                    
+                    updateBonusUI(data.time_left);
                     
                     let rHTML = "";
                     data.leaderboard.forEach((u, i) => {
@@ -337,6 +445,7 @@ async def handle_webapp(request):
             }
 
             setInterval(() => { if (userId && botId) loadData(); }, 20000);
+            initChests(false);
             loadData();
         </script>
     </body>
@@ -379,7 +488,7 @@ def get_new_child_dp(child_config: dict, child_db) -> Dispatcher:
     async def get_user(user_id):
         user = await child_db.users.find_one({"_id": user_id})
         if not user:
-            user = {"_id": user_id, "lang": "es", "referrals": 0, "reputation": 0, "mode": "anon", "in_vip": False, "notified_vip": False}
+            user = {"_id": user_id, "lang": "es", "referrals": 0, "reputation": 0, "mode": "anon", "in_vip": False, "notified_vip": False, "last_bonus": 0}
             await child_db.users.insert_one(user)
         return user
 
@@ -454,7 +563,7 @@ def get_new_child_dp(child_config: dict, child_db) -> Dispatcher:
         btn_id = "🆔 Conectar ID" if lang == "es" else "🆔 Connect ID"
         btn_prof = "👤 Mi Perfil" if lang == "es" else "👤 My Profile"
         btn_share = "🔗 Compartir Link" if lang == "es" else "🔗 Share Link"
-        btn_panel = "✨ Radar y Cofre" if lang == "es" else "✨ Radar & Safe"
+        btn_panel = "✨ Mini App de Intercambio" if lang == "es" else "✨ Exchange Mini App"
         
         markup = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text=btn_panel, web_app=WebAppInfo(url=webapp_url))],
@@ -467,13 +576,13 @@ def get_new_child_dp(child_config: dict, child_db) -> Dispatcher:
             txt = (
                 "👋 <b>¡Bienvenido a la red de intercambio!</b>\n\n"
                 "⚠️ <b>REQUISITO CLAVE:</b> Sube material propio a este chat para poder hacer intercambios.\n\n"
-                "🚀 Utiliza el botón <b>Radar y Cofre</b> para encontrar a otras personas disponibles en vivo."
+                "🚀 Utiliza la <b>Mini App</b> para reclamar tus cofres diarios, ver el radar y reclamar tu VIP."
             )
         else:
             txt = (
                 "👋 <b>Welcome to the exchange network!</b>\n\n"
                 "⚠️ <b>KEY REQUIREMENT:</b> Upload your own media to this chat to be able to trade.\n\n"
-                "🚀 Use the <b>Radar & Safe</b> button to find other online users instantly."
+                "🚀 Use the <b>Mini App</b> to claim your daily chests, check the radar, and view VIP status."
             )
         await bot.send_message(chat_id=user_id, text=txt, reply_markup=markup, parse_mode="HTML")
 
@@ -1204,6 +1313,7 @@ async def web_server():
     app = web.Application()
     app.router.add_get("/", handle_webapp)
     app.router.add_get("/api/data", api_get_data)
+    app.router.add_post("/api/bonus", api_claim_bonus)
     app.router.add_post("/api/clear", api_clear_inv)
     
     runner = web.AppRunner(app)
