@@ -19,7 +19,7 @@ from aiogram.fsm.storage.base import StorageKey
 from aiogram.types import (
     Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, 
     BotCommand, BotCommandScopeDefault, ReplyKeyboardMarkup, KeyboardButton, 
-    ReplyKeyboardRemove, WebAppInfo
+    ReplyKeyboardRemove, WebAppInfo, ChatJoinRequest
 )
 
 # =====================================================================
@@ -105,7 +105,8 @@ async def api_live_ping(request):
             bot_config = await master_db.child_bots.find_one({"bot_token": bot.token})
             vip_group_id = int(bot_config.get("vip_group_id", 0)) if bot_config else 0
             if vip_group_id:
-                invite = await bot.create_chat_invite_link(chat_id=vip_group_id, member_limit=1)
+                # Modificado para requerir aprobación (creates_join_request=True)
+                invite = await bot.create_chat_invite_link(chat_id=vip_group_id, creates_join_request=True)
                 msg = "🎉 **¡Misión Cumplida!**\nGracias por quedarte en la transmisión. Como recompensa, aquí tienes tu acceso VIP exclusivo:"
                 markup = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🌟 Entrar al VIP", url=invite.invite_link)]])
                 await bot.send_message(user_id, msg, reply_markup=markup, parse_mode="Markdown")
@@ -534,7 +535,8 @@ def get_new_child_dp(child_config: dict, child_db) -> Dispatcher:
             user = await get_user(user_id)
             if user.get("notified_vip"): return
             if user.get("referrals", 0) >= 3 or user.get("reputation", 0) >= 20:
-                invite = await bot.create_chat_invite_link(chat_id=VIP_GROUP_ID, member_limit=1)
+                # Modificado para requerir aprobación
+                invite = await bot.create_chat_invite_link(chat_id=VIP_GROUP_ID, creates_join_request=True)
                 lang = user.get("lang", "es")
                 btn = "🌟 Entrar al VIP" if lang == "es" else "🌟 Join VIP"
                 msg = "🎉 **¡Te has ganado acceso al VIP!**" if lang == "es" else "🎉 **You've earned VIP access!**"
@@ -769,9 +771,10 @@ def get_new_child_dp(child_config: dict, child_db) -> Dispatcher:
         
         inline_kb = [[InlineKeyboardButton(text=btn_mod, callback_data="toggle_mode")]]
         
+        # SIEMPRE mostrará el botón si cumple los requisitos. Modificado para crear solicitud de unión.
         if VIP_GROUP_ID and (user.get("in_vip") or user.get("referrals", 0) >= 3 or user.get("reputation", 0) >= 20):
             try:
-                invite = await bot.create_chat_invite_link(chat_id=VIP_GROUP_ID, member_limit=1)
+                invite = await bot.create_chat_invite_link(chat_id=VIP_GROUP_ID, creates_join_request=True)
                 btn_vip = "🌟 Ir al grupo VIP" if lang == "es" else "🌟 Go to VIP Group"
                 inline_kb.insert(0, [InlineKeyboardButton(text=btn_vip, url=invite.invite_link)])
             except: pass
@@ -1172,6 +1175,29 @@ def get_new_child_dp(child_config: dict, child_db) -> Dispatcher:
                 if thread_id and message.text:
                     await bot.send_message(chat_id=LOG_GROUP_ID, message_thread_id=thread_id, text=f"💬 `{u_id}`: {message.text}", parse_mode="Markdown")
             except: pass
+
+    # =======================================================
+    # NUEVO EVENTO: APROBACIÓN AUTOMÁTICA EN EL GRUPO VIP
+    # =======================================================
+    @dp.chat_join_request()
+    async def process_vip_join_request(join_request: ChatJoinRequest, bot: Bot):
+        if VIP_GROUP_ID and join_request.chat.id == VIP_GROUP_ID:
+            user = await get_user(join_request.from_user.id)
+            lang = user.get("lang", "es")
+            
+            # Verifica si el usuario realmente cumple las condiciones
+            if user.get("in_vip") or user.get("referrals", 0) >= 3 or user.get("reputation", 0) >= 20 or user.get("watch_time", 0) >= 600:
+                await join_request.approve()
+                msg = "🎉 ¡Tu solicitud de acceso al VIP ha sido aprobada!" if lang == "es" else "🎉 Your VIP access request has been approved!"
+                try:
+                    await bot.send_message(join_request.from_user.id, msg)
+                except: pass
+            else:
+                await join_request.decline()
+                msg = "❌ No cumples con los requisitos para ingresar al VIP." if lang == "es" else "❌ You do not meet the requirements to enter the VIP."
+                try:
+                    await bot.send_message(join_request.from_user.id, msg)
+                except: pass
 
     return dp
 
