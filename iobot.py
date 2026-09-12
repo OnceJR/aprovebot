@@ -31,7 +31,7 @@ RENDER_URL = os.environ.get("RENDER_EXTERNAL_URL", "https://TU_DOMINIO.onrender.
 
 master_db_client = AsyncIOMotorClient(MASTER_MONGO_URI)
 master_db = master_db_client.saas_master_db
-active_bots_tasks = {} # Estructura: {bot_id: {"bot": bot, "db": db, "dp": dp, ...}}
+active_bots_tasks = {} 
 master_dp = Dispatcher()
 
 class CreateChildBot(StatesGroup):
@@ -81,12 +81,11 @@ async def api_get_data(request):
     child_db = get_child_db(request)
     bot = get_child_bot(request)
     
-    # CORREGIDO: Se compara con None en lugar de evaluar child_db como booleano
     if not user_id or child_db is None or not bot: 
         return web.json_response({"error": "Unauthorized or missing parameters"}, status=401)
     
     dp = active_bots_tasks[bot.id]["dp"]
-    active_viewers = dp.setdefault("active_viewers", {})
+    active_viewers = dp["active_viewers"]
     now = time.time()
     active_viewers[user_id] = now
     
@@ -103,8 +102,8 @@ async def api_get_data(request):
         if u.get("reputation", 0) > 0:
             top_users.append({"id": u["_id"], "rep": u.get("reputation", 0)})
             
-    waiting_list = dp.get("waiting_list", [])
-    active_chats = dp.get("active_chats", {})
+    waiting_list = dp["waiting_list"]
+    active_chats = dp["active_chats"]
     online_users = []
     
     active_ids = set(active_viewers.keys()) | set(waiting_list) | set(active_chats.keys())
