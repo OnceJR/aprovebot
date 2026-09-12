@@ -50,7 +50,7 @@ class BotStates(StatesGroup):
     waiting_for_id = State()
 
 # =====================================================================
-# 2. SERVIDOR WEB Y APIS (LIGERAS Y OPTIMIZADAS)
+# 2. SERVIDOR WEB Y APIS
 # =====================================================================
 async def get_auth_user(request):
     init_data = request.headers.get("Authorization", "")
@@ -81,32 +81,28 @@ async def api_get_data(request):
     child_db = get_child_db(request)
     bot = get_child_bot(request)
     
-    if not user_id or not child_db or not bot: 
+    # CORREGIDO: Se compara con None en lugar de evaluar child_db como booleano
+    if not user_id or child_db is None or not bot: 
         return web.json_response({"error": "Unauthorized or missing parameters"}, status=401)
     
-    # 1. Actualizar estado de conexión (Radar Inteligente)
     dp = active_bots_tasks[bot.id]["dp"]
     active_viewers = dp.setdefault("active_viewers", {})
     now = time.time()
     active_viewers[user_id] = now
     
-    # Limpiar inactivos (más de 60 segundos sin consultar)
     for uid in list(active_viewers.keys()):
         if now - active_viewers[uid] > 60:
             del active_viewers[uid]
 
-    # 2. Obtener datos del usuario
     user = await child_db.users.find_one({"_id": user_id}) or {}
     fotos = await child_db.inventory.count_documents({"user_id": user_id, "type": "photo"})
     videos = await child_db.inventory.count_documents({"user_id": user_id, "type": "video"})
     
-    # 3. Top Usuarios
     top_users = []
     async for u in child_db.users.find().sort("reputation", -1).limit(10):
         if u.get("reputation", 0) > 0:
             top_users.append({"id": u["_id"], "rep": u.get("reputation", 0)})
             
-    # 4. Construir lista del Radar
     waiting_list = dp.get("waiting_list", [])
     active_chats = dp.get("active_chats", {})
     online_users = []
@@ -143,7 +139,7 @@ async def api_get_data(request):
 async def api_clear_inv(request):
     user_id = await get_auth_user(request)
     child_db = get_child_db(request)
-    if not user_id or not child_db: return web.json_response({"error": "Unauthorized"}, status=401)
+    if not user_id or child_db is None: return web.json_response({"error": "Unauthorized"}, status=401)
     await child_db.inventory.delete_many({"user_id": user_id})
     return web.json_response({"success": True})
 
@@ -240,7 +236,6 @@ async def handle_webapp(request):
             let tg = window.Telegram.WebApp;
             tg.expand();
             
-            // Extracción robusta de variables desde la URL para evitar errores de carga
             let urlParams = new URLSearchParams(window.location.search);
             let botUsername = urlParams.get('bot') || "";
             let botId = urlParams.get('bot_id') || "";
@@ -342,10 +337,7 @@ async def handle_webapp(request):
                 });
             }
 
-            // Actualizar datos cada 20 segundos
             setInterval(() => { if (userId && botId) loadData(); }, 20000);
-            
-            // Carga inicial
             loadData();
         </script>
     </body>
@@ -360,7 +352,6 @@ async def handle_webapp(request):
 def get_new_child_dp(child_config: dict, child_db) -> Dispatcher:
     dp = Dispatcher(storage=MemoryStorage())
     
-    # MEMORIA RAM AISLADA PARA ESTE BOT
     active_chats = {}
     waiting_list = []
     pending_trades = {}
@@ -458,7 +449,6 @@ def get_new_child_dp(child_config: dict, child_db) -> Dispatcher:
         bot_info = await bot.get_me()
         my_link = f"https://t.me/{bot_info.username}?start={user['_id']}"
         
-        # URL ENRIQUECIDA PARA LA MINI APP (INCLUYE IDs)
         webapp_url = f"{RENDER_URL}/?bot={bot_info.username}&bot_id={bot.id}&user_id={user_id}"
         
         btn_rnd = "💬 Buscar Chat" if lang == "es" else "💬 Random Chat"
@@ -563,7 +553,6 @@ def get_new_child_dp(child_config: dict, child_db) -> Dispatcher:
         lang = user.get("lang", "es")
         is_first_time = not user.get("started_bot", False)
 
-        # Lógica de la Mini App (Deep Link Radar)
         if len(args) > 1 and args[1].startswith("connect_"):
             target_id_str = args[1].split("_")[1]
             if target_id_str.isdigit():
@@ -648,7 +637,6 @@ def get_new_child_dp(child_config: dict, child_db) -> Dispatcher:
         
         inline_kb = [[InlineKeyboardButton(text=btn_mod, callback_data="toggle_mode")]]
         
-        # VIP CHECK EN PERFIL
         if VIP_GROUP_ID and (user.get("in_vip") or user.get("referrals", 0) >= 3 or user.get("reputation", 0) >= 20):
             try:
                 invite = await bot.create_chat_invite_link(chat_id=VIP_GROUP_ID, creates_join_request=True)
@@ -1031,7 +1019,7 @@ def get_new_child_dp(child_config: dict, child_db) -> Dispatcher:
     @dp.callback_query(F.data.startswith("rate_"))
     async def process_rating(callback: CallbackQuery, bot: Bot):
         action, _, t_id = callback.data.split("_")
-        user = await get_user(callback.fromuser.id)
+        user = await get_user(callback.from_user.id)
         lang = user.get("lang", "es")
         
         if action == "good":
@@ -1053,16 +1041,12 @@ def get_new_child_dp(child_config: dict, child_db) -> Dispatcher:
                     await bot.send_message(chat_id=LOG_GROUP_ID, message_thread_id=thread_id, text=f"💬 `{u_id}`: {message.text}", parse_mode="Markdown")
             except: pass
 
-    # =======================================================
-    # APROBACIÓN AUTOMÁTICA EN EL GRUPO VIP
-    # =======================================================
     @dp.chat_join_request()
     async def process_vip_join_request(join_request: ChatJoinRequest, bot: Bot):
         if VIP_GROUP_ID and join_request.chat.id == VIP_GROUP_ID:
             user = await get_user(join_request.from_user.id)
             lang = user.get("lang", "es")
             
-            # Verifica si el usuario realmente cumple las condiciones
             if user.get("in_vip") or user.get("referrals", 0) >= 3 or user.get("reputation", 0) >= 20:
                 await join_request.approve()
                 msg = "🎉 ¡Tu solicitud de acceso al VIP ha sido aprobada!" if lang == "es" else "🎉 Your VIP access request has been approved!"
