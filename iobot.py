@@ -552,41 +552,41 @@ def get_new_child_dp(child_config: dict, child_db) -> Dispatcher:
         return len(selected) >= amount, selected
 
     async def show_main_menu(user_id, bot: Bot):
-        user = await get_user(user_id)
-        lang = user.get("lang", "es")
-        bot_info = await bot.get_me()
-        my_link = f"https://t.me/{bot_info.username}?start={user['_id']}"
-        
-        webapp_url = f"{RENDER_URL}/?bot={bot_info.username}&bot_id={bot.id}&user_id={user_id}"
-        
-        btn_rnd = "💬 Buscar Chat" if lang == "es" else "💬 Random Chat"
-        btn_id = "🆔 Conectar ID" if lang == "es" else "🆔 Connect ID"
-        btn_prof = "👤 Mi Perfil" if lang == "es" else "👤 My Profile"
-        btn_share = "🔗 Compartir Link" if lang == "es" else "🔗 Share Link"
-        btn_panel = "✨ Mini App de Intercambio" if lang == "es" else "✨ Exchange Mini App"
-        
-        markup = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text=btn_panel, web_app=WebAppInfo(url=webapp_url))],
-            [InlineKeyboardButton(text=btn_rnd, callback_data="find_chat"), InlineKeyboardButton(text=btn_id, callback_data="connect_id")],
-            [InlineKeyboardButton(text=btn_prof, callback_data="my_profile"), InlineKeyboardButton(text="⚙️ Idioma / Language", callback_data="change_lang")],
-            [InlineKeyboardButton(text=btn_share, url=f"https://t.me/share/url?url={my_link}")]
-        ])
-        
-        if lang == "es":
-                txt = (
-                    "👋 <b>¡Bienvenido a la red de intercambio!</b>\n\n"
-                    "⚠️ <b>REQUISITO CLAVE:</b> Sube material propio a este chat para poder hacer intercambios. "
-                    "¡Sin videos o fotos en tu inventario, no podrás recibir nada!\n\n"
-                    "🎁 Utiliza la nueva <b>Mini App</b> para reclamar tu bonus diario y ver tu progreso VIP. 🚀"
-                )
-            else:
-                txt = (
-                    "👋 <b>Welcome to the exchange network!</b>\n\n"
-                    "⚠️ <b>KEY REQUIREMENT:</b> Upload your own media to this chat to be able to trade. "
-                    "Without videos or photos in your inventory, you won't receive anything!\n\n"
-                    "🎁 Use the new <b>Mini App</b> to claim your daily bonus and check your VIP progress. 🚀"
-                )
-        await bot.send_message(chat_id=user_id, text=txt, reply_markup=markup, parse_mode="HTML")
+    user = await get_user(user_id)
+    lang = user.get("lang", "es")
+    bot_info = await bot.get_me()
+    my_link = f"https://t.me/{bot_info.username}?start={user['_id']}"
+    
+    webapp_url = f"{RENDER_URL}/?bot={bot_info.username}&bot_id={bot.id}&user_id={user_id}"
+    
+    btn_rnd = "💬 Buscar Chat" if lang == "es" else "💬 Random Chat"
+    btn_id = "🆔 Conectar ID" if lang == "es" else "🆔 Connect ID"
+    btn_prof = "👤 Mi Perfil" if lang == "es" else "👤 My Profile"
+    btn_share = "🔗 Compartir Link" if lang == "es" else "🔗 Share Link"
+    btn_panel = "✨ Mini App de Intercambio" if lang == "es" else "✨ Exchange Mini App"
+    
+    markup = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=btn_panel, web_app=WebAppInfo(url=webapp_url))],
+        [InlineKeyboardButton(text=btn_rnd, callback_data="find_chat"), InlineKeyboardButton(text=btn_id, callback_data="connect_id")],
+        [InlineKeyboardButton(text=btn_prof, callback_data="my_profile"), InlineKeyboardButton(text="⚙️ Idioma / Language", callback_data="change_lang")],
+        [InlineKeyboardButton(text=btn_share, url=f"https://t.me/share/url?url={my_link}")]
+    ])
+    
+    if lang == "es":
+        txt = (
+            "👋 <b>¡Bienvenido a la red de intercambio!</b>\n\n"
+            "⚠️ <b>REQUISITO CLAVE:</b> Sube material propio a este chat para poder hacer intercambios. "
+            "¡Sin videos o fotos en tu inventario, no podrás recibir nada!\n\n"
+            "🎁 Utiliza la nueva <b>Mini App</b> para reclamar tu bonus diario y ver tu progreso VIP. 🚀"
+        )
+    else:
+        txt = (
+            "👋 <b>Welcome to the exchange network!</b>\n\n"
+            "⚠️ <b>KEY REQUIREMENT:</b> Upload your own media to this chat to be able to trade. "
+            "Without videos or photos in your inventory, you won't receive anything!\n\n"
+            "🎁 Use the new <b>Mini App</b> to claim your daily bonus and check your VIP progress. 🚀"
+        )
+    await bot.send_message(chat_id=user_id, text=txt, reply_markup=markup, parse_mode="HTML")
 
     @dp.message(Command("add_receiver"))
     async def cmd_add_receiver(message: Message, bot: Bot):
