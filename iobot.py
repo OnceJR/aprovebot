@@ -2,9 +2,8 @@ import os
 import asyncio
 import logging
 import time
-import random
-import json
 from urllib.parse import parse_qsl
+import json
 from aiohttp import web
 from motor.motor_asyncio import AsyncIOMotorClient
 
@@ -18,8 +17,8 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.fsm.storage.base import StorageKey
 from aiogram.types import (
     Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, 
-    BotCommand, BotCommandScopeDefault, ReplyKeyboardMarkup, KeyboardButton, 
-    ReplyKeyboardRemove, WebAppInfo, ChatJoinRequest
+    ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove, WebAppInfo,
+    ChatJoinRequest
 )
 
 # =====================================================================
@@ -32,7 +31,7 @@ RENDER_URL = os.environ.get("RENDER_EXTERNAL_URL", "https://TU_DOMINIO.onrender.
 
 master_db_client = AsyncIOMotorClient(MASTER_MONGO_URI)
 master_db = master_db_client.saas_master_db
-active_bots_tasks = {} # Estructura: {bot_id: {"bot": bot, "db": db, "dp": dp, "queue": queue, ...}}
+active_bots_tasks = {} # Estructura: {bot_id: {"bot": bot, "db": db, "dp": dp, ...}}
 master_dp = Dispatcher()
 
 class CreateChildBot(StatesGroup):
@@ -51,7 +50,7 @@ class BotStates(StatesGroup):
     waiting_for_id = State()
 
 # =====================================================================
-# 2. SERVIDOR WEB Y APIS 
+# 2. SERVIDOR WEB Y APIS (LIGERAS Y OPTIMIZADAS)
 # =====================================================================
 async def get_auth_user(request):
     init_data = request.headers.get("Authorization", "")
@@ -77,77 +76,46 @@ def get_child_bot(request):
     except (ValueError, TypeError): bot_id = 0
     return active_bots_tasks.get(bot_id, {}).get("bot")
 
-async def api_live_ping(request):
-    user_id = await get_auth_user(request)
-    child_db = get_child_db(request)
-    bot = get_child_bot(request)
-    if not user_id or not child_db or not bot: return web.json_response({"error": "Unauthorized"}, status=401)
-    
-    dp = active_bots_tasks[bot.id]["dp"]
-    active_viewers = dp["active_viewers"]
-    
-    now = time.time()
-    active_viewers[user_id] = now
-    
-    for uid in list(active_viewers.keys()):
-        if now - active_viewers[uid] > 45: del active_viewers[uid]
-            
-    viewers_count = len(active_viewers)
-    user = await child_db.users.find_one({"_id": user_id}) or {}
-    current_time = user.get("watch_time", 0) + 30 
-    await child_db.users.update_one({"_id": user_id}, {"$set": {"watch_time": current_time}}, upsert=True)
-    
-    won = False
-    if current_time >= 600 and not user.get("in_vip"):
-        won = True
-        await child_db.users.update_one({"_id": user_id}, {"$set": {"notified_vip": True, "in_vip": True}})
-        try:
-            bot_config = await master_db.child_bots.find_one({"bot_token": bot.token})
-            vip_group_id = int(bot_config.get("vip_group_id", 0)) if bot_config else 0
-            if vip_group_id:
-                # Modificado para requerir aprobación (creates_join_request=True)
-                invite = await bot.create_chat_invite_link(chat_id=vip_group_id, creates_join_request=True)
-                msg = "🎉 **¡Misión Cumplida!**\nGracias por quedarte en la transmisión. Como recompensa, aquí tienes tu acceso VIP exclusivo:"
-                markup = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🌟 Entrar al VIP", url=invite.invite_link)]])
-                await bot.send_message(user_id, msg, reply_markup=markup, parse_mode="Markdown")
-        except Exception as e:
-            logging.error(f"Error enviando VIP por stream: {e}")
-
-    return web.json_response({"success": True, "viewers": viewers_count, "watch_time": current_time, "won": won})
-
 async def api_get_data(request):
     user_id = await get_auth_user(request)
     child_db = get_child_db(request)
     bot = get_child_bot(request)
-    if not user_id or not child_db or not bot: return web.json_response({"error": "Unauthorized"}, status=401)
     
+    if not user_id or not child_db or not bot: 
+        return web.json_response({"error": "Unauthorized or missing parameters"}, status=401)
+    
+    # 1. Actualizar estado de conexión (Radar Inteligente)
+    dp = active_bots_tasks[bot.id]["dp"]
+    active_viewers = dp.setdefault("active_viewers", {})
+    now = time.time()
+    active_viewers[user_id] = now
+    
+    # Limpiar inactivos (más de 60 segundos sin consultar)
+    for uid in list(active_viewers.keys()):
+        if now - active_viewers[uid] > 60:
+            del active_viewers[uid]
+
+    # 2. Obtener datos del usuario
     user = await child_db.users.find_one({"_id": user_id}) or {}
     fotos = await child_db.inventory.count_documents({"user_id": user_id, "type": "photo"})
     videos = await child_db.inventory.count_documents({"user_id": user_id, "type": "video"})
     
+    # 3. Top Usuarios
     top_users = []
     async for u in child_db.users.find().sort("reputation", -1).limit(10):
         if u.get("reputation", 0) > 0:
             top_users.append({"id": u["_id"], "rep": u.get("reputation", 0)})
             
-    # Lógica del Radar en vivo
-    dp = active_bots_tasks[bot.id]["dp"]
-    active_viewers = dp.get("active_viewers", {})
+    # 4. Construir lista del Radar
     waiting_list = dp.get("waiting_list", [])
     active_chats = dp.get("active_chats", {})
-    
     online_users = []
-    now = time.time()
     
     active_ids = set(active_viewers.keys()) | set(waiting_list) | set(active_chats.keys())
     
     for uid in active_ids:
         if uid == user_id: continue 
         
-        is_recent = (now - active_viewers.get(uid, 0)) < 300 
-        if not is_recent and uid not in waiting_list and uid not in active_chats:
-            continue
-            
         status = "Libre 🟢"
         if uid in active_chats:
             status = "Ocupado 🔴"
@@ -163,31 +131,14 @@ async def api_get_data(request):
             "is_free": status != "Ocupado 🔴"
         })
     
-    last_bonus = user.get("last_bonus", 0)
-    time_left_bonus = max(0, (last_bonus + (6 * 3600)) - now)
-    
     return web.json_response({
-        "fotos": fotos, "videos": videos,
-        "reputation": user.get("reputation", 0), "referrals": user.get("referrals", 0),
-        "time_left": time_left_bonus,
-        "leaderboard": top_users, "online_users": online_users
+        "fotos": fotos, 
+        "videos": videos,
+        "reputation": user.get("reputation", 0), 
+        "referrals": user.get("referrals", 0),
+        "leaderboard": top_users, 
+        "online_users": online_users
     })
-
-async def api_claim_bonus(request):
-    user_id = await get_auth_user(request)
-    child_db = get_child_db(request)
-    if not user_id or not child_db: return web.json_response({"error": "Unauthorized"}, status=401)
-    
-    user = await child_db.users.find_one({"_id": user_id}) or {}
-    now = time.time()
-    last_bonus = user.get("last_bonus", 0)
-    cooldown = 6 * 3600
-    if now < last_bonus + cooldown: return web.json_response({"success": False, "error": "Cooldown active"})
-        
-    puntos = random.randint(1, 5)
-    nueva_rep = user.get("reputation", 0) + puntos
-    await child_db.users.update_one({"_id": user_id}, {"$set": {"last_bonus": now, "reputation": nueva_rep}}, upsert=True)
-    return web.json_response({"success": True, "bonus": puntos, "new_rep": nueva_rep, "time_left": cooldown})
 
 async def api_clear_inv(request):
     user_id = await get_auth_user(request)
@@ -197,8 +148,6 @@ async def api_clear_inv(request):
     return web.json_response({"success": True})
 
 async def handle_webapp(request):
-    bot_username = request.query.get("bot", "")
-    bot_id = request.query.get("bot_id", "")
     html_content = """
     <!DOCTYPE html>
     <html lang="es">
@@ -207,7 +156,6 @@ async def handle_webapp(request):
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
         <title>Exchange Panel</title>
         <script src="https://telegram.org/js/telegram-web-app.js"></script>
-        <script src="https://cdn.jsdelivr.net/npm/canvas-confetti@1.6.0/dist/confetti.browser.min.js"></script>
         <link href="https://fonts.googleapis.com/css2?family=Poppins:wght@400;500;600;700;800&display=swap" rel="stylesheet">
         <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
         <style>
@@ -223,7 +171,7 @@ async def handle_webapp(request):
             .header h1 { font-size: 24px; font-weight: 800; color: var(--text-strong); text-transform: uppercase; }
             .header-icon { font-size: 28px; color: var(--accent); }
             .tabs { display: flex; background: var(--card-bg); border-radius: 14px; padding: 6px; margin-bottom: 24px; overflow-x: auto; border: 1px solid var(--card-border); scrollbar-width: none; gap: 6px; -webkit-overflow-scrolling: touch; }
-            .tab { flex: 0 0 28%; text-align: center; padding: 12px 4px; font-size: 13px; font-weight: 600; color: var(--hint); cursor: pointer; display: flex; flex-direction: column; gap: 4px; white-space: nowrap; transition: all 0.2s; }
+            .tab { flex: 0 0 25%; text-align: center; padding: 12px 4px; font-size: 13px; font-weight: 600; color: var(--hint); cursor: pointer; display: flex; flex-direction: column; gap: 4px; white-space: nowrap; transition: all 0.2s; }
             .tab.active { background: var(--accent); color: #fff; box-shadow: 0 4px 12px rgba(88, 166, 255, 0.3); border-radius: 10px; }
             .section { display: none; flex-direction: column; gap: 16px; animation: fadeIn 0.3s ease-in-out; }
             .section.active { display: flex; }
@@ -238,10 +186,6 @@ async def handle_webapp(request):
             .btn-connect { background: rgba(88, 166, 255, 0.15); border: 1px solid rgba(88, 166, 255, 0.3); color: var(--accent); }
             .progress-bg { background: rgba(255,255,255,0.05); border-radius: 10px; height: 14px; width: 100%; }
             .progress-fill { background: var(--gradient-gold); height: 100%; width: 0%; border-radius: 10px; transition: width 0.8s ease-in-out; }
-            .chests-container { display: flex; justify-content: center; gap: 15px; margin: 20px 0; }
-            .chest-wrapper { width: 90px; height: 90px; cursor: pointer; position: relative; transition: transform 0.2s;}
-            .chest-wrapper.disabled { opacity: 0.5; filter: grayscale(100%); pointer-events: none; }
-            .chest-img { width: 100%; height: 100%; object-fit: contain; }
             .list-item { background: rgba(255,255,255,0.03); padding: 16px; border-radius: 12px; margin-bottom: 12px; border: 1px solid var(--card-border); }
             .badge { font-size: 10px; padding: 2px 6px; border-radius: 6px; font-weight: 700; background: rgba(227, 179, 65, 0.15); color: var(--gold); border: 1px solid rgba(227, 179, 65, 0.3); }
         </style>
@@ -250,14 +194,24 @@ async def handle_webapp(request):
         <div class="header"><i class="fa-solid fa-bolt header-icon"></i><h1>Exchange Hub</h1></div>
         
         <div class="tabs" id="nav-tabs">
-            <div class="tab active" onclick="switchTab('stats', this)"><i class="fa-solid fa-star"></i> VIP</div>
-            <div class="tab" onclick="switchTab('cofres', this)"><i class="fa-solid fa-box-open"></i> Bonus</div>
-            <div class="tab" onclick="switchTab('mercado', this)"><i class="fa-solid fa-satellite-dish"></i> Radar</div>
+            <div class="tab active" onclick="switchTab('mercado', this)"><i class="fa-solid fa-satellite-dish"></i> Radar</div>
+            <div class="tab" onclick="switchTab('stats', this)"><i class="fa-solid fa-star"></i> VIP</div>
             <div class="tab" onclick="switchTab('rank', this)"><i class="fa-solid fa-trophy"></i> Top</div>
             <div class="tab" onclick="switchTab('inventory', this)"><i class="fa-solid fa-vault"></i> Cofre</div>
         </div>
 
-        <div id="stats" class="section active">
+        <div id="mercado" class="section active">
+            <div class="card">
+                <div class="card-title card-title-flex" style="margin-bottom:12px;">
+                    <span><i class="fa-solid fa-satellite-dish"></i> Radar en Vivo</span>
+                    <button class="btn-main" style="width:auto; padding:6px 12px; font-size:12px;" onclick="loadData()"><i class="fa-solid fa-rotate-right"></i></button>
+                </div>
+                <p style="font-size:12px; color:var(--hint); margin-bottom:12px;">Usuarios buscando intercambios en este momento.</p>
+                <div id="offers-list">Buscando usuarios en línea...</div>
+            </div>
+        </div>
+
+        <div id="stats" class="section">
             <div class="card">
                 <div class="card-title">Progreso VIP</div>
                 <div style="display:flex; justify-content:space-between;"><span>Reputación</span><strong id="vip-text">--/20</strong></div>
@@ -269,27 +223,8 @@ async def handle_webapp(request):
             </div>
         </div>
 
-        <div id="cofres" class="section">
-            <div class="card" style="text-align: center;">
-                <div class="card-title" style="color:var(--gold); text-align:center;">Recompensa Diaria</div>
-                <div class="chests-container" id="chests-container"></div>
-                <div id="bonus-status" style="font-weight:700; color:var(--hint); margin-top:10px;">Calculando...</div>
-            </div>
-        </div>
-
-        <div id="mercado" class="section">
-            <div class="card">
-                <div class="card-title card-title-flex" style="margin-bottom:12px;">
-                    <span><i class="fa-solid fa-satellite-dish"></i> Radar de Usuarios</span>
-                    <button class="btn-main" style="width:auto; padding:6px 12px; font-size:12px;" onclick="loadData()"><i class="fa-solid fa-rotate-right"></i></button>
-                </div>
-                <p style="font-size:12px; color:var(--hint); margin-bottom:12px;">Aquí verás a los usuarios que están usando el bot o buscando intercambios en este momento.</p>
-                <div id="offers-list">Buscando usuarios en línea...</div>
-            </div>
-        </div>
-
         <div id="rank" class="section">
-            <div class="card"><div class="card-title">Top 10 Semanal</div><div id="ranking-list">Cargando...</div></div>
+            <div class="card"><div class="card-title">Top 10 Global</div><div id="ranking-list">Cargando...</div></div>
         </div>
 
         <div id="inventory" class="section">
@@ -304,10 +239,12 @@ async def handle_webapp(request):
         <script>
             let tg = window.Telegram.WebApp;
             tg.expand();
-            let user = tg.initDataUnsafe?.user;
-            let userId = user?.id || 0;
-            let botUsername = "BOT_USERNAME_PLACEHOLDER"; 
-            let botId = "BOT_ID_PLACEHOLDER";
+            
+            // Extracción robusta de variables desde la URL para evitar errores de carga
+            let urlParams = new URLSearchParams(window.location.search);
+            let botUsername = urlParams.get('bot') || "";
+            let botId = urlParams.get('bot_id') || "";
+            let userId = parseInt(urlParams.get('user_id')) || tg.initDataUnsafe?.user?.id || 0;
             let reqHeaders = { "Content-Type": "application/json", "Authorization": tg.initData || "" };
 
             function switchTab(tabId, el) {
@@ -339,86 +276,23 @@ async def handle_webapp(request):
                 copyToClipboard(link, "✅ Link copiado al portapapeles.");
             }
 
-            let chestsContainer = document.getElementById('chests-container');
-            let isBonusReady = false;
-            
-            function initChests(ready) {
-                isBonusReady = ready;
-                chestsContainer.innerHTML = "";
-                for(let i=0; i<3; i++) {
-                    let w = document.createElement('div');
-                    w.className = `chest-wrapper ${ready ? '' : 'disabled'}`;
-                    w.onclick = () => ready ? openChest(w) : null;
-                    w.innerHTML = `<img src="https://img.icons8.com/color/96/treasure-chest.png" class="chest-img">`;
-                    chestsContainer.appendChild(w);
-                }
-            }
-
-            let bonusTimer;
-            function updateBonusUI(timeLeft) {
-                let txt = document.getElementById("bonus-status");
-                clearInterval(bonusTimer);
-                if (timeLeft <= 0) {
-                    if(!isBonusReady) initChests(true);
-                    txt.innerText = "¡Toca un cofre!";
-                    txt.style.color = "var(--success)";
-                } else {
-                    if(isBonusReady) initChests(false);
-                    txt.style.color = "var(--hint)";
-                    bonusTimer = setInterval(() => {
-                        timeLeft--;
-                        if (timeLeft <= 0) updateBonusUI(0);
-                        else {
-                            let h = Math.floor(timeLeft / 3600);
-                            let m = Math.floor((timeLeft % 3600) / 60);
-                            let s = Math.floor(timeLeft % 60);
-                            txt.innerText = `⏳ Disponible en: ${h}h ${m}m ${s}s`;
-                        }
-                    }, 1000);
-                }
-            }
-
-            async function openChest(el) {
-                if(!isBonusReady) return;
-                tg.HapticFeedback.impactOccurred('heavy');
-                document.querySelectorAll('.chest-wrapper').forEach(w => w.classList.add('disabled'));
-                document.getElementById("bonus-status").innerText = "Abriendo...";
-                
-                try {
-                    let res = await fetch(`/api/bonus?id=${userId}&bot_id=${botId}`, { method: "POST", headers: reqHeaders, body: "{}" });
-                    let data = await res.json();
-                    
-                    if(data.success) {
-                        el.classList.remove('disabled');
-                        el.querySelector('.chest-img').src = "https://img.icons8.com/color/96/open-box.png";
-                        confetti({ particleCount: 120, spread: 80, origin: { y: 0.6 } });
-                        tg.showAlert(`🎉 ¡Felicidades! Ganaste ${data.bonus} Puntos de Reputación.`);
-                        loadData();
-                    } else {
-                        tg.showAlert("⚠️ Aún debes esperar el tiempo indicado.");
-                        loadData();
-                    }
-                } catch(e) { 
-                    tg.showAlert("❌ Error de conexión al servidor."); 
-                    document.querySelectorAll('.chest-wrapper').forEach(w => w.classList.remove('disabled'));
-                    document.getElementById("bonus-status").innerText = "¡Toca un cofre!";
-                    loadData(); 
-                }
-            }
-
             async function loadData() {
-                if (!userId) return;
+                if (!userId || !botId) {
+                    document.getElementById("offers-list").innerHTML = '<div style="text-align:center;color:var(--danger); font-size:14px; padding: 20px 0;">Error: Faltan credenciales en la URL.</div>';
+                    return;
+                }
+                
                 try {
                     let res = await fetch(`/api/data?id=${userId}&bot_id=${botId}`, { headers: reqHeaders });
                     let data = await res.json();
                     
+                    if (data.error) throw new Error(data.error);
+
                     document.getElementById("photo-count").innerText = data.fotos;
                     document.getElementById("video-count").innerText = data.videos;
                     document.getElementById("vip-text").innerText = `${data.reputation}/20`;
                     document.getElementById("vip-fill").style.width = Math.min(100, (data.reputation / 20) * 100) + "%";
                     document.getElementById("ref-count").innerText = data.referrals;
-                    
-                    updateBonusUI(data.time_left);
                     
                     let rHTML = "";
                     data.leaderboard.forEach((u, i) => {
@@ -428,7 +302,10 @@ async def handle_webapp(request):
                     document.getElementById("ranking-list").innerHTML = rHTML || '<div style="text-align:center;color:var(--hint); font-size:14px;">Aún no hay datos.</div>';
 
                     renderRadar(data.online_users || []);
-                } catch(e) { console.error("Error loading data", e); }
+                } catch(e) { 
+                    console.error("Error loading data", e); 
+                    document.getElementById("offers-list").innerHTML = '<div style="text-align:center;color:var(--danger); font-size:14px; padding: 20px 0;">Error de conexión.</div>';
+                }
             }
 
             function renderRadar(users) {
@@ -465,13 +342,15 @@ async def handle_webapp(request):
                 });
             }
 
-            setInterval(() => { if (userId) loadData(); }, 35000);
-            initChests(false);
+            // Actualizar datos cada 20 segundos
+            setInterval(() => { if (userId && botId) loadData(); }, 20000);
+            
+            // Carga inicial
             loadData();
         </script>
     </body>
     </html>
-    """.replace("BOT_USERNAME_PLACEHOLDER", bot_username).replace("BOT_ID_PLACEHOLDER", str(bot_id))
+    """
     return web.Response(text=html_content, content_type="text/html")
 
 
@@ -485,7 +364,6 @@ def get_new_child_dp(child_config: dict, child_db) -> Dispatcher:
     active_chats = {}
     waiting_list = []
     pending_trades = {}
-    processed_albums = set()
     active_viewers = {} 
     pending_notifications = {}
     chat_threads = {} 
@@ -496,7 +374,6 @@ def get_new_child_dp(child_config: dict, child_db) -> Dispatcher:
     dp["active_chats"] = active_chats
     dp["waiting_list"] = waiting_list
 
-    # Variables de Configuración dinámicas (vienen de Mongo)
     FORCE_SUB_CHANNEL_ID = child_config.get("force_sub_id", 0)
     if FORCE_SUB_CHANNEL_ID: FORCE_SUB_CHANNEL_ID = int(FORCE_SUB_CHANNEL_ID)
     FORCE_SUB_CHANNEL_LINK = child_config.get("force_sub_link", "")
@@ -512,7 +389,7 @@ def get_new_child_dp(child_config: dict, child_db) -> Dispatcher:
     async def get_user(user_id):
         user = await child_db.users.find_one({"_id": user_id})
         if not user:
-            user = {"_id": user_id, "lang": "es", "referrals": 0, "reputation": 0, "mode": "anon", "in_vip": False, "notified_vip": False, "last_bonus": 0, "last_offer": 0}
+            user = {"_id": user_id, "lang": "es", "referrals": 0, "reputation": 0, "mode": "anon", "in_vip": False, "notified_vip": False}
             await child_db.users.insert_one(user)
         return user
 
@@ -535,7 +412,6 @@ def get_new_child_dp(child_config: dict, child_db) -> Dispatcher:
             user = await get_user(user_id)
             if user.get("notified_vip"): return
             if user.get("referrals", 0) >= 3 or user.get("reputation", 0) >= 20:
-                # Modificado para requerir aprobación
                 invite = await bot.create_chat_invite_link(chat_id=VIP_GROUP_ID, creates_join_request=True)
                 lang = user.get("lang", "es")
                 btn = "🌟 Entrar al VIP" if lang == "es" else "🌟 Join VIP"
@@ -581,13 +457,15 @@ def get_new_child_dp(child_config: dict, child_db) -> Dispatcher:
         lang = user.get("lang", "es")
         bot_info = await bot.get_me()
         my_link = f"https://t.me/{bot_info.username}?start={user['_id']}"
-        webapp_url = f"{RENDER_URL}/?bot={bot_info.username}&bot_id={bot.id}"
+        
+        # URL ENRIQUECIDA PARA LA MINI APP (INCLUYE IDs)
+        webapp_url = f"{RENDER_URL}/?bot={bot_info.username}&bot_id={bot.id}&user_id={user_id}"
         
         btn_rnd = "💬 Buscar Chat" if lang == "es" else "💬 Random Chat"
         btn_id = "🆔 Conectar ID" if lang == "es" else "🆔 Connect ID"
         btn_prof = "👤 Mi Perfil" if lang == "es" else "👤 My Profile"
         btn_share = "🔗 Compartir Link" if lang == "es" else "🔗 Share Link"
-        btn_panel = "✨ Abrir App de Intercambio" if lang == "es" else "✨ Open App"
+        btn_panel = "✨ Radar y Cofre" if lang == "es" else "✨ Radar & Safe"
         
         markup = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text=btn_panel, web_app=WebAppInfo(url=webapp_url))],
@@ -599,15 +477,14 @@ def get_new_child_dp(child_config: dict, child_db) -> Dispatcher:
         if lang == "es":
             txt = (
                 "👋 <b>¡Bienvenido a la red de intercambio!</b>\n\n"
-                "⚠️ <b>REQUISITO CLAVE:</b> Sube material propio a este chat para poder hacer intercambios. "
-                "¡Sin videos o fotos en tu inventario, no podrás recibir nada!\n\n"
-                "🎁 Utiliza la nueva <b>Mini App</b> para reclamar tu bonus diario y ver el radar de usuarios. 🚀"
+                "⚠️ <b>REQUISITO CLAVE:</b> Sube material propio a este chat para poder hacer intercambios.\n\n"
+                "🚀 Utiliza el botón <b>Radar y Cofre</b> para encontrar a otras personas disponibles en vivo."
             )
         else:
             txt = (
                 "👋 <b>Welcome to the exchange network!</b>\n\n"
                 "⚠️ <b>KEY REQUIREMENT:</b> Upload your own media to this chat to be able to trade.\n\n"
-                "🎁 Use the new <b>Mini App</b> to claim your daily bonus and check the user radar. 🚀"
+                "🚀 Use the <b>Radar & Safe</b> button to find other online users instantly."
             )
         await bot.send_message(chat_id=user_id, text=txt, reply_markup=markup, parse_mode="HTML")
 
@@ -654,7 +531,7 @@ def get_new_child_dp(child_config: dict, child_db) -> Dispatcher:
         operaciones_reales = total_archivos_enviados // 2
         vip_users = await child_db.users.count_documents({"in_vip": True})
         stats_text = (
-            "📊 **ESTADÍSTICAS DEL BOT HIJO**\n\n"
+            "📊 **ESTADÍSTICAS DEL BOT**\n\n"
             f"👥 Usuarios registrados: `{total_users}`\n"
             f"🌟 Usuarios VIP: `{vip_users}`\n"
             f"📁 Archivos en cofre: `{total_files}`\n"
@@ -686,7 +563,7 @@ def get_new_child_dp(child_config: dict, child_db) -> Dispatcher:
         lang = user.get("lang", "es")
         is_first_time = not user.get("started_bot", False)
 
-        # DEEP LINKING: Lógica para reconectar desde el radar de la Mini App
+        # Lógica de la Mini App (Deep Link Radar)
         if len(args) > 1 and args[1].startswith("connect_"):
             target_id_str = args[1].split("_")[1]
             if target_id_str.isdigit():
@@ -771,7 +648,7 @@ def get_new_child_dp(child_config: dict, child_db) -> Dispatcher:
         
         inline_kb = [[InlineKeyboardButton(text=btn_mod, callback_data="toggle_mode")]]
         
-        # SIEMPRE mostrará el botón si cumple los requisitos. Modificado para crear solicitud de unión.
+        # VIP CHECK EN PERFIL
         if VIP_GROUP_ID and (user.get("in_vip") or user.get("referrals", 0) >= 3 or user.get("reputation", 0) >= 20):
             try:
                 invite = await bot.create_chat_invite_link(chat_id=VIP_GROUP_ID, creates_join_request=True)
@@ -1154,7 +1031,7 @@ def get_new_child_dp(child_config: dict, child_db) -> Dispatcher:
     @dp.callback_query(F.data.startswith("rate_"))
     async def process_rating(callback: CallbackQuery, bot: Bot):
         action, _, t_id = callback.data.split("_")
-        user = await get_user(callback.from_user.id)
+        user = await get_user(callback.fromuser.id)
         lang = user.get("lang", "es")
         
         if action == "good":
@@ -1177,7 +1054,7 @@ def get_new_child_dp(child_config: dict, child_db) -> Dispatcher:
             except: pass
 
     # =======================================================
-    # NUEVO EVENTO: APROBACIÓN AUTOMÁTICA EN EL GRUPO VIP
+    # APROBACIÓN AUTOMÁTICA EN EL GRUPO VIP
     # =======================================================
     @dp.chat_join_request()
     async def process_vip_join_request(join_request: ChatJoinRequest, bot: Bot):
@@ -1186,17 +1063,15 @@ def get_new_child_dp(child_config: dict, child_db) -> Dispatcher:
             lang = user.get("lang", "es")
             
             # Verifica si el usuario realmente cumple las condiciones
-            if user.get("in_vip") or user.get("referrals", 0) >= 3 or user.get("reputation", 0) >= 20 or user.get("watch_time", 0) >= 600:
+            if user.get("in_vip") or user.get("referrals", 0) >= 3 or user.get("reputation", 0) >= 20:
                 await join_request.approve()
                 msg = "🎉 ¡Tu solicitud de acceso al VIP ha sido aprobada!" if lang == "es" else "🎉 Your VIP access request has been approved!"
-                try:
-                    await bot.send_message(join_request.from_user.id, msg)
+                try: await bot.send_message(join_request.from_user.id, msg)
                 except: pass
             else:
                 await join_request.decline()
                 msg = "❌ No cumples con los requisitos para ingresar al VIP." if lang == "es" else "❌ You do not meet the requirements to enter the VIP."
-                try:
-                    await bot.send_message(join_request.from_user.id, msg)
+                try: await bot.send_message(join_request.from_user.id, msg)
                 except: pass
 
     return dp
@@ -1345,9 +1220,7 @@ async def process_db_version(callback: CallbackQuery, state: FSMContext):
 async def web_server():
     app = web.Application()
     app.router.add_get("/", handle_webapp)
-    app.router.add_post("/api/live_ping", api_live_ping)
     app.router.add_get("/api/data", api_get_data)
-    app.router.add_post("/api/bonus", api_claim_bonus)
     app.router.add_post("/api/clear", api_clear_inv)
     
     runner = web.AppRunner(app)
