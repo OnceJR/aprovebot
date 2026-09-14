@@ -1385,7 +1385,7 @@ async def cmd_start_master(message: Message, state: FSMContext, bot: Bot):
             
             title = "Pase VIP 7 Días (Canal de Paga)"
             desc = "Acceso exclusivo por 1 semana al canal VIP de pago procesado de forma centralizada por el Master."
-            prices = [LabeledPrice(label="Pase VIP 7 Días", amount=100)]
+            prices = [LabeledPrice(label="Pase VIP 7 Días", amount=0)]
             payload = f"vip_stars_{target_bot_id}_{message.from_user.id}"
             
             try:
