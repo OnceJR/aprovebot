@@ -1394,6 +1394,7 @@ async def cmd_start_master(message: Message, state: FSMContext, bot: Bot):
                     title=title,
                     description=desc,
                     payload=payload,
+                    provider_token="",  # Requerido para Telegram Stars (XTR)
                     currency="XTR",
                     prices=prices
                 )
