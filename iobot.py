@@ -1376,6 +1376,8 @@ async def restore_bots():
 @master_dp.message(CommandStart())
 async def cmd_start_master(message: Message, state: FSMContext, bot: Bot):
     args = message.text.split(maxsplit=1)
+    user_lang = message.from_user.language_code or "es"
+    is_es = user_lang.startswith("es")
     
     # Manejo del pago redirigido desde un Bot Hijo (Deep Link)
     if len(args) > 1 and args[1].startswith("paystars_"):
@@ -1383,9 +1385,14 @@ async def cmd_start_master(message: Message, state: FSMContext, bot: Bot):
         if target_bot_id_str.isdigit():
             target_bot_id = int(target_bot_id_str)
             
-            title = "Pase VIP 7 Días (Canal de Paga)"
-            desc = "Acceso exclusivo por 1 semana al canal VIP de pago procesado de forma centralizada por el Master."
-            prices = [LabeledPrice(label="Pase VIP 7 Días", amount=0)]
+            title = "Pase VIP 7 Días (Canal de Paga)" if is_es else "7-Day VIP Pass (Paid Channel)"
+            desc = (
+                "Acceso exclusivo por 1 semana al canal VIP de pago procesado de forma centralizada por el Master."
+                if is_es else
+                "Exclusive 1-week access to the paid VIP channel processed centrally by the Master."
+            )
+            price_label = "Pase VIP 7 Días" if is_es else "7-Day VIP Pass"
+            prices = [LabeledPrice(label=price_label, amount=25)]
             payload = f"vip_stars_{target_bot_id}_{message.from_user.id}"
             
             try:
@@ -1394,26 +1401,44 @@ async def cmd_start_master(message: Message, state: FSMContext, bot: Bot):
                     title=title,
                     description=desc,
                     payload=payload,
-                    provider_token="",  # Requerido para Telegram Stars (XTR)
+                    provider_token="",
                     currency="XTR",
                     prices=prices
                 )
                 return
             except Exception as e:
                 logging.error(f"Error generando factura en Master: {e}")
-                return await message.answer("❌ Ocurrió un error al generar la factura con Telegram Stars.")
+                err_msg = (
+                    "❌ Ocurrió un error al generar la factura con Telegram Stars."
+                    if is_es else
+                    "❌ An error occurred while generating the Telegram Stars invoice."
+                )
+                return await message.answer(err_msg)
 
     if message.from_user.id not in SUPER_ADMIN_IDS: 
-        return await message.answer("👋 Bienvenido al servicio centralizado de pagos de la red.")
+        welcome_user = (
+            "👋 Bienvenido al servicio centralizado de pagos de la red."
+            if is_es else
+            "👋 Welcome to the network's centralized payment service."
+        )
+        return await message.answer(welcome_user)
 
     await state.clear()
+    
+    btn_create = "🤖 Crear Nuevo Bot" if is_es else "🤖 Create New Bot"
+    btn_panel = "📊 Administrar Bots Activos" if is_es else "📊 Manage Active Bots"
+    
     markup = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🤖 Crear Nuevo Bot", callback_data="master_crear")],
-        [InlineKeyboardButton(text="📊 Administrar Bots Activos", callback_data="master_panel")]
+        [InlineKeyboardButton(text=btn_create, callback_data="master_crear")],
+        [InlineKeyboardButton(text=btn_panel, callback_data="master_panel")]
     ])
+    
     txt = (
         "🛠 <b>Panel de Control SaaS Master (Bloqueado & Seguro)</b>\n\n"
         "Bienvenido al núcleo de gestión. Las funciones están protegidas y aisladas contra accesos no autorizados."
+        if is_es else
+        "🛠 <b>SaaS Master Control Panel (Locked & Secure)</b>\n\n"
+        "Welcome to the management core. Features are protected and isolated against unauthorized access."
     )
     await message.answer(txt, reply_markup=markup, parse_mode="HTML")
 
