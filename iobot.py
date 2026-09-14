@@ -3,7 +3,7 @@ import asyncio
 import logging
 import time
 import random
-from datetime import datetime
+from datetime import datetime, timedelta
 from urllib.parse import parse_qsl
 import json
 from aiohttp import web
@@ -20,16 +20,18 @@ from aiogram.fsm.storage.base import StorageKey
 from aiogram.types import (
     Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, 
     ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove, WebAppInfo,
-    ChatJoinRequest
+    ChatJoinRequest, LabeledPrice, PreCheckoutQuery
 )
 
 # =====================================================================
-# 1. CONFIGURACIÓN DEL PANEL MASTER
+# 1. CONFIGURACIÓN DEL PANEL MASTER Y SEGURIDAD
 # =====================================================================
 MASTER_TOKEN = os.getenv("MASTER_TOKEN", "8972664077:AAFZuPYPIFypZN7ovV849CBuRRZYiMrVdDY")
 MASTER_MONGO_URI = os.getenv("MONGO_URI", "mongodb+srv://carlosjrpelegrina_db_user:1DNyN9AFa9bh1tCr@cluster0.haf2f1l.mongodb.net")
 PORT = int(os.environ.get("PORT", 8080))
 RENDER_URL = os.environ.get("RENDER_EXTERNAL_URL", "https://TU_DOMINIO.onrender.com")
+
+SUPER_ADMIN_IDS = [8983189714, 7452819858]
 
 master_db_client = AsyncIOMotorClient(MASTER_MONGO_URI)
 master_db = master_db_client.saas_master_db
@@ -42,6 +44,7 @@ class CreateChildBot(StatesGroup):
     waiting_for_sub_link = State()
     waiting_for_vip_id = State()
     waiting_for_log_id = State()
+    waiting_for_paid_vip_id = State()
     waiting_for_db_version = State()
 
 class BotStates(StatesGroup):
@@ -52,8 +55,13 @@ class BotStates(StatesGroup):
     waiting_trade_amount = State()
     waiting_for_id = State()
 
+def extract_chat_id(msg: Message) -> str:
+    if msg.forward_from_chat:
+        return str(msg.forward_from_chat.id)
+    return msg.text.strip()
+
 # =====================================================================
-# 2. SERVIDOR WEB Y APIS (CON COFRES Y RECOMPENSAS DIARIAS)
+# 2. SERVIDOR WEB Y APIS
 # =====================================================================
 async def get_auth_user(request):
     init_data = request.headers.get("Authorization", "")
@@ -299,9 +307,9 @@ async def handle_webapp(request):
                 temp.select();
                 try {
                     document.execCommand("copy");
-                    tg.showAlert(successMessage + "\\n\\n" + text);
+                    tg.showAlert(successMessage + "\n\n" + text);
                 } catch (err) {
-                    tg.showAlert("No se pudo copiar.\\n\\n" + text);
+                    tg.showAlert("No se pudo copiar.\n\n" + text);
                 }
                 document.body.removeChild(temp);
             }
@@ -372,7 +380,7 @@ async def handle_webapp(request):
                     }
                 } catch(e) { 
                     tg.showAlert("❌ Error de conexión al servidor."); 
-                    document.querySelectorAll('.chest-wrapper').forEach(w => w.classList.remove('disabled'));
+                    document.querySelectorAll('.chest-wrapper').forEach(w => w.classList.add('disabled'));
                     document.getElementById("bonus-status").innerText = "¡Elige un cofre!";
                     loadData(); 
                 }
@@ -457,7 +465,7 @@ async def handle_webapp(request):
 
 
 # =====================================================================
-# 3. CORE SAAS: FÁBRICA DE BOTS HIJOS (CON CREACIÓN LAZY DE TOPICS)
+# 3. CORE SAAS: FÁBRICA DE BOTS HIJOS (CON PRIVACIDAD, MANTENIMIENTO, BLACKLIST, VIP Y ESTRELLAS XTR)
 # =====================================================================
 def get_new_child_dp(child_config: dict, child_db) -> Dispatcher:
     dp = Dispatcher(storage=MemoryStorage())
@@ -480,7 +488,7 @@ def get_new_child_dp(child_config: dict, child_db) -> Dispatcher:
     FORCE_SUB_CHANNEL_LINK = child_config.get("force_sub_link", "")
     VIP_GROUP_ID = int(child_config.get("vip_group_id", 0)) if child_config.get("vip_group_id") else 0
     LOG_GROUP_ID = int(child_config.get("log_group_id", 0)) if child_config.get("log_group_id") else 0
-    SUPER_ADMIN_IDS = [8983189714, 7452819858] 
+    PAID_VIP_CHANNEL_ID = int(child_config.get("paid_vip_channel_id", 0)) if child_config.get("paid_vip_channel_id") else 0
 
     async def get_or_create_chat_topic(bot: Bot, u_id: int, t_id: int):
         if not LOG_GROUP_ID: return None
@@ -505,12 +513,20 @@ def get_new_child_dp(child_config: dict, child_db) -> Dispatcher:
     async def get_user(user_id):
         user = await child_db.users.find_one({"_id": user_id})
         if not user:
-            user = {"_id": user_id, "lang": "es", "referrals": 0, "reputation": 0, "mode": "anon", "in_vip": False, "notified_vip": False, "last_bonus": 0}
+            user = {"_id": user_id, "lang": "es", "referrals": 0, "reputation": 0, "mode": "anon", "in_vip": False, "notified_vip": False, "last_bonus": 0, "vip_until": 0}
             await child_db.users.insert_one(user)
         return user
 
     async def save_user(user_id, data):
         await child_db.users.update_one({"_id": user_id}, {"$set": data}, upsert=True)
+
+    async def is_maintenance_mode():
+        cfg = await child_db.settings.find_one({"_id": "config"})
+        return cfg.get("maintenance", False) if cfg else False
+
+    async def is_blacklisted(user_id):
+        user = await get_user(user_id)
+        return user.get("blacklisted", False)
 
     async def check_force_sub(user_id, bot: Bot):
         if user_id in SUPER_ADMIN_IDS: return True
@@ -526,17 +542,37 @@ def get_new_child_dp(child_config: dict, child_db) -> Dispatcher:
         if not VIP_GROUP_ID: return
         try:
             user = await get_user(user_id)
-            if user.get("notified_vip"): return
             if user.get("referrals", 0) >= 3 or user.get("reputation", 0) >= 20:
-                invite = await bot.create_chat_invite_link(chat_id=VIP_GROUP_ID, creates_join_request=True)
-                lang = user.get("lang", "es")
-                btn = "🌟 Entrar al VIP" if lang == "es" else "🌟 Join VIP"
-                msg = "🎉 **¡Te has ganado acceso al VIP!**" if lang == "es" else "🎉 **You've earned VIP access!**"
-                markup = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=btn, url=invite.invite_link)]])
-                await bot.send_message(user_id, msg, reply_markup=markup, parse_mode="Markdown")
-                await save_user(user_id, {"notified_vip": True, "in_vip": True})
+                if not user.get("notified_vip"):
+                    invite = await bot.create_chat_invite_link(chat_id=VIP_GROUP_ID, member_limit=1, creates_join_request=False)
+                    lang = user.get("lang", "es")
+                    btn = "🌟 Entrar al Grupo VIP (Referidos/Puntos)" if lang == "es" else "🌟 Join VIP Group"
+                    msg = "🎉 **¡Tienes acceso al Grupo VIP por referidos/puntos!** Aquí tienes tu enlace exclusivo:" if lang == "es" else "🎉 **You have VIP access!** Here is your exclusive invite link:"
+                    markup = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=btn, url=invite.invite_link)]])
+                    await bot.send_message(user_id, msg, reply_markup=markup, parse_mode="Markdown")
+                    await save_user(user_id, {"notified_vip": True, "in_vip": True})
         except Exception as e:
             logging.error(f"❌ Error crítico en check_vip_status: {e}")
+
+    async def background_vip_cleaner(bot: Bot):
+        while True:
+            try:
+                now = time.time()
+                # Limpieza específica para usuarios de pago por Estrellas cuyo vip_until haya expirado
+                cursor = child_db.users.find({"paid_vip_active": True, "vip_until": {"$gt": 0, "$lt": now}})
+                async for u in cursor:
+                    uid = u["_id"]
+                    if PAID_VIP_CHANNEL_ID:
+                        try:
+                            await bot.ban_chat_member(PAID_VIP_CHANNEL_ID, uid)
+                            await bot.unban_chat_member(PAID_VIP_CHANNEL_ID, uid)
+                            await bot.send_message(uid, "⚠️ **Tu suscripción o pase VIP de 1 semana por Estrellas ha expirado.** Has sido retirado del canal VIP de pago.")
+                        except Exception as ex:
+                            logging.error(f"Error expulsando usuario {uid} del canal VIP pagado: {ex}")
+                    await save_user(uid, {"paid_vip_active": False, "vip_until": 0})
+            except Exception as e:
+                logging.error(f"Error en background_vip_cleaner: {e}")
+            await asyncio.sleep(3600)
 
     async def send_rating_request(user_id, target_id, bot: Bot):
         user = await get_user(user_id)
@@ -605,6 +641,7 @@ def get_new_child_dp(child_config: dict, child_db) -> Dispatcher:
             )
         await bot.send_message(chat_id=user_id, text=txt, reply_markup=markup, parse_mode="HTML")
 
+    # ================= COMANDOS ADMINISTRATIVOS Y MODERACIÓN (BOT HIJO) =================
     @dp.message(Command("add_receiver"))
     async def cmd_add_receiver(message: Message, bot: Bot):
         if message.from_user.id not in SUPER_ADMIN_IDS: return
@@ -622,6 +659,34 @@ def get_new_child_dp(child_config: dict, child_db) -> Dispatcher:
             await child_db.settings.update_one({"_id": "config"}, {"$pull": {"extra_receivers": rem_id}}, upsert=True)
             await message.answer(f"✅ ID `{rem_id}` eliminado.")
         except: await message.answer("⚠️ Uso: `/del_receiver ID`")
+
+    @dp.message(Command("mantenimiento"))
+    async def cmd_maintenance(message: Message, bot: Bot):
+        if message.from_user.id not in SUPER_ADMIN_IDS: return
+        cfg = await child_db.settings.find_one({"_id": "config"})
+        current = cfg.get("maintenance", False) if cfg else False
+        new_state = not current
+        await child_db.settings.update_one({"_id": "config"}, {"$set": {"maintenance": new_state}}, upsert=True)
+        status_txt = "activado 🔴" if new_state else "desactivado 🟢"
+        await message.answer(f"🛠️ Modo mantenimiento {status_txt}.")
+
+    @dp.message(Command("blacklist"))
+    async def cmd_blacklist_user(message: Message, bot: Bot):
+        if message.from_user.id not in SUPER_ADMIN_IDS: return
+        try:
+            target_id = int(message.text.split()[1])
+            await save_user(target_id, {"blacklisted": True})
+            await message.answer(f"🚫 Usuario `{target_id}` agregado a la lista negra.")
+        except: await message.answer("⚠️ Uso: `/blacklist ID`")
+
+    @dp.message(Command("unblacklist"))
+    async def cmd_unblacklist_user(message: Message, bot: Bot):
+        if message.from_user.id not in SUPER_ADMIN_IDS: return
+        try:
+            target_id = int(message.text.split()[1])
+            await save_user(target_id, {"blacklisted": False})
+            await message.answer(f"✅ Usuario `{target_id}` removido de la lista negra.")
+        except: await message.answer("⚠️ Uso: `/unblacklist ID`")
 
     @dp.message(Command("broadcast"))
     async def cmd_broadcast(message: Message, bot: Bot):
@@ -650,7 +715,7 @@ def get_new_child_dp(child_config: dict, child_db) -> Dispatcher:
         stats_text = (
             "📊 **ESTADÍSTICAS DEL BOT**\n\n"
             f"👥 Usuarios registrados: `{total_users}`\n"
-            f"🌟 Usuarios VIP: `{vip_users}`\n"
+            f"🌟 Usuarios VIP (Referidos/Puntos): `{vip_users}`\n"
             f"📁 Archivos en cofre: `{total_files}`\n"
             f"🔄 Intercambios exitosos: `{operaciones_reales}`\n"
             f"💬 Chats en vivo: `{active_chats_count}`"
@@ -659,8 +724,13 @@ def get_new_child_dp(child_config: dict, child_db) -> Dispatcher:
 
     @dp.message(CommandStart(), StateFilter("*"))
     async def cmd_start(message: Message, state: FSMContext, bot: Bot):
-        await state.clear()
         user_id = message.from_user.id
+        if await is_blacklisted(user_id): return
+        
+        if await is_maintenance_mode() and user_id not in SUPER_ADMIN_IDS:
+            return await message.answer("🛠️ **Bot en Mantenimiento**\n\nEstamos actualizando el sistema. Vuelve a intentarlo más tarde.")
+
+        await state.clear()
         args = message.text.split(maxsplit=1)
         
         if user_id in waiting_list: waiting_list.remove(user_id)
@@ -729,11 +799,13 @@ def get_new_child_dp(child_config: dict, child_db) -> Dispatcher:
 
     @dp.callback_query(F.data == "verify_sub")
     async def verify_sub(callback: CallbackQuery, bot: Bot):
-        user = await get_user(callback.from_user.id)
+        user_id = callback.from_user.id
+        if await is_blacklisted(user_id): return
+        user = await get_user(user_id)
         lang = user.get("lang", "es")
-        if await check_force_sub(callback.from_user.id, bot):
+        if await check_force_sub(user_id, bot):
             await callback.message.delete()
-            await show_main_menu(callback.from_user.id, bot)
+            await show_main_menu(user_id, bot)
         else: 
             err_msg = "⚠️ Aún no te has unido." if lang == "es" else "⚠️ You haven't joined yet."
             await callback.answer(err_msg, show_alert=True)
@@ -761,27 +833,100 @@ def get_new_child_dp(child_config: dict, child_db) -> Dispatcher:
         
         btn_mod = "🔄 Cambiar Modo" if lang == "es" else "🔄 Change Mode"
         btn_vol = "⬅️ Volver" if lang == "es" else "⬅️ Back"
+        btn_buy_vip = "⭐ Comprar VIP 7 Días (Stars)" if lang == "es" else "⭐ Buy 7-Day VIP (Stars)"
         
-        inline_kb = [[InlineKeyboardButton(text=btn_mod, callback_data="toggle_mode")]]
+        inline_kb = [
+            [InlineKeyboardButton(text=btn_buy_vip, callback_data="buy_vip_stars")],
+            [InlineKeyboardButton(text=btn_mod, callback_data="toggle_mode")]
+        ]
         
+        # Botón para el Grupo VIP (por referidos/puntos)
         if VIP_GROUP_ID and (user.get("in_vip") or user.get("referrals", 0) >= 3 or user.get("reputation", 0) >= 20):
             try:
-                invite = await bot.create_chat_invite_link(chat_id=VIP_GROUP_ID, creates_join_request=True)
-                btn_vip = "🌟 Ir al grupo VIP" if lang == "es" else "🌟 Go to VIP Group"
-                inline_kb.insert(0, [InlineKeyboardButton(text=btn_vip, url=invite.invite_link)])
+                invite_free = await bot.create_chat_invite_link(chat_id=VIP_GROUP_ID, member_limit=1, creates_join_request=False)
+                btn_free_vip = "🌟 Ir al Grupo VIP (Referidos/Puntos)" if lang == "es" else "🌟 Go to Free VIP Group"
+                inline_kb.insert(0, [InlineKeyboardButton(text=btn_free_vip, url=invite_free.invite_link)])
+            except: pass
+
+        # Botón para el Canal VIP de pago con Estrellas
+        if PAID_VIP_CHANNEL_ID and user.get("vip_until", 0) > time.time():
+            try:
+                invite_paid = await bot.create_chat_invite_link(chat_id=PAID_VIP_CHANNEL_ID, member_limit=1, creates_join_request=False)
+                btn_paid_vip = "💎 Ir al Canal VIP de Paga (Estrellas)" if lang == "es" else "💎 Go to Paid VIP Channel"
+                inline_kb.insert(0, [InlineKeyboardButton(text=btn_paid_vip, url=invite_paid.invite_link)])
             except: pass
                 
         inline_kb.append([InlineKeyboardButton(text=btn_vol, callback_data="back_main")])
         markup = InlineKeyboardMarkup(inline_keyboard=inline_kb)
         
+        vip_expires = user.get('vip_until', 0)
+        vip_status_txt = f"Activo hasta: {datetime.fromtimestamp(vip_expires).strftime('%Y-%m-%d %H:%M')}" if vip_expires > time.time() else "Inactivo ❌"
+        
         if lang == "es":
             modo = "🕵️‍♂️ Anónimo" if user.get("mode") == "anon" else "👤 Público"
-            txt = f"👤 **Tu Perfil**\n\n🆔 ID: `{uid}`\n🌟 Reputación: `{user.get('reputation', 0)}/20`\n👥 Referidos: `{user.get('referrals', 0)}/3`\n🎭 Modo: **{modo}**\n\n📦 Inventario: 📷 {fotos} | 🎥 {videos}"
+            txt = f"👤 **Tu Perfil**\n\n🆔 ID: `{uid}`\n🌟 Reputación: `{user.get('reputation', 0)}/20`\n👥 Referidos: `{user.get('referrals', 0)}/3`\n⭐ VIP Estrellas: **{vip_status_txt}**\n🎭 Modo: **{modo}**\n\n📦 Inventario: 📷 {fotos} | 🎥 {videos}"
         else:
             modo = "🕵️‍♂️ Anonymous" if user.get("mode") == "anon" else "👤 Public"
-            txt = f"👤 **Your Profile**\n\n🆔 ID: `{uid}`\n🌟 Reputation: `{user.get('reputation', 0)}/20`\n👥 Referrals: `{user.get('referrals', 0)}/3`\n🎭 Mode: **{modo}**\n\n📦 Inventory: 📷 {fotos} | 🎥 {videos}"
+            txt = f"👤 **Your Profile**\n\n🆔 ID: `{uid}`\n🌟 Reputation: `{user.get('reputation', 0)}/20`\n👥 Referrals: `{user.get('referrals', 0)}/3`\n⭐ Stars VIP: **{vip_status_txt}**\n🎭 Mode: **{modo}**\n\n📦 Inventory: 📷 {fotos} | 🎥 {videos}"
             
         await callback.message.edit_text(txt, reply_markup=markup, parse_mode="Markdown")
+
+    @dp.callback_query(F.data == "buy_vip_stars")
+    async def buy_vip_stars(callback: CallbackQuery, bot: Bot):
+        user_id = callback.from_user.id
+        user = await get_user(user_id)
+        lang = user.get("lang", "es")
+        
+        title = "Pase VIP 7 Días (Canal de Paga)" if lang == "es" else "7-Day VIP Pass (Paid Channel)"
+        desc = "Obtén acceso exclusivo por 1 semana al canal VIP de pago mediante Telegram Stars." if lang == "es" else "Get 1 week exclusive access to the paid VIP channel using Telegram Stars."
+        
+        prices = [LabeledPrice(label="Pase VIP 7 Días", amount=100)] # 100 Estrellas
+        
+        try:
+            await bot.send_invoice(
+                chat_id=user_id,
+                title=title,
+                description=desc,
+                payload="vip_pass_7d_payload",
+                currency="XTR",
+                prices=prices
+            )
+            await callback.answer()
+        except Exception as e:
+            logging.error(f"Error enviando factura de estrellas: {e}")
+            await callback.answer("❌ Error al procesar la factura de estrellas.", show_alert=True)
+
+    @dp.pre_checkout_query()
+    async def process_pre_checkout_query(pre_checkout_query: PreCheckoutQuery, bot: Bot):
+        await bot.answer_pre_checkout_query(pre_checkout_query.id, ok=True)
+
+    @dp.message(F.successful_payment)
+    async def process_successful_payment(message: Message, bot: Bot):
+        user_id = message.from_user.id
+        payment = message.successful_payment
+        if payment.invoice_payload == "vip_pass_7d_payload":
+            user = await get_user(user_id)
+            lang = user.get("lang", "es")
+            now = time.time()
+            current_until = user.get("vip_until", 0)
+            base_time = max(now, current_until)
+            new_vip_until = base_time + (7 * 86400) # Sumar 7 días
+            
+            await save_user(user_id, {"vip_until": new_vip_until, "paid_vip_active": True})
+            
+            # Generar enlace de invitación directo al Canal VIP de pago
+            if PAID_VIP_CHANNEL_ID:
+                try:
+                    invite = await bot.create_chat_invite_link(chat_id=PAID_VIP_CHANNEL_ID, member_limit=1, creates_join_request=False)
+                    btn = "💎 Entrar al Canal VIP de Paga" if lang == "es" else "💎 Enter Paid VIP Channel"
+                    markup = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=btn, url=invite.invite_link)]])
+                    link_msg = "🎉 **¡Pago con Estrellas exitoso!** Aquí tienes tu acceso exclusivo al canal VIP de pago:" if lang == "es" else "🎉 **Payment successful!** Here is your exclusive access to the paid VIP channel:"
+                    await bot.send_message(user_id, link_msg, reply_markup=markup, parse_mode="Markdown")
+                except Exception as ex:
+                    logging.error(f"Error creando invite link para canal pagado: {ex}")
+
+            succ_msg = "✅ Tu suscripción ha sido extendida por 7 días más." if lang == "es" else "✅ Your subscription has been extended by 7 days."
+            await message.answer(succ_msg, parse_mode="Markdown")
 
     @dp.callback_query(F.data == "toggle_mode")
     async def toggle_mode(callback: CallbackQuery, bot: Bot):
@@ -807,13 +952,15 @@ def get_new_child_dp(child_config: dict, child_db) -> Dispatcher:
 
     @dp.message(StateFilter(BotStates.waiting_for_id), ~F.text.startswith("/"))
     async def process_connect_id(message: Message, state: FSMContext, bot: Bot):
-        user = await get_user(message.from_user.id)
+        user_id = message.from_user.id
+        if await is_blacklisted(user_id): return
+        user = await get_user(user_id)
         lang = user.get("lang", "es")
         
         if not message.text.isdigit(): 
             return await message.answer("⚠️ Debe ser un número." if lang == "es" else "⚠️ Must be a number.")
             
-        t_id, u_id = int(message.text), message.from_user.id
+        t_id, u_id = int(message.text), user_id
         if t_id == u_id: return
         if t_id in active_chats or t_id in waiting_list: 
             return await message.answer("⚠️ Ocupado." if lang == "es" else "⚠️ Busy.")
@@ -857,6 +1004,7 @@ def get_new_child_dp(child_config: dict, child_db) -> Dispatcher:
     @dp.callback_query(F.data == "find_chat")
     async def find_chat(callback: CallbackQuery, state: FSMContext, bot: Bot):
         u_id = callback.from_user.id
+        if await is_blacklisted(u_id): return
         if u_id in active_chats:
             return await callback.answer("⚠️ Ya tienes un chat activo.", show_alert=True)
         if u_id in waiting_list:
@@ -929,6 +1077,7 @@ def get_new_child_dp(child_config: dict, child_db) -> Dispatcher:
     @dp.message(F.chat.type == "private", F.photo | F.video | F.document)
     async def handle_media(message: Message, bot: Bot):
         u_id = message.from_user.id
+        if await is_blacklisted(u_id): return
         user = await get_user(u_id)
         lang = user.get("lang", "es")
         
@@ -997,7 +1146,6 @@ def get_new_child_dp(child_config: dict, child_db) -> Dispatcher:
         pending_trades[t_id] = {"sender": u_id, "amount": amt, "type": t_type}
         await state.set_state(BotStates.chatting)
         
-        # Ensure a topic exists since a trade proposal indicates active engagement
         await get_or_create_chat_topic(bot, u_id, t_id)
 
         btn_acc = "✅ Aceptar" if t_lang == "es" else "✅ Accept"
@@ -1150,6 +1298,7 @@ def get_new_child_dp(child_config: dict, child_db) -> Dispatcher:
     @dp.message(StateFilter(BotStates.chatting), ~F.text.startswith("/"), ~F.text.in_(["🤝 Proponer Intercambio", "🤝 Propose Trade", "❌ Desconectar", "❌ Disconnect"]))
     async def relay_msg(message: Message, bot: Bot):
         u_id = message.from_user.id
+        if await is_blacklisted(u_id): return
         target = active_chats.get(u_id)
         if target:
             try: 
@@ -1162,25 +1311,28 @@ def get_new_child_dp(child_config: dict, child_db) -> Dispatcher:
     @dp.chat_join_request()
     async def process_vip_join_request(join_request: ChatJoinRequest, bot: Bot):
         if VIP_GROUP_ID and join_request.chat.id == VIP_GROUP_ID:
-            user = await get_user(join_request.from_user.id)
+            uid = join_request.from_user.id
+            user = await get_user(uid)
             lang = user.get("lang", "es")
             
-            if user.get("in_vip") or user.get("referrals", 0) >= 3 or user.get("reputation", 0) >= 20:
+            if user.get("referrals", 0) >= 3 or user.get("reputation", 0) >= 20:
                 await join_request.approve()
-                msg = "🎉 ¡Tu solicitud de acceso al VIP ha sido aprobada!" if lang == "es" else "🎉 Your VIP access request has been approved!"
-                try: await bot.send_message(join_request.from_user.id, msg)
+                msg = "🎉 ¡Tu solicitud de acceso al grupo VIP gratuito ha sido aprobada!" if lang == "es" else "🎉 Your free VIP group access request has been approved!"
+                try: await bot.send_message(uid, msg)
                 except: pass
             else:
                 await join_request.decline()
-                msg = "❌ No cumples con los requisitos para ingresar al VIP." if lang == "es" else "❌ You do not meet the requirements to enter the VIP."
-                try: await bot.send_message(join_request.from_user.id, msg)
+                msg = "❌ No cumples con los requisitos mínimos de referidos (3) o reputación (20)." if lang == "es" else "❌ You do not meet the minimum requirements."
+                try: await bot.send_message(uid, msg)
                 except: pass
+
+    dp["vip_cleaner_task"] = asyncio.create_task(background_vip_cleaner(bot=None))
 
     return dp
 
 
 # =====================================================================
-# 4. TRABAJADORES EN SEGUNDO PLANO Y AISLAMIENTO DE PROCESOS
+# 4. TRABAJADORES EN SEGUNDO PLANO Y MONITOR ANTI-BAN (HEALTH CHECK)
 # =====================================================================
 async def child_message_worker(bot_id: int):
     bot = active_bots_tasks[bot_id]["bot"]
@@ -1209,11 +1361,30 @@ async def child_message_worker(bot_id: int):
             finally: queue.task_done()
     except asyncio.CancelledError: pass
 
+async def health_check_monitor():
+    while True:
+        await asyncio.sleep(600)
+        for bot_id, data in list(active_bots_tasks.items()):
+            bot = data["bot"]
+            try:
+                await bot.get_me()
+            except TelegramUnauthorizedError:
+                logging.warning(f"⚠️ Bot hijo {bot_id} revocado o baneado por Telegram. Limpiando...")
+                await isolate_and_cleanup_bot(bot_id, revoked=True)
+                for admin_id in SUPER_ADMIN_IDS:
+                    try:
+                        await bot.send_message(admin_id, f"🚨 **ALERTA ANTI-BAN:** El bot hijo con ID `{bot_id}` ha sido revocado o bloqueado por Telegram y fue desactivado limpiamente.")
+                    except: pass
+            except Exception:
+                pass
+
 async def isolate_and_cleanup_bot(bot_id: int, revoked: bool = False):
     if bot_id in active_bots_tasks:
         tasks = active_bots_tasks[bot_id]
         tasks["polling_task"].cancel()
         tasks["worker_task"].cancel()
+        if "vip_cleaner_task" in tasks:
+            tasks["vip_cleaner_task"].cancel()
         await tasks["bot"].session.close()
         
         token = tasks["bot"].token
@@ -1245,83 +1416,135 @@ async def start_child_bot(config: dict) -> bool:
     
     polling_task = asyncio.create_task(child_polling_wrapper(dp, bot, bot_id))
     worker_task = asyncio.create_task(child_message_worker(bot_id))
+    vip_cleaner_task = asyncio.create_task(dp["vip_cleaner_task"](bot) if callable(dp.get("vip_cleaner_task")) else background_vip_cleaner_runner(bot, child_db, PAID_VIP_CHANNEL_ID=int(config.get("paid_vip_channel_id", 0)) if config.get("paid_vip_channel_id") else 0))
+    
     active_bots_tasks[bot_id]["polling_task"] = polling_task
     active_bots_tasks[bot_id]["worker_task"] = worker_task
+    active_bots_tasks[bot_id]["vip_cleaner_task"] = vip_cleaner_task
     return True
+
+async def background_vip_cleaner_runner(bot: Bot, child_db, PAID_VIP_CHANNEL_ID: int):
+    while True:
+        try:
+            now = time.time()
+            cursor = child_db.users.find({"paid_vip_active": True, "vip_until": {"$gt": 0, "$lt": now}})
+            async for u in cursor:
+                uid = u["_id"]
+                if PAID_VIP_CHANNEL_ID:
+                    try:
+                        await bot.ban_chat_member(PAID_VIP_CHANNEL_ID, uid)
+                        await bot.unban_chat_member(PAID_VIP_CHANNEL_ID, uid)
+                        await bot.send_message(uid, "⚠️ **Tu pase VIP de 1 semana por Estrellas ha expirado.** Has sido retirado del canal VIP de pago.")
+                    except: pass
+                await child_db.users.update_one({"_id": uid}, {"$set": {"paid_vip_active": False, "vip_until": 0}})
+        except: pass
+        await asyncio.sleep(3600)
 
 async def restore_bots():
     cursor = master_db.child_bots.find({"status": "active"})
     async for config in cursor: await start_child_bot(config)
 
 # =====================================================================
-# 5. HANDLERS DEL MASTER BOT (Panel Profesional & Gestión de Bots)
+# 5. HANDLERS DEL MASTER BOT (CONFIGURACIÓN DINÁMICA Y MANUAL)
 # =====================================================================
 @master_dp.message(F.text == "/start")
 async def cmd_start_master(message: Message, state: FSMContext):
+    if message.from_user.id not in SUPER_ADMIN_IDS: return
     await state.clear()
     markup = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🤖 Crear Nuevo Bot", callback_data="master_crear")],
-        [InlineKeyboardButton(text="📊 Administrar Bots Activos", callback_data="master_panel")]
+        [InlineKeyboardButton(text="📊 Administrar Bots Activos", callback_data="master_panel")],
+        [InlineKeyboardButton(text="🚨 Ban Global en Red", callback_data="master_global_ban")]
     ])
     txt = (
-        "🛠 <b>Panel de Control SaaS Master</b>\n\n"
-        "Bienvenido al núcleo de gestión de bots de intercambio. Desde aquí puedes desplegar y supervisar tus redes con aislamiento total."
+        "🛠 <b>Panel de Control SaaS Master (Bloqueado & Seguro)</b>\n\n"
+        "Bienvenido al núcleo de gestión. Las funciones están protegidas y aisladas contra accesos no autorizados."
     )
     await message.answer(txt, reply_markup=markup, parse_mode="HTML")
 
 @master_dp.callback_query(F.data == "master_crear")
 async def cb_crear_bot(callback: CallbackQuery, state: FSMContext):
-    await callback.message.edit_text("🤖 <b>Paso 1/5:</b> Envíame el <b>Token</b> del bot proporcionado por @BotFather:", parse_mode="HTML")
+    if callback.from_user.id not in SUPER_ADMIN_IDS: return
+    await callback.message.edit_text("🤖 <b>Paso 1/7:</b> Envíame el <b>Token</b> del bot proporcionado por @BotFather:", parse_mode="HTML")
     await state.set_state(CreateChildBot.waiting_for_token)
 
 @master_dp.message(CreateChildBot.waiting_for_token)
 async def process_token(message: Message, state: FSMContext):
+    if message.from_user.id not in SUPER_ADMIN_IDS: return
     await state.update_data(token=message.text.strip())
-    await message.answer("📢 <b>Paso 2/5:</b> Envía el <b>ID del Canal de Suscripción Obligatoria</b> (Ej: <code>-100123456789</code>):", parse_mode="HTML")
+    await message.answer("📢 <b>Paso 2/7:</b> Envía el <b>ID del Canal de Suscripción Obligatoria</b> o reenvíame un mensaje de ese canal:", parse_mode="HTML")
     await state.set_state(CreateChildBot.waiting_for_sub_id)
 
 @master_dp.message(CreateChildBot.waiting_for_sub_id)
 async def process_sub_id(message: Message, state: FSMContext):
-    await state.update_data(sub_id=message.text.strip())
-    await message.answer("🔗 <b>Paso 3/5:</b> Envía el <b>Enlace de invitación al Canal</b> (Ej: <code>https://t.me/tu_canal</code>):", parse_mode="HTML")
+    if message.from_user.id not in SUPER_ADMIN_IDS: return
+    await state.update_data(sub_id=extract_chat_id(message))
+    await message.answer("🔗 <b>Paso 3/7:</b> Envía el <b>Enlace de invitación al Canal de Suscripción</b> (Ej: <code>https://t.me/tu_canal</code>):", parse_mode="HTML")
     await state.set_state(CreateChildBot.waiting_for_sub_link)
 
 @master_dp.message(CreateChildBot.waiting_for_sub_link)
 async def process_sub_link(message: Message, state: FSMContext):
+    if message.from_user.id not in SUPER_ADMIN_IDS: return
     await state.update_data(sub_link=message.text.strip())
-    await message.answer("🌟 <b>Paso 4/5:</b> Envía el <b>ID del Grupo VIP</b> de destino:", parse_mode="HTML")
+    await message.answer("🌟 <b>Paso 4/7:</b> Envía el <b>ID del Grupo VIP Gratuito</b> (para referidos y 20 puntos de reputación) o reenvía un mensaje del mismo:", parse_mode="HTML")
     await state.set_state(CreateChildBot.waiting_for_vip_id)
 
 @master_dp.message(CreateChildBot.waiting_for_vip_id)
 async def process_vip_id(message: Message, state: FSMContext):
-    await state.update_data(vip_id=message.text.strip())
-    await message.answer("📂 <b>Paso 5/5:</b> Envía el <b>ID del Grupo de Logs</b> (donde se crearán los hilos de los chats activos):", parse_mode="HTML")
+    if message.from_user.id not in SUPER_ADMIN_IDS: return
+    await state.update_data(vip_id=extract_chat_id(message))
+    markup = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⏭️ Omitir / No usar Logs", callback_data="skip_logs")]])
+    await message.answer("📂 <b>Paso 5/7:</b> Envía el <b>ID del Grupo de Logs</b> o reenvíame un mensaje de ese grupo (puedes omitirlo):", reply_markup=markup, parse_mode="HTML")
     await state.set_state(CreateChildBot.waiting_for_log_id)
+
+@master_dp.callback_query(CreateChildBot.waiting_for_log_id, F.data == "skip_logs")
+async def process_skip_logs(callback: CallbackQuery, state: FSMContext):
+    if callback.from_user.id not in SUPER_ADMIN_IDS: return
+    await state.update_data(log_id="0")
+    markup = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⏭️ Omitir / No usar VIP de Pago", callback_data="skip_paid_vip")]])
+    await callback.message.answer("💎 <b>Paso 6/7:</b> Envía el <b>ID del Canal VIP de Paga con Estrellas (XTR)</b> o reenvía un mensaje (puedes omitirlo):", reply_markup=markup, parse_mode="HTML")
+    await state.set_state(CreateChildBot.waiting_for_paid_vip_id)
 
 @master_dp.message(CreateChildBot.waiting_for_log_id)
 async def process_log_id(message: Message, state: FSMContext):
-    await state.update_data(log_id=message.text.strip())
-    markup = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🗄️ Versión Base de Datos v1", callback_data="set_db_v1")],
-        [InlineKeyboardButton(text="🗄️ Versión Base de Datos v2", callback_data="set_db_v2")]
-    ])
-    await message.answer("⚙️ Selecciona la versión de almacenamiento aislada:", reply_markup=markup)
+    if message.from_user.id not in SUPER_ADMIN_IDS: return
+    await state.update_data(log_id=extract_chat_id(message))
+    markup = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⏭️ Omitir / No usar VIP de Pago", callback_data="skip_paid_vip")]])
+    await message.answer("💎 <b>Paso 6/7:</b> Envía el <b>ID del Canal VIP de Paga con Estrellas (XTR)</b> o reenvía un mensaje (puedes omitirlo):", reply_markup=markup, parse_mode="HTML")
+    await state.set_state(CreateChildBot.waiting_for_paid_vip_id)
+
+@master_dp.callback_query(CreateChildBot.waiting_for_paid_vip_id, F.data == "skip_paid_vip")
+async def process_skip_paid_vip(callback: CallbackQuery, state: FSMContext):
+    if callback.from_user.id not in SUPER_ADMIN_IDS: return
+    await state.update_data(paid_vip_id="0")
+    await callback.message.answer("🗄️ <b>Paso 7/7:</b> Escribe manualmente la <b>Versión de la Base de Datos</b> para aislar colecciones en MongoDB (Ej: <code>v1</code>, <code>cluster_a</code>, <code>bot_vip_db</code>):", parse_mode="HTML")
     await state.set_state(CreateChildBot.waiting_for_db_version)
 
-@master_dp.callback_query(CreateChildBot.waiting_for_db_version)
-async def process_db_version(callback: CallbackQuery, state: FSMContext):
-    await callback.message.edit_text("⏳ <i>Desplegando infraestructura y verificando token...</i>", parse_mode="HTML")
-    db_version = callback.data.split("_")[-1] 
+@master_dp.message(CreateChildBot.waiting_for_paid_vip_id)
+async def process_paid_vip_id(message: Message, state: FSMContext):
+    if message.from_user.id not in SUPER_ADMIN_IDS: return
+    await state.update_data(paid_vip_id=extract_chat_id(message))
+    await message.answer("🗄️ <b>Paso 7/7:</b> Escribe manualmente la <b>Versión de la Base de Datos</b> para aislar colecciones en MongoDB (Ej: <code>v1</code>, <code>cluster_a</code>, <code>bot_vip_db</code>):", parse_mode="HTML")
+    await state.set_state(CreateChildBot.waiting_for_db_version)
+
+@master_dp.message(CreateChildBot.waiting_for_db_version)
+async def process_db_version_manual(message: Message, state: FSMContext):
+    if message.from_user.id not in SUPER_ADMIN_IDS: return
+    db_version = message.text.strip()
+    if not db_version: db_version = "v1"
+    
+    await message.answer("⏳ <i>Desplegando infraestructura y conectando base de datos...</i>", parse_mode="HTML")
     data = await state.get_data()
     
     new_bot_config = {
-        "owner_id": callback.from_user.id,
+        "owner_id": message.from_user.id,
         "bot_token": data["token"],
         "status": "active",
         "force_sub_id": data["sub_id"], 
         "force_sub_link": data["sub_link"],
         "vip_group_id": data["vip_id"], 
-        "log_group_id": data["log_id"],
+        "log_group_id": data.get("log_id", "0"),
+        "paid_vip_channel_id": data.get("paid_vip_id", "0"),
         "db_version": db_version,
         "created_at": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
     }
@@ -1337,22 +1560,23 @@ async def process_db_version(callback: CallbackQuery, state: FSMContext):
         summary = (
             "🎉 <b>¡BOT HIJO CONFIGURADO Y EN LÍNEA!</b>\n\n"
             f"🤖 <b>Bot User:</b> <code>@{me.username}</code> (ID: <code>{me.id}</code>)\n"
-            f"📅 <b>Fecha de Creación:</b> <code>{new_bot_config['created_at']} UTC</code>\n"
-            f"📂 <b>DB Versión:</b> <code>{db_version}</code>\n"
             f"📢 <b>Canal Sub:</b> <code>{data['sub_id']}</code>\n"
-            f"🌟 <b>Grupo VIP:</b> <code>{data['vip_id']}</code>\n"
-            f"📋 <b>Grupo Logs:</b> <code>{data['log_id']}</code>\n\n"
-            "✅ <i>Estado de salud: Todos los sistemas operativos y polling activo.</i>"
+            f"🌟 <b>Grupo VIP Gratuito:</b> <code>{data['vip_id']}</code>\n"
+            f"💎 <b>Canal VIP Paga (Stars):</b> <code>{data.get('paid_vip_id', '0')}</code>\n"
+            f"📋 <b>Grupo Logs:</b> <code>{new_bot_config['log_id']}</code>\n"
+            f"🗄️ <b>Base de Datos:</b> <code>{db_version}</code>\n\n"
+            "✅ <i>Estado de salud: Todos los sistemas operativos y monitor activo.</i>"
         )
         markup = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="📊 Volver al Panel", callback_data="master_panel")]])
-        await callback.message.edit_text(summary, reply_markup=markup, parse_mode="HTML")
+        await message.answer(summary, reply_markup=markup, parse_mode="HTML")
     else:
         markup = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔄 Reintentar", callback_data="master_crear")]])
-        await callback.message.edit_text("❌ <b>Error:</b> El token proporcionado es inválido o no se pudo conectar con Telegram.", reply_markup=markup, parse_mode="HTML")
+        await message.answer("❌ <b>Error:</b> El token proporcionado es inválido o no se pudo conectar.", reply_markup=markup, parse_mode="HTML")
     await state.clear()
 
 @master_dp.callback_query(F.data == "master_panel")
 async def cb_master_panel(callback: CallbackQuery):
+    if callback.from_user.id not in SUPER_ADMIN_IDS: return
     cursor = master_db.child_bots.find({"status": "active"})
     bots_list = [b async for b in cursor]
     
@@ -1361,7 +1585,6 @@ async def cb_master_panel(callback: CallbackQuery):
     
     for b in bots_list:
         token = b["bot_token"]
-        # Fast user count retrieval
         try:
             temp_b = Bot(token=token)
             me = await temp_b.get_me()
@@ -1380,9 +1603,8 @@ async def cb_master_panel(callback: CallbackQuery):
     markup = InlineKeyboardMarkup(inline_keyboard=keyboard)
     await callback.message.edit_text(txt, reply_markup=markup, parse_mode="HTML")
 
-
 # =====================================================================
-# 6. INICIO DEL SISTEMA (SERVER + BOTS)
+# 6. INICIO DEL SISTEMA (SERVER + BOTS + HEALTH CHECK)
 # =====================================================================
 async def web_server():
     app = web.Application()
@@ -1405,7 +1627,8 @@ async def main():
         runner = await web_server()
         await restore_bots()
         await master_bot.delete_webhook(drop_pending_updates=True)
-        print("🚀 Sistema Master-Child corriendo exitosamente.")
+        asyncio.create_task(health_check_monitor())
+        print("🚀 Sistema Master-Child corriendo exitosamente con arquitectura separada (Grupo VIP Gratis / Canal VIP de Paga Estrellas).")
         await master_dp.start_polling(master_bot)
     finally:
         await master_bot.session.close()
