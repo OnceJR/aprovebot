@@ -31,12 +31,13 @@ MASTER_MONGO_URI = os.getenv("MONGO_URI", "mongodb+srv://carlosjrpelegrina_db_us
 PORT = int(os.environ.get("PORT", 8080))
 RENDER_URL = os.environ.get("RENDER_EXTERNAL_URL", "https://TU_DOMINIO.onrender.com")
 
-SUPER_ADMIN_IDS = [8983189714, 7501486397]
+SUPER_ADMIN_IDS = [8983189714, 7452819858]
 
 master_db_client = AsyncIOMotorClient(MASTER_MONGO_URI)
 master_db = master_db_client.saas_master_db
 active_bots_tasks = {} 
 master_dp = Dispatcher()
+MASTER_BOT_USERNAME = ""
 
 class CreateChildBot(StatesGroup):
     waiting_for_token = State()
@@ -467,7 +468,7 @@ async def handle_webapp(request):
 
 
 # =====================================================================
-# 3. CORE SAAS: FÁBRICA DE BOTS HIJOS (CON PRIVACIDAD, MANTENIMIENTO, BLACKLIST, VIP Y ESTRELLAS XTR)
+# 3. CORE SAAS: FÁBRICA DE BOTS HIJOS
 # =====================================================================
 def get_new_child_dp(child_config: dict, child_db) -> Dispatcher:
     dp = Dispatcher(storage=MemoryStorage())
@@ -817,8 +818,10 @@ def get_new_child_dp(child_config: dict, child_db) -> Dispatcher:
         btn_vol = "⬅️ Volver" if lang == "es" else "⬅️ Back"
         btn_buy_vip = "⭐ Comprar VIP 7 Días (Stars)" if lang == "es" else "⭐ Buy 7-Day VIP (Stars)"
         
+        master_pay_url = f"https://t.me/{MASTER_BOT_USERNAME}?start=paystars_{bot.id}"
+        
         inline_kb = [
-            [InlineKeyboardButton(text=btn_buy_vip, callback_data="buy_vip_stars")],
+            [InlineKeyboardButton(text=btn_buy_vip, url=master_pay_url)],
             [InlineKeyboardButton(text=btn_mod, callback_data="toggle_mode")]
         ]
         
@@ -850,62 +853,6 @@ def get_new_child_dp(child_config: dict, child_db) -> Dispatcher:
             txt = f"👤 **Your Profile**\n\n🆔 ID: `{uid}`\n🌟 Reputation: `{user.get('reputation', 0)}/20`\n👥 Referrals: `{user.get('referrals', 0)}/3`\n⭐ Stars VIP: **{vip_status_txt}**\n🎭 Mode: **{modo}**\n\n📦 Inventory: 📷 {fotos} | 🎥 {videos}"
             
         await callback.message.edit_text(txt, reply_markup=markup, parse_mode="Markdown")
-
-    @dp.callback_query(F.data == "buy_vip_stars")
-    async def buy_vip_stars(callback: CallbackQuery, bot: Bot):
-        user_id = callback.from_user.id
-        user = await get_user(user_id)
-        lang = user.get("lang", "es")
-        
-        title = "Pase VIP 7 Días (Canal de Paga)" if lang == "es" else "7-Day VIP Pass (Paid Channel)"
-        desc = "Obtén acceso exclusivo por 1 semana al canal VIP de pago mediante Telegram Stars." if lang == "es" else "Get 1 week exclusive access to the paid VIP channel using Telegram Stars."
-        
-        prices = [LabeledPrice(label="Pase VIP 7 Días", amount=100)]
-        
-        try:
-            await bot.send_invoice(
-                chat_id=user_id,
-                title=title,
-                description=desc,
-                payload="vip_pass_7d_payload",
-                currency="XTR",
-                prices=prices
-            )
-            await callback.answer()
-        except Exception as e:
-            logging.error(f"Error enviando factura de estrellas: {e}")
-            await callback.answer("❌ Error al procesar la factura de estrellas.", show_alert=True)
-
-    @dp.pre_checkout_query()
-    async def process_pre_checkout_query(pre_checkout_query: PreCheckoutQuery):
-        await pre_checkout_query.answer(ok=True)
-
-    @dp.message(F.successful_payment)
-    async def process_successful_payment(message: Message, bot: Bot):
-        user_id = message.from_user.id
-        payment = message.successful_payment
-        if payment.invoice_payload == "vip_pass_7d_payload":
-            user = await get_user(user_id)
-            lang = user.get("lang", "es")
-            now = time.time()
-            current_until = user.get("vip_until", 0)
-            base_time = max(now, current_until)
-            new_vip_until = base_time + (7 * 86400)
-            
-            await save_user(user_id, {"vip_until": new_vip_until, "paid_vip_active": True})
-            
-            if PAID_VIP_CHANNEL_ID:
-                try:
-                    invite = await bot.create_chat_invite_link(chat_id=PAID_VIP_CHANNEL_ID, member_limit=1, creates_join_request=False)
-                    btn = "💎 Entrar al Canal VIP de Paga" if lang == "es" else "💎 Enter Paid VIP Channel"
-                    markup = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=btn, url=invite.invite_link)]])
-                    link_msg = "🎉 **¡Pago con Estrellas exitoso!** Aquí tienes tu acceso exclusivo al canal VIP de pago:" if lang == "es" else "🎉 **Payment successful!** Here is your exclusive access to the paid VIP channel:"
-                    await bot.send_message(user_id, link_msg, reply_markup=markup, parse_mode="Markdown")
-                except Exception as ex:
-                    logging.error(f"Error creando invite link para canal pagado: {ex}")
-
-            succ_msg = "✅ Tu suscripción ha sido extendida por 7 días más." if lang == "es" else "✅ Your subscription has been extended by 7 days."
-            await message.answer(succ_msg, parse_mode="Markdown")
 
     @dp.callback_query(F.data == "toggle_mode")
     async def toggle_mode(callback: CallbackQuery, bot: Bot):
@@ -1424,11 +1371,40 @@ async def restore_bots():
     async for config in cursor: await start_child_bot(config)
 
 # =====================================================================
-# 5. HANDLERS DEL MASTER BOT (CONFIGURACIÓN DINÁMICA Y MANUAL)
+# 5. HANDLERS DEL MASTER BOT (PAGOS CENTRALIZADOS Y CONFIGURACIÓN)
 # =====================================================================
-@master_dp.message(F.text == "/start")
-async def cmd_start_master(message: Message, state: FSMContext):
-    if message.from_user.id not in SUPER_ADMIN_IDS: return
+@master_dp.message(CommandStart())
+async def cmd_start_master(message: Message, state: FSMContext, bot: Bot):
+    args = message.text.split(maxsplit=1)
+    
+    # Manejo del pago redirigido desde un Bot Hijo (Deep Link)
+    if len(args) > 1 and args[1].startswith("paystars_"):
+        target_bot_id_str = args[1].split("_")[1]
+        if target_bot_id_str.isdigit():
+            target_bot_id = int(target_bot_id_str)
+            
+            title = "Pase VIP 7 Días (Canal de Paga)"
+            desc = "Acceso exclusivo por 1 semana al canal VIP de pago procesado de forma centralizada por el Master."
+            prices = [LabeledPrice(label="Pase VIP 7 Días", amount=100)]
+            payload = f"vip_stars_{target_bot_id}_{message.from_user.id}"
+            
+            try:
+                await bot.send_invoice(
+                    chat_id=message.from_user.id,
+                    title=title,
+                    description=desc,
+                    payload=payload,
+                    currency="XTR",
+                    prices=prices
+                )
+                return
+            except Exception as e:
+                logging.error(f"Error generando factura en Master: {e}")
+                return await message.answer("❌ Ocurrió un error al generar la factura con Telegram Stars.")
+
+    if message.from_user.id not in SUPER_ADMIN_IDS: 
+        return await message.answer("👋 Bienvenido al servicio centralizado de pagos de la red.")
+
     await state.clear()
     markup = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🤖 Crear Nuevo Bot", callback_data="master_crear")],
@@ -1439,6 +1415,53 @@ async def cmd_start_master(message: Message, state: FSMContext):
         "Bienvenido al núcleo de gestión. Las funciones están protegidas y aisladas contra accesos no autorizados."
     )
     await message.answer(txt, reply_markup=markup, parse_mode="HTML")
+
+@master_dp.pre_checkout_query()
+async def process_master_pre_checkout(pre_checkout_query: PreCheckoutQuery):
+    await pre_checkout_query.answer(ok=True)
+
+@master_dp.message(F.successful_payment)
+async def process_master_successful_payment(message: Message, bot: Bot):
+    payment = message.successful_payment
+    payload = payment.invoice_payload
+    
+    if payload.startswith("vip_stars_"):
+        parts = payload.split("_")
+        target_bot_id = int(parts[2])
+        user_id = int(parts[3])
+        
+        child_info = active_bots_tasks.get(target_bot_id)
+        if not child_info:
+            return await message.answer("✅ Pago recibido con éxito. Por favor ponte en contacto con soporte si no recibes tu acceso.")
+
+        child_db = child_info["db"]
+        child_bot = child_info["bot"]
+        
+        config = await master_db.child_bots.find_one({"bot_token": child_bot.token})
+        paid_channel_id = int(config.get("paid_vip_channel_id", 0)) if config and config.get("paid_vip_channel_id") else 0
+        
+        user = await child_db.users.find_one({"_id": user_id}) or {}
+        now = time.time()
+        current_until = user.get("vip_until", 0)
+        base_time = max(now, current_until)
+        new_vip_until = base_time + (7 * 86400)
+        
+        await child_db.users.update_one(
+            {"_id": user_id}, 
+            {"$set": {"vip_until": new_vip_until, "paid_vip_active": True}}, 
+            upsert=True
+        )
+        
+        if paid_channel_id:
+            try:
+                invite = await child_bot.create_chat_invite_link(chat_id=paid_channel_id, member_limit=1, creates_join_request=False)
+                markup = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="💎 Entrar al Canal VIP de Paga", url=invite.invite_link)]])
+                await message.answer("🎉 <b>¡Pago con Estrellas confirmado!</b> Aquí tienes tu acceso exclusivo de 7 días al canal VIP:", reply_markup=markup, parse_mode="HTML")
+            except Exception as ex:
+                logging.error(f"Error generando invitación al canal VIP desde Master: {ex}")
+                await message.answer("🎉 <b>¡Pago confirmado!</b> Tu cuenta ha sido actualizada en la base de datos.")
+        else:
+            await message.answer("🎉 <b>¡Pago confirmado!</b> Tu tiempo VIP de 7 días ha sido registrado exitosamente.")
 
 @master_dp.callback_query(F.data == "master_crear")
 async def cb_crear_bot(callback: CallbackQuery, state: FSMContext):
@@ -1598,15 +1621,20 @@ async def web_server():
     return runner
 
 async def main():
+    global MASTER_BOT_USERNAME
     logging.basicConfig(level=logging.INFO)
     master_bot = Bot(token=MASTER_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
+    
+    me = await master_bot.get_me()
+    MASTER_BOT_USERNAME = me.username
+    
     runner = None
     try:
         runner = await web_server()
         await restore_bots()
         await master_bot.delete_webhook(drop_pending_updates=True)
         asyncio.create_task(health_check_monitor(master_bot))
-        print("🚀 Sistema Master-Child corriendo exitosamente con arquitectura totalmente corregida y optimizada.")
+        print(f"🚀 Sistema Master (@{MASTER_BOT_USERNAME}) corriendo exitosamente con pagos centralizados y arquitectura robusta.")
         await master_dp.start_polling(master_bot)
     finally:
         await master_bot.session.close()
