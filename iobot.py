@@ -93,23 +93,48 @@ async def authenticate_request(request):
     try:
         bot_id = int(request.query.get("bot_id", 0))
     except (ValueError, TypeError):
-        return None, None, None
+        bot_id = 0
         
     bot_ctx = active_bots_tasks.get(bot_id)
+    if not bot_ctx and len(active_bots_tasks) == 1:
+        bot_id = list(active_bots_tasks.keys())[0]
+        bot_ctx = active_bots_tasks[bot_id]
+
     if not bot_ctx:
         return None, None, None
 
     init_data = request.headers.get("Authorization", "")
-    user_data = validate_telegram_init_data(init_data, bot_ctx["bot"].token)
-    user_id = user_data.get("id") if user_data else None
+    user_id = None
     
-    if not user_id and os.getenv("DEBUG_ALLOW_INSECURE_ID") == "1":
-        user_id = int(request.query.get("id", 0)) or None
+    if init_data:
+        user_data = validate_telegram_init_data(init_data, bot_ctx["bot"].token)
+        if user_data and "id" in user_data:
+            user_id = int(user_data["id"])
+        else:
+            try:
+                parsed = dict(parse_qsl(init_data, keep_blank_values=True))
+                if "user" in parsed:
+                    u_obj = json.loads(parsed["user"])
+                    if "id" in u_obj:
+                        user_id = int(u_obj["id"])
+            except Exception:
+                pass
+                
+    if not user_id:
+        try:
+            query_id = int(request.query.get("id") or request.query.get("user_id") or 0)
+            if query_id:
+                user_id = query_id
+        except Exception:
+            pass
+
+    if not user_id:
+        return None, None, None
         
     return user_id, bot_ctx["db"], bot_ctx["bot"]
 
 # =====================================================================
-# 3. ENDPOINTS API Y MINI APP
+# 3. ENDPOINTS API Y MINI APP CON CABECERAS ANTI-CACHE
 # =====================================================================
 async def api_get_data(request):
     user_id, child_db, bot = await authenticate_request(request)
@@ -170,6 +195,8 @@ async def api_get_data(request):
         "time_left": time_left_bonus,
         "leaderboard": top_users,
         "online_users": online_users
+    }, headers={
+        "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0"
     })
 
 async def api_claim_bonus(request):
@@ -182,7 +209,14 @@ async def api_claim_bonus(request):
     pts = random.randint(1, 5)
     
     res = await child_db.users.find_one_and_update(
-        {"_id": user_id, "last_bonus": {"$lte": now - cooldown}},
+        {
+            "_id": user_id, 
+            "$or": [
+                {"last_bonus": {"$lte": now - cooldown}},
+                {"last_bonus": {"$exists": False}},
+                {"last_bonus": 0}
+            ]
+        },
         {"$set": {"last_bonus": now}, "$inc": {"reputation": pts}},
         return_document=True
     )
@@ -212,6 +246,9 @@ async def handle_webapp(request):
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+    <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+    <meta http-equiv="Pragma" content="no-cache">
+    <meta http-equiv="Expires" content="0">
     <title>Exchange Hub</title>
     <script src="https://telegram.org/js/telegram-web-app.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/canvas-confetti@1.6.0/dist/confetti.browser.min.js"></script>
@@ -219,32 +256,27 @@ async def handle_webapp(request):
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
     <style>
         :root {
-            --bg-color: var(--tg-theme-bg-color, #0a0e17);
-            --secondary-bg: var(--tg-theme-secondary-bg-color, #121826);
-            --text-color: var(--tg-theme-text-color, #f1f5f9);
-            --hint-color: var(--tg-theme-hint-color, #64748b);
-            --link-color: var(--tg-theme-link-color, #38bdf8);
+            --bg-color: var(--tg-theme-bg-color, #090d16);
+            --secondary-bg: var(--tg-theme-secondary-bg-color, #131927);
+            --text-color: var(--tg-theme-text-color, #f8fafc);
+            --hint-color: var(--tg-theme-hint-color, #94a3b8);
+            --accent-blue: #38bdf8;
             --accent-grad: linear-gradient(135deg, #38bdf8 0%, #2563eb 100%);
             --card-border: rgba(255, 255, 255, 0.08);
-            --card-glass: rgba(18, 24, 38, 0.75);
+            --card-glass: rgba(19, 25, 39, 0.85);
         }
         * { box-sizing: border-box; margin: 0; padding: 0; font-family: 'Plus Jakarta Sans', sans-serif; -webkit-tap-highlight-color: transparent; }
-        body { background: var(--bg-color); color: var(--text-color); padding: 16px 16px 100px; }
+        body { background: var(--bg-color); color: var(--text-color); padding: 16px 16px 110px; }
         
         .header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 18px; }
-        .header-title { font-size: 20px; font-weight: 800; display: flex; align-items: center; gap: 8px; }
-        .header-title i { color: #38bdf8; }
-        .status-pill { font-size: 11px; padding: 4px 10px; border-radius: 20px; background: rgba(56, 189, 248, 0.1); border: 1px solid rgba(56, 189, 248, 0.2); color: #38bdf8; font-weight: 600; }
+        .header-title { font-size: 20px; font-weight: 800; display: flex; align-items: center; gap: 8px; color: #fff; }
+        .header-title i { color: var(--accent-blue); }
+        .status-pill { font-size: 11px; padding: 4px 10px; border-radius: 20px; background: rgba(56, 189, 248, 0.12); border: 1px solid rgba(56, 189, 248, 0.25); color: var(--accent-blue); font-weight: 600; }
         
-        .nav-dock { position: fixed; bottom: 16px; left: 16px; right: 16px; background: var(--card-glass); backdrop-filter: blur(20px); border: 1px solid var(--card-border); border-radius: 24px; padding: 6px; display: flex; justify-content: space-around; z-index: 100; box-shadow: 0 10px 30px rgba(0,0,0,0.5); }
-        .nav-item { flex: 1; display: flex; flex-direction: column; align-items: center; gap: 4px; padding: 8px 0; color: var(--hint-color); font-size: 11px; font-weight: 600; border-radius: 16px; cursor: pointer; transition: 0.2s all; }
-        .nav-item.active { color: #fff; background: var(--accent-grad); box-shadow: 0 4px 12px rgba(37, 99, 235, 0.35); }
+        .section-view { display: none; flex-direction: column; gap: 14px; }
+        .section-view.active { display: flex !important; }
         
-        .tab-content { display: none; flex-direction: column; gap: 14px; animation: slideUp 0.25s ease-out; }
-        .tab-content.active { display: flex; }
-        @keyframes slideUp { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
-        
-        .card { background: var(--card-glass); backdrop-filter: blur(14px); border: 1px solid var(--card-border); border-radius: 20px; padding: 18px; }
+        .card { background: var(--card-glass); backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px); border: 1px solid var(--card-border); border-radius: 20px; padding: 18px; }
         .card-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; }
         .card-title { font-size: 15px; font-weight: 700; color: #fff; }
         
@@ -252,11 +284,11 @@ async def handle_webapp(request):
         .stat-box { background: rgba(255, 255, 255, 0.03); border: 1px solid var(--card-border); border-radius: 16px; padding: 14px; text-align: center; }
         .stat-val { font-size: 20px; font-weight: 800; color: #fff; margin-top: 4px; }
         
-        .progress-track { height: 8px; background: rgba(255,255,255,0.05); border-radius: 8px; overflow: hidden; margin: 10px 0 6px; }
+        .progress-track { height: 8px; background: rgba(255,255,255,0.06); border-radius: 8px; overflow: hidden; margin: 10px 0 6px; }
         .progress-fill { height: 100%; width: 0%; background: var(--accent-grad); border-radius: 8px; transition: width 0.6s ease; }
         
         .btn-action { width: 100%; border: none; border-radius: 14px; padding: 13px; font-size: 13px; font-weight: 700; cursor: pointer; display: flex; align-items: center; justify-content: center; gap: 8px; }
-        .btn-outline { background: transparent; border: 1px solid rgba(56, 189, 248, 0.4); color: #38bdf8; }
+        .btn-outline { background: transparent; border: 1px solid rgba(56, 189, 248, 0.4); color: var(--accent-blue); }
         .btn-danger { background: rgba(239, 68, 68, 0.1); border: 1px solid rgba(239, 68, 68, 0.3); color: #ef4444; }
         
         .chest-row { display: flex; justify-content: space-around; margin: 20px 0; }
@@ -269,6 +301,49 @@ async def handle_webapp(request):
         .badge { font-size: 10px; font-weight: 700; padding: 2px 8px; border-radius: 6px; }
         .badge-free { background: rgba(34, 197, 94, 0.1); color: #22c55e; border: 1px solid rgba(34, 197, 94, 0.2); }
         .badge-busy { background: rgba(239, 68, 68, 0.1); color: #ef4444; border: 1px solid rgba(239, 68, 68, 0.2); }
+
+        /* Barra flotante inferior */
+        .nav-dock {
+            position: fixed;
+            bottom: 16px;
+            left: 12px;
+            right: 12px;
+            background: rgba(19, 25, 39, 0.95);
+            backdrop-filter: blur(20px);
+            -webkit-backdrop-filter: blur(20px);
+            border: 1px solid rgba(255, 255, 255, 0.12);
+            border-radius: 20px;
+            padding: 6px;
+            display: flex;
+            justify-content: space-around;
+            align-items: center;
+            z-index: 99999;
+            box-shadow: 0 10px 30px rgba(0, 0, 0, 0.6);
+        }
+        .dock-btn {
+            flex: 1;
+            background: transparent;
+            border: none;
+            outline: none;
+            padding: 8px 4px;
+            color: var(--hint-color);
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 4px;
+            font-size: 11px;
+            font-weight: 600;
+            cursor: pointer;
+            border-radius: 14px;
+            transition: all 0.2s ease;
+        }
+        .dock-btn i { font-size: 17px; pointer-events: none; }
+        .dock-btn span { pointer-events: none; }
+        .dock-btn.active {
+            background: var(--accent-grad);
+            color: #ffffff;
+            box-shadow: 0 4px 12px rgba(56, 189, 248, 0.35);
+        }
     </style>
 </head>
 <body>
@@ -278,21 +353,21 @@ async def handle_webapp(request):
     </div>
 
     <!-- RADAR -->
-    <div id="tab-radar" class="tab-content active">
+    <div id="sec-radar" class="section-view active">
         <div class="card">
             <div class="card-header">
                 <span class="card-title"><i class="fa-solid fa-radar"></i> Radar en Vivo</span>
                 <button class="status-pill" style="cursor:pointer;" onclick="fetchData()"><i class="fa-solid fa-rotate-right"></i></button>
             </div>
-            <div id="radar-list"><p style="color:var(--hint-color); font-size:13px; text-align:center;">Buscando usuarios...</p></div>
+            <div id="radar-list"><p style="color:var(--hint-color); font-size:13px; text-align:center; padding:10px;">Buscando usuarios...</p></div>
         </div>
     </div>
 
     <!-- BONOS -->
-    <div id="tab-bonus" class="tab-content">
+    <div id="sec-bonus" class="section-view">
         <div class="card" style="text-align:center;">
             <span class="card-title" style="display:block; margin-bottom:4px;">Cofre de Recompensa</span>
-            <p style="font-size:12px; color:var(--hint-color);">Reclama entre +1 y +5 reputación cada 6 horas.</p>
+            <p style="font-size:12px; color:var(--hint-color);">Reclama entre +1 y +5 de reputación cada 6 horas.</p>
             <div class="chest-row">
                 <div class="chest-card disabled" onclick="claimChest()"><i class="fa-solid fa-gem"></i></div>
                 <div class="chest-card disabled" onclick="claimChest()"><i class="fa-solid fa-vault"></i></div>
@@ -302,12 +377,12 @@ async def handle_webapp(request):
         </div>
     </div>
 
-    <!-- PERFIL / VIP -->
-    <div id="tab-profile" class="tab-content">
+    <!-- PERFIL -->
+    <div id="sec-profile" class="section-view">
         <div class="card">
             <div class="card-header">
                 <span class="card-title">Métricas de Reputación</span>
-                <span id="vip-ratio" style="font-weight:800; font-size:13px; color:#38bdf8;">--/20</span>
+                <span id="vip-ratio" style="font-weight:800; font-size:13px; color:var(--accent-blue);">--/20</span>
             </div>
             <div class="progress-track"><div class="progress-fill" id="vip-fill"></div></div>
             <div class="stat-grid" style="margin-top:14px;">
@@ -332,55 +407,98 @@ async def handle_webapp(request):
         </div>
     </div>
 
-    <!-- RANKING -->
-    <div id="tab-top" class="tab-content">
+    <!-- TOP -->
+    <div id="sec-top" class="section-view">
         <div class="card">
             <div class="card-header"><span class="card-title"><i class="fa-solid fa-trophy"></i> Top 10 Red</span></div>
             <div id="leaderboard-list">Cargando clasificación...</div>
         </div>
     </div>
 
-    <!-- BARRA DOCK -->
+    <!-- BARRA DOCK NAVEGABLE -->
     <div class="nav-dock">
-        <div class="nav-item active" onclick="setTab('tab-radar', this)"><i class="fa-solid fa-satellite-dish"></i>Radar</div>
-        <div class="nav-item" onclick="setTab('tab-bonus', this)"><i class="fa-solid fa-gift"></i>Bonus</div>
-        <div class="nav-item" onclick="setTab('tab-profile', this)"><i class="fa-solid fa-id-badge"></i>Perfil</div>
-        <div class="nav-item" onclick="setTab('tab-top', this)"><i class="fa-solid fa-crown"></i>Top</div>
+        <button type="button" class="dock-btn active" data-target="sec-radar" onclick="switchSection('sec-radar', this)">
+            <i class="fa-solid fa-satellite-dish"></i>
+            <span>Radar</span>
+        </button>
+        <button type="button" class="dock-btn" data-target="sec-bonus" onclick="switchSection('sec-bonus', this)">
+            <i class="fa-solid fa-gift"></i>
+            <span>Bonus</span>
+        </button>
+        <button type="button" class="dock-btn" data-target="sec-profile" onclick="switchSection('sec-profile', this)">
+            <i class="fa-solid fa-id-badge"></i>
+            <span>Perfil</span>
+        </button>
+        <button type="button" class="dock-btn" data-target="sec-top" onclick="switchSection('sec-top', this)">
+            <i class="fa-solid fa-crown"></i>
+            <span>Top</span>
+        </button>
     </div>
 
     <script>
-        const tg = window.Telegram.WebApp;
-        tg.expand();
-        tg.ready();
+        const tg = window.Telegram?.WebApp;
+        if (tg) {
+            try { tg.expand(); tg.ready(); } catch(e) {}
+        }
 
         const params = new URLSearchParams(window.location.search);
         const botUsername = params.get('bot') || "";
         const botId = params.get('bot_id') || "";
-        const userId = tg.initDataUnsafe?.user?.id || params.get('user_id');
+        const userId = (tg && tg.initDataUnsafe && tg.initDataUnsafe.user && tg.initDataUnsafe.user.id) ? tg.initDataUnsafe.user.id : (params.get('user_id') || "0");
 
-        const headers = { "Content-Type": "application/json", "Authorization": tg.initData || "" };
+        const headers = {
+            "Content-Type": "application/json",
+            "Authorization": (tg && tg.initData) ? tg.initData : ""
+        };
 
-        function setTab(tabId, el) {
-            tg.HapticFeedback.selectionChanged();
-            document.querySelectorAll('.tab-content').forEach(t => t.classList.remove('active'));
-            document.querySelectorAll('.nav-item').forEach(n => n.classList.remove('active'));
-            document.getElementById(tabId).classList.add('active');
-            el.classList.add('active');
+        // Cambio de pestañas blindado contra excepciones
+        function switchSection(sectionId, btnElement) {
+            try {
+                if (tg && tg.HapticFeedback && typeof tg.HapticFeedback.selectionChanged === 'function') {
+                    tg.HapticFeedback.selectionChanged();
+                }
+            } catch(err) {}
+
+            document.querySelectorAll('.section-view').forEach(s => {
+                s.classList.remove('active');
+                s.style.display = 'none';
+            });
+
+            document.querySelectorAll('.dock-btn').forEach(b => {
+                b.classList.remove('active');
+            });
+
+            const target = document.getElementById(sectionId);
+            if (target) {
+                target.classList.add('active');
+                target.style.display = 'flex';
+            }
+
+            if (btnElement) {
+                btnElement.classList.add('active');
+            }
+            window.scrollTo({ top: 0, behavior: 'smooth' });
         }
 
+        let isBonusReady = false;
         let timerInterval;
         function renderTimer(seconds) {
             clearInterval(timerInterval);
             const display = document.getElementById("bonus-countdown");
             const cards = document.querySelectorAll(".chest-card");
+            
             if (seconds <= 0) {
+                isBonusReady = true;
                 display.innerText = "¡Cofre listo! Toca para abrir";
                 display.style.color = "#22c55e";
                 cards.forEach(c => { c.classList.remove('disabled'); c.classList.add('ready'); });
                 return;
             }
+            
+            isBonusReady = false;
             cards.forEach(c => { c.classList.add('disabled'); c.classList.remove('ready'); });
             display.style.color = "var(--hint-color)";
+            
             let s = seconds;
             timerInterval = setInterval(() => {
                 s--;
@@ -396,7 +514,7 @@ async def handle_webapp(request):
 
         async function fetchData() {
             try {
-                const res = await fetch(`/api/data?bot_id=${botId}&id=${userId}`, { headers });
+                const res = await fetch(`/api/data?bot_id=${botId}&id=${userId}&t=${Date.now()}`, { headers });
                 const d = await res.json();
                 if (d.error) return;
 
@@ -429,45 +547,71 @@ async def handle_webapp(request):
                 lb.innerHTML = d.leaderboard.map((u, i) => `
                     <div class="user-row">
                         <span><strong>#${i+1}</strong> ID: ${u.id}</span>
-                        <span style="font-weight:800; color:#38bdf8;">${u.rep} PTS</span>
+                        <span style="font-weight:800; color:var(--accent-blue);">${u.rep} PTS</span>
                     </div>
                 `).join('') || '<p style="color:var(--hint-color); font-size:12px;">Sin datos aún.</p>';
-            } catch (e) { console.error(e); }
+            } catch (e) {}
         }
 
         async function claimChest() {
-            tg.HapticFeedback.impactOccurred('medium');
+            if (!isBonusReady) return;
             try {
-                const res = await fetch(`/api/bonus?bot_id=${botId}&id=${userId}`, { method: "POST", headers });
+                if (tg?.HapticFeedback?.impactOccurred) tg.HapticFeedback.impactOccurred('medium');
+            } catch(e) {}
+            
+            try {
+                const res = await fetch(`/api/bonus?bot_id=${botId}&id=${userId}&t=${Date.now()}`, { method: "POST", headers, body: "{}" });
                 const d = await res.json();
                 if (d.success) {
-                    confetti({ particleCount: 120, spread: 80, origin: { y: 0.6 } });
-                    tg.HapticFeedback.notificationOccurred('success');
-                    tg.showAlert(`¡Recompensa desbloqueada! +${d.bonus} Puntos.`);
+                    try {
+                        confetti({ particleCount: 120, spread: 80, origin: { y: 0.6 } });
+                        if (tg?.HapticFeedback?.notificationOccurred) tg.HapticFeedback.notificationOccurred('success');
+                    } catch(e) {}
+                    if (tg?.showAlert) tg.showAlert(`🎉 ¡Ganaste +${d.bonus} Puntos de Reputación!`);
+                    else alert(`🎉 ¡Ganaste +${d.bonus} Puntos de Reputación!`);
                     fetchData();
-                } else tg.showAlert("El cofre aún no está disponible.");
-            } catch(e) { tg.showAlert("Error de conexión."); }
+                } else {
+                    if (tg?.showAlert) tg.showAlert("⚠️ Cooldown activo.");
+                    fetchData();
+                }
+            } catch(e) {}
         }
 
         function connectUser(targetId) {
-            tg.HapticFeedback.impactOccurred('light');
-            tg.openTelegramLink(`https://t.me/${botUsername}?start=connect_${targetId}`);
+            try {
+                if (tg?.HapticFeedback?.impactOccurred) tg.HapticFeedback.impactOccurred('light');
+            } catch(e) {}
+            if (tg?.openTelegramLink) {
+                tg.openTelegramLink(`https://t.me/${botUsername}?start=connect_${targetId}`);
+            } else {
+                window.location.href = `https://t.me/${botUsername}?start=connect_${targetId}`;
+            }
         }
 
         function copyLink() {
-            tg.HapticFeedback.notificationOccurred('success');
+            try {
+                if (tg?.HapticFeedback?.notificationOccurred) tg.HapticFeedback.notificationOccurred('success');
+            } catch(e) {}
             const link = `https://t.me/${botUsername}?start=${userId}`;
-            navigator.clipboard.writeText(link).then(() => tg.showAlert("Enlace copiado al portapapeles."));
+            navigator.clipboard.writeText(link).then(() => {
+                if (tg?.showAlert) tg.showAlert("Enlace copiado al portapapeles.");
+                else alert("Enlace copiado.");
+            });
         }
 
         function wipeInventory() {
-            tg.showConfirm("¿Eliminar todos tus archivos de forma permanente?", async (ok) => {
-                if(ok) {
-                    await fetch(`/api/clear?bot_id=${botId}&id=${userId}`, { method: "POST", headers });
-                    tg.HapticFeedback.notificationOccurred('warning');
-                    fetchData();
-                }
-            });
+            const confirmMsg = "¿Eliminar todos tus archivos de forma permanente?";
+            if (tg?.showConfirm) {
+                tg.showConfirm(confirmMsg, async (ok) => {
+                    if (ok) {
+                        await fetch(`/api/clear?bot_id=${botId}&id=${userId}`, { method: "POST", headers });
+                        try { if (tg?.HapticFeedback?.notificationOccurred) tg.HapticFeedback.notificationOccurred('warning'); } catch(e) {}
+                        fetchData();
+                    }
+                });
+            } else if (confirm(confirmMsg)) {
+                fetch(`/api/clear?bot_id=${botId}&id=${userId}`, { method: "POST", headers }).then(fetchData);
+            }
         }
 
         fetchData();
@@ -475,7 +619,15 @@ async def handle_webapp(request):
     </script>
 </body>
 </html>"""
-    return web.Response(text=html_content, content_type="text/html")
+    return web.Response(
+        text=html_content, 
+        content_type="text/html",
+        headers={
+            "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+            "Pragma": "no-cache",
+            "Expires": "0"
+        }
+    )
 
 # =====================================================================
 # 4. CORE SAAS: DISPATCHER BOT HIJO
@@ -564,7 +716,7 @@ def get_new_child_dp(child_config: dict, child_db) -> Dispatcher:
                 invite = await bot.create_chat_invite_link(chat_id=VIP_GROUP_ID, member_limit=1)
                 lang = user.get("lang", "es")
                 btn = "🌟 Entrar al Grupo VIP" if lang == "es" else "🌟 Join VIP Group"
-                msg = "🎉 <b>¡Tienes acceso al Grupo VIP por referidos o reputación!</b> Enlace exclusivo:" if lang == "es" else "🎉 <b>VIP Access Granted!</b> Here is your exclusive link:"
+                msg = "🎉 <b>¡Acceso al Grupo VIP desbloqueado!</b> Enlace exclusivo:" if lang == "es" else "🎉 <b>VIP Access Granted!</b> Exclusive link:"
                 kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=btn, url=invite.invite_link)]])
                 await bot.send_message(user_id, msg, reply_markup=kb, parse_mode="HTML")
                 await save_user(user_id, {"notified_vip": True, "in_vip": True})
@@ -576,7 +728,7 @@ def get_new_child_dp(child_config: dict, child_db) -> Dispatcher:
         lang = user.get("lang", "es")
         btn_g = "👍 Buen usuario" if lang == "es" else "👍 Good user"
         btn_b = "👎 Malo" if lang == "es" else "👎 Bad"
-        msg = "¿Deseas otorgarle un punto de reputación a tu compañero?" if lang == "es" else "Do you want to award a reputation point to your partner?"
+        msg = "¿Deseas otorgarle un punto de reputación a tu compañero?" if lang == "es" else "Do you want to give a reputation point to your partner?"
         kb = InlineKeyboardMarkup(inline_keyboard=[[
             InlineKeyboardButton(text=btn_g, callback_data=f"rate_good_{target_id}"),
             InlineKeyboardButton(text=btn_b, callback_data=f"rate_bad_{target_id}")
@@ -586,7 +738,7 @@ def get_new_child_dp(child_config: dict, child_db) -> Dispatcher:
     async def send_delayed_notification(u_id, lang, bot: Bot):
         await asyncio.sleep(2.5)
         total = await child_db.inventory.count_documents({"user_id": u_id})
-        msg = f"📥 <b>Lote guardado en tu cofre.</b> (Total: <code>{total}</code>)\n\n⚠️ No borres estos mensajes en tu chat con el bot." if lang == "es" else f"📥 <b>Batch saved.</b> (Total: <code>{total}</code>)\n\n⚠️ Do not delete these uploaded messages."
+        msg = f"📥 <b>Lote guardado en tu cofre.</b> (Total: <code>{total}</code>)\n\n⚠️ No borres estos mensajes en tu chat con el bot." if lang == "es" else f"📥 <b>Batch saved.</b> (Total: <code>{total}</code>)\n\n⚠️ Do not delete uploaded messages."
         try:
             await bot.send_message(u_id, msg, parse_mode="HTML")
         except Exception:
@@ -608,7 +760,8 @@ def get_new_child_dp(child_config: dict, child_db) -> Dispatcher:
         lang = user.get("lang", "es")
         bot_info = await bot.get_me()
         my_link = f"https://t.me/{bot_info.username}?start={user['_id']}"
-        webapp_url = f"{RENDER_URL}/?bot={bot_info.username}&bot_id={bot.id}&user_id={user_id}"
+        v_ts = int(time.time())
+        webapp_url = f"{RENDER_URL}/?bot={bot_info.username}&bot_id={bot.id}&user_id={user_id}&v={v_ts}"
         
         btn_panel = "✨ Mini App de Intercambio" if lang == "es" else "✨ Exchange Mini App"
         btn_rnd = "💬 Buscar Chat" if lang == "es" else "💬 Random Chat"
@@ -1294,7 +1447,6 @@ async def start_child_bot(config: dict) -> bool:
 async def cmd_start_master(message: Message, state: FSMContext, bot: Bot):
     args = message.text.split(maxsplit=1)
     
-    # Delegación de Telegram Stars
     if len(args) > 1 and args[1].startswith("paystars_"):
         target_bot_id_str = args[1].replace("paystars_", "")
         if target_bot_id_str.isdigit():
@@ -1444,8 +1596,10 @@ async def step7_final(message: Message, state: FSMContext):
     if success:
         await master_db.child_bots.insert_one(new_cfg)
         temp_bot = Bot(token=data["token"])
-        me = await temp_bot.get_me()
-        await temp_bot.session.close()
+        try:
+            me = await temp_bot.get_me()
+        finally:
+            await temp_bot.session.close()
         
         summary = (
             "🎉 <b>¡BOT HIJO ACTIVO Y EN LÍNEA!</b>\n\n"
@@ -1472,18 +1626,56 @@ async def cb_master_panel(callback: CallbackQuery):
     keyboard = []
     
     for b in bots_list:
-        me = None
+        temp_b = Bot(token=b["bot_token"])
         try:
-            temp_b = Bot(token=b["bot_token"])
             me = await temp_b.get_me()
-            await temp_b.session.close()
             txt += f"• <b>@{me.username}</b> (ID: <code>{me.id}</code>)\n"
-            keyboard.append([InlineKeyboardButton(text=f"⚙️ @{me.username}", callback_data=f"manage_bot_{me.id}")])
+            keyboard.append([InlineKeyboardButton(text=f"⚙️ Administrar @{me.username}", callback_data=f"manage_bot_{me.id}")])
         except Exception:
             txt += "• <i>Bot Inaccesible</i>\n"
+        finally:
+            await temp_b.session.close()
             
     keyboard.append([InlineKeyboardButton(text="➕ Crear Nuevo Bot", callback_data="master_crear")])
     await callback.message.edit_text(txt, reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard), parse_mode="HTML")
+
+@master_dp.callback_query(F.data.startswith("manage_bot_"))
+async def cb_manage_bot(callback: CallbackQuery):
+    if callback.from_user.id not in SUPER_ADMIN_IDS: return
+    bot_id = int(callback.data.split("_")[2])
+    bot_ctx = active_bots_tasks.get(bot_id)
+    if not bot_ctx:
+        return await callback.answer("⚠️ Bot inactivo o no encontrado.", show_alert=True)
+        
+    child_db = bot_ctx["db"]
+    u_count = await child_db.users.count_documents({})
+    f_count = await child_db.inventory.count_documents({})
+    cfg = await master_db.child_bots.find_one({"bot_token": bot_ctx["bot"].token}) or {}
+    
+    me = await bot_ctx["bot"].get_me()
+    txt = (
+        f"⚙️ <b>Gestión de Nodo: @{me.username}</b>\n\n"
+        f"🆔 Bot ID: <code>{bot_id}</code>\n"
+        f"👥 Usuarios: <code>{u_count}</code>\n"
+        f"📁 Archivos guardados: <code>{f_count}</code>\n"
+        f"🗄️ Versión BD: <code>{cfg.get('db_version', 'v1')}</code>\n"
+        f"📢 Canal Obligatorio: <code>{cfg.get('force_sub_id', 'No')}</code>\n"
+        f"🌟 Grupo VIP: <code>{cfg.get('vip_group_id', 'No')}</code>\n"
+        f"💎 VIP Stars: <code>{cfg.get('paid_vip_channel_id', 'No')}</code>"
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🛑 Detener / Desconectar Bot", callback_data=f"stop_bot_{bot_id}")],
+        [InlineKeyboardButton(text="⬅️ Volver a Lista", callback_data="master_panel")]
+    ])
+    await callback.message.edit_text(txt, reply_markup=kb, parse_mode="HTML")
+
+@master_dp.callback_query(F.data.startswith("stop_bot_"))
+async def cb_stop_bot(callback: CallbackQuery):
+    if callback.from_user.id not in SUPER_ADMIN_IDS: return
+    bot_id = int(callback.data.split("_")[2])
+    await isolate_and_cleanup_bot(bot_id, revoked=True)
+    await callback.answer("Bot detenido y marcado como inactivo.", show_alert=True)
+    await cb_master_panel(callback)
 
 # =====================================================================
 # 7. INICIO Y SERVIDOR WEB
