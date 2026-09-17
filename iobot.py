@@ -26,12 +26,22 @@ from aiogram.types import (
 )
 
 # =====================================================================
-# 1. CONFIGURACIÓN DEL PANEL MASTER Y VARIABLES
+# 1. CONFIGURACIÓN DEL PANEL MASTER Y SEGURIDAD
 # =====================================================================
-MASTER_TOKEN = os.getenv("MASTER_TOKEN", "")
-MASTER_MONGO_URI = os.getenv("MONGO_URI", "")
+MASTER_TOKEN = os.getenv("MASTER_TOKEN", "").strip()
+MASTER_MONGO_URI = os.getenv("MONGO_URI", "").strip()
 PORT = int(os.environ.get("PORT", 8080))
 RENDER_URL = os.environ.get("RENDER_EXTERNAL_URL", "https://tu-dominio.onrender.com").rstrip('/')
+
+if not MASTER_MONGO_URI:
+    raise RuntimeError(
+        "❌ ERROR CRÍTICO: La variable 'MONGO_URI' está vacía o no existe en las variables de entorno."
+    )
+
+if not MASTER_TOKEN:
+    raise RuntimeError(
+        "❌ ERROR CRÍTICO: La variable 'MASTER_TOKEN' no está configurada."
+    )
 
 raw_admins = os.getenv("SUPER_ADMINS", "8983189714,7452819858")
 SUPER_ADMIN_IDS = [int(i.strip()) for i in raw_admins.split(",") if i.strip().isdigit()]
@@ -134,7 +144,7 @@ async def authenticate_request(request):
     return user_id, bot_ctx["db"], bot_ctx["bot"]
 
 # =====================================================================
-# 3. ENDPOINTS API Y MINI APP CON CABECERAS ANTI-CACHE
+# 3. ENDPOINTS API Y MINI APP
 # =====================================================================
 async def api_get_data(request):
     user_id, child_db, bot = await authenticate_request(request)
@@ -302,7 +312,6 @@ async def handle_webapp(request):
         .badge-free { background: rgba(34, 197, 94, 0.1); color: #22c55e; border: 1px solid rgba(34, 197, 94, 0.2); }
         .badge-busy { background: rgba(239, 68, 68, 0.1); color: #ef4444; border: 1px solid rgba(239, 68, 68, 0.2); }
 
-        /* Barra flotante inferior */
         .nav-dock {
             position: fixed;
             bottom: 16px;
@@ -451,7 +460,6 @@ async def handle_webapp(request):
             "Authorization": (tg && tg.initData) ? tg.initData : ""
         };
 
-        // Cambio de pestañas blindado contra excepciones
         function switchSection(sectionId, btnElement) {
             try {
                 if (tg && tg.HapticFeedback && typeof tg.HapticFeedback.selectionChanged === 'function') {
@@ -728,7 +736,7 @@ def get_new_child_dp(child_config: dict, child_db) -> Dispatcher:
         lang = user.get("lang", "es")
         btn_g = "👍 Buen usuario" if lang == "es" else "👍 Good user"
         btn_b = "👎 Malo" if lang == "es" else "👎 Bad"
-        msg = "¿Deseas otorgarle un punto de reputación a tu compañero?" if lang == "es" else "Do you want to give a reputation point to your partner?"
+        msg = "¿Deseas otorgarle un punto de reputación extra a tu compañero?" if lang == "es" else "Do you want to give a bonus reputation point to your partner?"
         kb = InlineKeyboardMarkup(inline_keyboard=[[
             InlineKeyboardButton(text=btn_g, callback_data=f"rate_good_{target_id}"),
             InlineKeyboardButton(text=btn_b, callback_data=f"rate_bad_{target_id}")
@@ -738,13 +746,36 @@ def get_new_child_dp(child_config: dict, child_db) -> Dispatcher:
     async def send_delayed_notification(u_id, lang, bot: Bot):
         await asyncio.sleep(2.5)
         total = await child_db.inventory.count_documents({"user_id": u_id})
-        msg = f"📥 <b>Lote guardado en tu cofre.</b> (Total: <code>{total}</code>)\n\n⚠️ No borres estos mensajes en tu chat con el bot." if lang == "es" else f"📥 <b>Batch saved.</b> (Total: <code>{total}</code>)\n\n⚠️ Do not delete uploaded messages."
+        msg = (
+            f"📥 <b>Lote guardado en tu cofre.</b> (Total en inventario: <code>{total}</code>)\n\n"
+            f"⚠️ <b>IMPORTANTE:</b> ¡No elimines los mensajes que acabas de subir aquí! Si los borras del chat, el bot no podrá reenviarlos y tus intercambios fallarán."
+            if lang == "es" else
+            f"📥 <b>Batch saved to your vault.</b> (Total in inventory: <code>{total}</code>)\n\n"
+            f"⚠️ <b>IMPORTANT:</b> Do not delete uploaded messages from this chat! If deleted, the bot cannot forward them and your trades will fail."
+        )
         try:
             await bot.send_message(u_id, msg, parse_mode="HTML")
         except Exception:
             pass
         finally:
             pending_notifications.pop(u_id, None)
+
+    # Cálculo preciso de archivos totales vs únicos con respecto al compañero
+    async def get_inventory_stats_for_trade(sender_id: int, receiver_id: int, category: str = "mixed"):
+        total_query = {"user_id": sender_id}
+        if category != "mixed":
+            total_query["type"] = category
+        total_count = await child_db.inventory.count_documents(total_query)
+
+        already_sent = [doc["file_unique_id"] async for doc in child_db.exchange_history.find(
+            {"sender_id": sender_id, "receiver_id": receiver_id}, {"file_unique_id": 1}
+        )]
+        
+        unique_query = {"user_id": sender_id, "file_unique_id": {"$nin": already_sent}}
+        if category != "mixed":
+            unique_query["type"] = category
+        unique_count = await child_db.inventory.count_documents(unique_query)
+        return total_count, unique_count
 
     async def get_random_batch(sender_id: int, receiver_id: int, category: str, amount: int):
         already_sent = [doc["file_unique_id"] async for doc in child_db.exchange_history.find({"sender_id": sender_id, "receiver_id": receiver_id}, {"file_unique_id": 1})]
@@ -766,6 +797,7 @@ def get_new_child_dp(child_config: dict, child_db) -> Dispatcher:
         btn_panel = "✨ Mini App de Intercambio" if lang == "es" else "✨ Exchange Mini App"
         btn_rnd = "💬 Buscar Chat" if lang == "es" else "💬 Random Chat"
         btn_id = "🆔 Conectar ID" if lang == "es" else "🆔 Connect ID"
+        btn_manual = "📖 Manual de Uso" if lang == "es" else "📖 User Guide"
         btn_prof = "👤 Mi Perfil" if lang == "es" else "👤 My Profile"
         btn_lang = "⚙️ Idioma / Lang"
         btn_share = "🔗 Compartir Link" if lang == "es" else "🔗 Share Link"
@@ -773,20 +805,82 @@ def get_new_child_dp(child_config: dict, child_db) -> Dispatcher:
         kb = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text=btn_panel, web_app=WebAppInfo(url=webapp_url))],
             [InlineKeyboardButton(text=btn_rnd, callback_data="find_chat"), InlineKeyboardButton(text=btn_id, callback_data="connect_id")],
-            [InlineKeyboardButton(text=btn_prof, callback_data="my_profile"), InlineKeyboardButton(text=btn_lang, callback_data="change_lang")],
-            [InlineKeyboardButton(text=btn_share, url=f"https://t.me/share/url?url={my_link}")]
+            [InlineKeyboardButton(text=btn_manual, callback_data="show_manual"), InlineKeyboardButton(text=btn_prof, callback_data="my_profile")],
+            [InlineKeyboardButton(text=btn_lang, callback_data="change_lang"), InlineKeyboardButton(text=btn_share, url=f"https://t.me/share/url?url={my_link}")]
         ])
 
         txt = (
-            "👋 <b>Bienvenido a la red de intercambio P2P</b>\n\n"
-            "⚠️ <b>Requisito:</b> Envía fotos o videos a este bot para cargarlos en tu cofre privado.\n\n"
-            "🎁 Utiliza la <b>Mini App</b> para verificar usuarios en vivo, abrir cofres diarios y revisar tu estado VIP."
+            "👋 <b>¡Bienvenido a la Red P2P de Intercambios!</b>\n\n"
+            "⚠️ <b>REGLA CRÍTICA:</b> Sube videos o fotos directamente a este chat para llenar tu cofre privado. "
+            "<b>No elimines los archivos que subas aquí</b>; si los borras, el bot no podrá reenviarlos y no podrás intercambiar.\n\n"
+            "💡 <i>¿Tienes dudas de cómo funciona? Toca el botón de <b>Manual de Uso</b> abajo.</i>"
         ) if lang == "es" else (
-            "👋 <b>Welcome to the P2P exchange network</b>\n\n"
-            "⚠️ <b>Requirement:</b> Send photos or videos to this chat to load your private vault.\n\n"
-            "🎁 Use the <b>Mini App</b> to see live users, open reward chests, and view VIP progress."
+            "👋 <b>Welcome to the P2P Exchange Network!</b>\n\n"
+            "⚠️ <b>CRITICAL RULE:</b> Upload videos or photos directly to this chat to load your private vault. "
+            "<b>Do not delete the files you upload here</b>; if deleted, the bot cannot forward them and your trades will fail.\n\n"
+            "💡 <i>New here? Tap the <b>User Guide</b> button below to learn how it works.</i>"
         )
         await bot.send_message(chat_id=user_id, text=txt, reply_markup=kb, parse_mode="HTML")
+
+    # ---- Manual de Uso en Dos Idiomas ----
+    async def render_manual_text(lang: str) -> str:
+        if lang == "es":
+            return (
+                "📖 <b>MANUAL DE USO — GUÍA COMPLETA</b>\n\n"
+                "1️⃣ <b>Cargar tu Cofre:</b>\n"
+                "• Envía fotos o videos a este chat privado con el bot.\n"
+                "• Quedarán guardados automáticamente en tu inventario.\n"
+                "• ⚠️ <b>ADVERTENCIA ESTRICTA:</b> Nunca borres los mensajes multimedia originales que subas. Si los eliminas del chat, el bot no podrá reenviarlos durante un trade y la transacción fallará.\n\n"
+                "2️⃣ <b>Búsqueda de Chat:</b>\n"
+                "• Al presionar <b>«Buscar Chat»</b>, entras a una sala de espera.\n"
+                "• <i>Para que la conexión se concrete, otra persona debe presionar ese mismo botón o enviarte solicitud.</i> No te salgas, el bot te avisará cuando alguien conecte.\n"
+                "• Si conoces el ID de un amigo, usa <b>«Conectar ID»</b> para emparejarse directamente.\n\n"
+                "3️⃣ <b>Intercambios Seguros (Trades):</b>\n"
+                "• Dentro de un chat conectado, presiona <b>«🤝 Proponer Intercambio»</b>.\n"
+                "• El bot comprobará tu cofre y te dirá cuántos archivos tienes en total y cuántos son <b>únicos</b> (que tu compañero aún no ha recibido).\n"
+                "• Elige la categoría (fotos, videos o mixto) y la cantidad.\n"
+                "• Cuando ambos aceptan, el bot intercambia los archivos de manera 100% automatizada e imparcial.\n\n"
+                "4️⃣ <b>Reputación y Grupo VIP:</b>\n"
+                "• Cada intercambio exitoso suma +1 Reputación.\n"
+                "• Abre el Cofre en la Mini App cada 6 horas para ganar hasta +5 puntos gratis.\n"
+                "• Con <b>20 Puntos</b> o <b>3 Referidos</b> desbloqueas acceso automático al <b>Grupo VIP Gratuito</b>."
+            )
+        else:
+            return (
+                "📖 <b>USER GUIDE — COMPLETE TUTORIAL</b>\n\n"
+                "1️⃣ <b>Loading your Vault:</b>\n"
+                "• Send photos or videos directly to this private chat.\n"
+                "• They will be automatically saved into your private inventory.\n"
+                "• ⚠️ <b>STRICT WARNING:</b> Never delete the original media messages you upload here! If you delete them, the bot won't be able to forward them during a trade and the exchange will fail.\n\n"
+                "2️⃣ <b>Finding a Chat:</b>\n"
+                "• When you tap <b>«Random Chat»</b>, you enter a waiting queue.\n"
+                "• <i>For the connection to happen, another user must also tap that button or send you a request.</i> Stay in the queue, the bot will notify you as soon as someone joins.\n"
+                "• If you know a friend's ID, use <b>«Connect ID»</b> to connect directly.\n\n"
+                "3️⃣ <b>Safe P2P Trading:</b>\n"
+                "• Once connected, tap <b>«🤝 Propose Trade»</b>.\n"
+                "• The bot will inspect your vault and display both your total files and <b>unique unrepeated files</b> for that specific partner.\n"
+                "• Select category (photos, videos, mixed) and quantity.\n"
+                "• Once both parties accept, delivery is executed automatically.\n\n"
+                "4️⃣ <b>Reputation & VIP Access:</b>\n"
+                "• Every completed trade awards +1 Reputation.\n"
+                "• Open the Reward Chest in the Mini App every 6 hours for up to +5 points.\n"
+                "• Reaching <b>20 Reputation</b> or <b>3 Referrals</b> grants immediate free access to the <b>VIP Group</b>."
+            )
+
+    @dp.callback_query(F.data == "show_manual")
+    async def cb_manual(callback: CallbackQuery):
+        user = await get_user(callback.from_user.id)
+        lang = user.get("lang", "es")
+        txt = await render_manual_text(lang)
+        kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Volver al Menú" if lang == "es" else "⬅️ Back to Menu", callback_data="back_main")]])
+        await callback.message.edit_text(txt, reply_markup=kb, parse_mode="HTML")
+
+    @dp.message(Command("manual"))
+    async def cmd_manual(message: Message):
+        user = await get_user(message.from_user.id)
+        lang = user.get("lang", "es")
+        txt = await render_manual_text(lang)
+        await message.answer(txt, parse_mode="HTML")
 
     # ---- Comandos Administrativos del Bot Hijo ----
     @dp.message(Command("add_receiver"))
@@ -1073,13 +1167,16 @@ def get_new_child_dp(child_config: dict, child_db) -> Dispatcher:
         except Exception: pass
         await callback.message.delete()
 
-    # Búsqueda aleatoria
+    # Búsqueda aleatoria con mensaje de sala de espera explícito
     @dp.callback_query(F.data == "find_chat")
     async def find_chat(callback: CallbackQuery, state: FSMContext, bot: Bot):
         u_id = callback.from_user.id
         if await is_blacklisted(u_id): return
         if u_id in active_chats or u_id in waiting_list:
-            return await callback.answer("Ya estás en una sesión o buscando.", show_alert=True)
+            return await callback.answer("Ya estás en una sesión o en espera.", show_alert=True)
+
+        user = await get_user(u_id)
+        lang = user.get("lang", "es")
 
         if waiting_list:
             t_id = waiting_list.pop(0)
@@ -1099,13 +1196,20 @@ def get_new_child_dp(child_config: dict, child_db) -> Dispatcher:
                                KeyboardButton(text="❌ Desconectar" if lng == "es" else "❌ Disconnect")]],
                     resize_keyboard=True
                 )
-                await bot.send_message(uid, "✅ <b>¡Chat emparejado con éxito!</b>", reply_markup=kb, parse_mode="HTML")
+                await bot.send_message(uid, "✅ <b>¡Chat emparejado con éxito!</b> Ya pueden hablar o intercambiar.", reply_markup=kb, parse_mode="HTML")
             await callback.message.delete()
         else:
             waiting_list.append(u_id)
             await state.set_state(BotStates.searching)
-            kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Cancelar", callback_data="leave_chat")]])
-            await callback.message.edit_text("🔍 <b>Buscando compañero de intercambio...</b>", reply_markup=kb, parse_mode="HTML")
+            kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Cancelar Búsqueda" if lang == "es" else "❌ Cancel Queue", callback_data="leave_chat")]])
+            txt = (
+                "🔍 <b>Buscando compañero de intercambio...</b>\n\n"
+                "⏳ <i>Estás en la sala de espera. Para que la conexión se complete, <b>otro usuario debe presionar «Buscar Chat»</b> o enviarte una solicitud directa. En cuanto alguien más entre, se emparejarán automáticamente.</i>"
+                if lang == "es" else
+                "🔍 <b>Searching for trade partner...</b>\n\n"
+                "⏳ <i>You are now in the queue. For the connection to establish, <b>another user must also tap «Random Chat»</b> or send you a request. You will be paired automatically once someone joins.</i>"
+            )
+            await callback.message.edit_text(txt, reply_markup=kb, parse_mode="HTML")
 
     @dp.message(F.text.in_(["❌ Desconectar", "❌ Disconnect"]))
     @dp.callback_query(F.data == "leave_chat")
@@ -1167,29 +1271,95 @@ def get_new_child_dp(child_config: dict, child_db) -> Dispatcher:
                 pending_notifications[u_id] = True
                 asyncio.create_task(send_delayed_notification(u_id, user.get("lang", "es"), bot))
 
-    # Motor de Intercambios
+    # Motor de Intercambios con notificación de archivos totales vs únicos
     @dp.message(StateFilter(BotStates.chatting), F.text.in_(["🤝 Proponer Intercambio", "🤝 Propose Trade"]))
     async def btn_propose(message: Message, state: FSMContext):
-        u = await get_user(message.from_user.id)
-        lng = u.get("lang", "es")
+        u_id = message.from_user.id
+        t_id = active_chats.get(u_id)
+        if not t_id:
+            return await message.answer("⚠️ No tienes ningún chat activo.")
+
+        user = await get_user(u_id)
+        lng = user.get("lang", "es")
+        
+        tot, unq = await get_inventory_stats_for_trade(u_id, t_id, "mixed")
+        
+        if unq == 0:
+            msg_no = (
+                f"⚠️ <b>Inventario agotado para este usuario:</b>\n\n"
+                f"• Total en tu cofre: <code>{tot}</code>\n"
+                f"• <b>Archivos únicos disponibles:</b> <code>0</code> (Ya le has transferido todos tus archivos o tu cofre está vacío).\n\n"
+                f"📥 <i>Sube más videos o fotos al bot para poder proponer un intercambio.</i>"
+                if lng == "es" else
+                f"⚠️ <b>No unrepeated files for this user:</b>\n\n"
+                f"• Total in vault: <code>{tot}</code>\n"
+                f"• <b>Unique files available:</b> <code>0</code> (All files have already been traded to this partner or your vault is empty).\n\n"
+                f"📥 <i>Upload more media to this chat to continue trading.</i>"
+            )
+            return await message.answer(msg_no, parse_mode="HTML")
+
         await state.set_state(BotStates.waiting_trade_type)
         kb = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="📷 Fotos" if lng == "es" else "📷 Photos", callback_data="settype_photo"),
              InlineKeyboardButton(text="🎥 Videos", callback_data="settype_video")],
             [InlineKeyboardButton(text="🔀 Mixto" if lng == "es" else "🔀 Mixed", callback_data="settype_mixed")]
         ])
-        await message.answer("🎬 <b>¿Qué categoría deseas intercambiar?</b>", reply_markup=kb, parse_mode="HTML")
+        
+        msg = (
+            f"📊 <b>Estado de tu Inventario con este usuario:</b>\n"
+            f"• Archivos totales en tu cofre: <code>{tot}</code>\n"
+            f"• <b>Archivos únicos listos para enviar:</b> <code>{unq}</code>\n\n"
+            f"⚠️ <i>Recuerda: Si eliminaste los mensajes originales del chat, no podrán reenviarse.</i>\n\n"
+            f"🎬 <b>¿Qué categoría deseas intercambiar?</b>"
+            if lng == "es" else
+            f"📊 <b>Your Inventory Status with this user:</b>\n"
+            f"• Total files in vault: <code>{tot}</code>\n"
+            f"• <b>Unique unrepeated files:</b> <code>{unq}</code>\n\n"
+            f"⚠️ <i>Remember: If you deleted original messages from the chat, delivery will fail.</i>\n\n"
+            f"🎬 <b>What category do you want to trade?</b>"
+        )
+        await message.answer(msg, reply_markup=kb, parse_mode="HTML")
 
     @dp.callback_query(StateFilter(BotStates.waiting_trade_type), F.data.startswith("settype_"))
     async def process_trade_type(callback: CallbackQuery, state: FSMContext):
-        await state.update_data(trade_type=callback.data.split("_")[1])
+        u_id = callback.from_user.id
+        t_id = active_chats.get(u_id)
+        if not t_id:
+            return await callback.answer("Chat desconectado.", show_alert=True)
+
+        user = await get_user(u_id)
+        lng = user.get("lang", "es")
+        t_type = callback.data.split("_")[1]
+        await state.update_data(trade_type=t_type)
+        
+        tot_cat, unq_cat = await get_inventory_stats_for_trade(u_id, t_id, t_type)
+        await state.update_data(max_unique=unq_cat)
+        
+        if unq_cat == 0:
+            err_msg = (
+                f"⚠️ No tienes archivos únicos de categoría <b>{t_type}</b> disponibles para este usuario."
+                if lng == "es" else
+                f"⚠️ You don't have any unique <b>{t_type}</b> files available for this user."
+            )
+            return await callback.message.edit_text(err_msg, parse_mode="HTML")
+
         await state.set_state(BotStates.waiting_trade_amount)
         kb = InlineKeyboardMarkup(inline_keyboard=[[
             InlineKeyboardButton(text="10x10", callback_data="trade_10"),
             InlineKeyboardButton(text="50x50", callback_data="trade_50"),
             InlineKeyboardButton(text="100x100", callback_data="trade_100")
         ]])
-        await callback.message.edit_text("🔢 <b>¿Qué cantidad?</b> Elige una opción o escríbela:", reply_markup=kb, parse_mode="HTML")
+        
+        msg = (
+            f"📁 Categoría seleccionada: <b>{t_type.capitalize()}</b>\n"
+            f"✨ Tienes <b>{unq_cat}</b> archivos únicos disponibles (de {tot_cat} totales en cofre).\n\n"
+            f"🔢 <b>¿Cuántos archivos deseas intercambiar?</b> Elige una opción o escribe un número:"
+            if lng == "es" else
+            f"📁 Selected category: <b>{t_type.capitalize()}</b>\n"
+            f"✨ You have <b>{unq_cat}</b> unique files available (out of {tot_cat} in vault).\n\n"
+            f"🔢 <b>How many files do you want to trade?</b> Choose an option or type a number:"
+        )
+        await callback.message.edit_text(msg, reply_markup=kb, parse_mode="HTML")
 
     async def execute_trade_proposal(u_id, amt, t_type, send_func, state, bot: Bot):
         t_id = active_chats.get(u_id)
@@ -1198,6 +1368,19 @@ def get_new_child_dp(child_config: dict, child_db) -> Dispatcher:
         user, t_user = await get_user(u_id), await get_user(t_id)
         lang, t_lang = user.get("lang", "es"), t_user.get("lang", "es")
         
+        _, unq_available = await get_inventory_stats_for_trade(u_id, t_id, t_type)
+        if amt > unq_available:
+            err_amt = (
+                f"⚠️ <b>Cantidad no disponible:</b>\n"
+                f"Has solicitado <b>{amt}</b> archivos, pero solo tienes <b>{unq_available}</b> archivos únicos sin repetir de esta categoría para este usuario.\n\n"
+                f"Por favor, elige una cantidad menor o sube más archivos."
+                if lang == "es" else
+                f"⚠️ <b>Amount not available:</b>\n"
+                f"You requested <b>{amt}</b> files, but you only have <b>{unq_available}</b> unrepeated unique files in this category.\n\n"
+                f"Please choose a smaller amount or upload more media."
+            )
+            return await send_func(err_amt, parse_mode="HTML")
+
         pending_trades[t_id] = {"sender": u_id, "amount": amt, "type": t_type}
         await state.set_state(BotStates.chatting)
         await get_or_create_chat_topic(bot, u_id, t_id)
@@ -1207,8 +1390,8 @@ def get_new_child_dp(child_config: dict, child_db) -> Dispatcher:
             InlineKeyboardButton(text="❌ Rechazar" if t_lang == "es" else "❌ Reject", callback_data="reject_trade")
         ]])
         
-        await send_func(f"⏳ Propuesta de trade <b>{amt}x{amt}</b> ({t_type}) enviada.", parse_mode="HTML")
-        await bot.send_message(t_id, f"🤝 <b>¡Oferta de Trade!</b>\nPropuesta: <b>{amt}x{amt}</b> ({t_type}). ¿Aceptas?", reply_markup=kb, parse_mode="HTML")
+        await send_func(f"⏳ Propuesta de trade <b>{amt}x{amt}</b> ({t_type}) enviada. Esperando confirmación...", parse_mode="HTML")
+        await bot.send_message(t_id, f"🤝 <b>¡Oferta de Trade Recibida!</b>\nPropuesta: <b>{amt}x{amt}</b> ({t_type}). ¿Aceptas?", reply_markup=kb, parse_mode="HTML")
 
     @dp.message(StateFilter(BotStates.waiting_trade_amount), F.text.regexp(r'^\d+$'))
     async def process_manual_trade_offer(message: Message, state: FSMContext, bot: Bot):
@@ -1233,12 +1416,12 @@ def get_new_child_dp(child_config: dict, child_db) -> Dispatcher:
         ok_r, files_r = await get_random_batch(u_id, s_id, t_type, amt)
         
         if not ok_s or not ok_r:
-            err = "⚠️ Uno de los usuarios no tiene suficientes archivos disponibles en su cofre."
+            err = "⚠️ Uno de los dos usuarios no cuenta con suficientes archivos únicos para completar este trade."
             await callback.message.edit_text(err)
             return await bot.send_message(s_id, err)
 
-        await callback.message.edit_text("✅ <i>Procesando intercambio seguro...</i>", parse_mode="HTML")
-        await bot.send_message(s_id, "✅ <i>Procesando intercambio seguro...</i>", parse_mode="HTML")
+        await callback.message.edit_text("✅ <i>Procesando intercambio seguro de archivos...</i>", parse_mode="HTML")
+        await bot.send_message(s_id, "✅ <i>Procesando intercambio seguro de archivos...</i>", parse_mode="HTML")
 
         sent_s, sent_r = 0, 0
         iter_s, iter_r = iter(files_s), iter(files_r)
@@ -1273,13 +1456,13 @@ def get_new_child_dp(child_config: dict, child_db) -> Dispatcher:
             await asyncio.sleep(0.2)
 
         if sent_s == 0 and sent_r == 0:
-            fail = "❌ Intercambio fallido: los archivos originales fueron borrados del chat."
+            fail = "❌ Intercambio fallido: Los mensajes originales fueron eliminados del chat por los usuarios."
             await bot.send_message(u_id, fail)
             return await bot.send_message(s_id, fail)
 
         thread_id = chat_threads.get(u_id) or chat_threads.get(s_id)
         if thread_id and LOG_GROUP_ID:
-            rep_log = f"🔄 <b>Intercambio Exitoso</b>\n• {s_id}: {sent_s}\n• {u_id}: {sent_r}\n• Modo: {t_type}"
+            rep_log = f"🔄 <b>Intercambio Finalizado</b>\n• Remitente 1: <code>{s_id}</code> (Enviados: {sent_s})\n• Remitente 2: <code>{u_id}</code> (Enviados: {sent_r})\n• Tipo: {t_type}"
             try: await bot.send_message(chat_id=LOG_GROUP_ID, message_thread_id=thread_id, text=rep_log, parse_mode="HTML")
             except Exception: pass
 
@@ -1288,8 +1471,8 @@ def get_new_child_dp(child_config: dict, child_db) -> Dispatcher:
         await check_vip_status(u_id, bot)
         await check_vip_status(s_id, bot)
 
-        await bot.send_message(u_id, f"🎉 <b>¡Trade completado!</b> Recibiste {sent_s} archivos. (+1 Reputación)", parse_mode="HTML")
-        await bot.send_message(s_id, f"🎉 <b>¡Trade completado!</b> Recibiste {sent_r} archivos. (+1 Reputación)", parse_mode="HTML")
+        await bot.send_message(u_id, f"🎉 <b>¡Trade completado con éxito!</b> Recibiste {sent_s} archivos. (+1 Reputación)", parse_mode="HTML")
+        await bot.send_message(s_id, f"🎉 <b>¡Trade completado con éxito!</b> Recibiste {sent_r} archivos. (+1 Reputación)", parse_mode="HTML")
 
         await send_rating_request(u_id, s_id, bot)
         await send_rating_request(s_id, u_id, bot)
@@ -1336,7 +1519,7 @@ def get_new_child_dp(child_config: dict, child_db) -> Dispatcher:
                 except Exception: pass
             else:
                 await join_req.decline()
-                try: await bot.send_message(join_req.from_user.id, "❌ No cumples los requisitos (3 referidos o 20 reputación).")
+                try: await bot.send_message(join_req.from_user.id, "❌ No cumples los requisitos mínimos (3 referidos o 20 de reputación).")
                 except Exception: pass
 
     return dp
@@ -1697,9 +1880,6 @@ async def main():
     global MASTER_BOT_USERNAME
     logging.basicConfig(level=logging.INFO)
     
-    if not MASTER_TOKEN or not MASTER_MONGO_URI:
-        raise RuntimeError("Configura MASTER_TOKEN y MONGO_URI en tus variables de entorno.")
-        
     master_bot = Bot(token=MASTER_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
     me = await master_bot.get_me()
     MASTER_BOT_USERNAME = me.username
