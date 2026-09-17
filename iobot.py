@@ -1,9 +1,11 @@
 import os
+import hmac
+import hashlib
 import asyncio
 import logging
 import time
 import random
-from datetime import datetime, timedelta
+from datetime import datetime
 from urllib.parse import parse_qsl
 import json
 from aiohttp import web
@@ -11,7 +13,7 @@ from motor.motor_asyncio import AsyncIOMotorClient
 
 from aiogram import Bot, Dispatcher, F, html
 from aiogram.client.default import DefaultBotProperties
-from aiogram.exceptions import TelegramUnauthorizedError, TelegramRetryAfter
+from aiogram.exceptions import TelegramUnauthorizedError, TelegramRetryAfter, TelegramBadRequest
 from aiogram.filters import Command, CommandStart, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -24,18 +26,19 @@ from aiogram.types import (
 )
 
 # =====================================================================
-# 1. CONFIGURACIÓN DEL PANEL MASTER Y SEGURIDAD
+# 1. CONFIGURACIÓN DEL PANEL MASTER Y VARIABLES
 # =====================================================================
-MASTER_TOKEN = os.getenv("MASTER_TOKEN", "8972664077:AAFZuPYPIFypZN7ovV849CBuRRZYiMrVdDY")
-MASTER_MONGO_URI = os.getenv("MONGO_URI", "mongodb+srv://carlosjrpelegrina_db_user:1DNyN9AFa9bh1tCr@cluster0.haf2f1l.mongodb.net")
+MASTER_TOKEN = os.getenv("MASTER_TOKEN", "")
+MASTER_MONGO_URI = os.getenv("MONGO_URI", "")
 PORT = int(os.environ.get("PORT", 8080))
-RENDER_URL = os.environ.get("RENDER_EXTERNAL_URL", "https://TU_DOMINIO.onrender.com")
+RENDER_URL = os.environ.get("RENDER_EXTERNAL_URL", "https://tu-dominio.onrender.com").rstrip('/')
 
-SUPER_ADMIN_IDS = [8983189714, 7452819858]
+raw_admins = os.getenv("SUPER_ADMINS", "8983189714,7452819858")
+SUPER_ADMIN_IDS = [int(i.strip()) for i in raw_admins.split(",") if i.strip().isdigit()]
 
 master_db_client = AsyncIOMotorClient(MASTER_MONGO_URI)
 master_db = master_db_client.saas_master_db
-active_bots_tasks = {} 
+active_bots_tasks = {}
 master_dp = Dispatcher()
 MASTER_BOT_USERNAME = ""
 
@@ -63,41 +66,56 @@ def extract_chat_id(msg: Message) -> str:
         return msg.text.strip()
     return "0"
 
+def format_progress_bar(current: int, total: int, length: int = 10) -> str:
+    ratio = min(max(current / total, 0.0), 1.0)
+    filled = int(round(length * ratio))
+    return "▰" * filled + "▱" * (length - filled)
+
 # =====================================================================
-# 2. SERVIDOR WEB Y APIS
+# 2. SEGURIDAD DE WEBAPP & VALIDACIÓN TELEGRAM
 # =====================================================================
-async def get_auth_user(request):
-    init_data = request.headers.get("Authorization", "")
-    if init_data:
-        try:
-            parsed = dict(parse_qsl(init_data))
-            user_obj = json.loads(parsed.get('user', '{}'))
-            if 'id' in user_obj: return int(user_obj['id'])
-        except: pass
+def validate_telegram_init_data(init_data: str, bot_token: str) -> dict | None:
     try:
-        query_id = int(request.query.get("id", 0))
-        if query_id: return query_id
-    except: pass
-    return None
+        parsed_data = dict(parse_qsl(init_data, keep_blank_values=True))
+        if "hash" not in parsed_data:
+            return None
+        check_hash = parsed_data.pop("hash")
+        data_check_string = "\n".join(f"{k}={v}" for k, v in sorted(parsed_data.items()))
+        secret_key = hmac.new(b"WebAppData", bot_token.encode(), hashlib.sha256).digest()
+        computed_hash = hmac.new(secret_key, data_check_string.encode(), hashlib.sha256).hexdigest()
+        if hmac.compare_digest(computed_hash, check_hash):
+            return json.loads(parsed_data.get("user", "{}"))
+        return None
+    except Exception:
+        return None
 
-def get_child_db(request):
-    try: bot_id = int(request.query.get("bot_id") or 0)
-    except (ValueError, TypeError): bot_id = 0
-    return active_bots_tasks.get(bot_id, {}).get("db")
+async def authenticate_request(request):
+    try:
+        bot_id = int(request.query.get("bot_id", 0))
+    except (ValueError, TypeError):
+        return None, None, None
+        
+    bot_ctx = active_bots_tasks.get(bot_id)
+    if not bot_ctx:
+        return None, None, None
 
-def get_child_bot(request):
-    try: bot_id = int(request.query.get("bot_id") or 0)
-    except (ValueError, TypeError): bot_id = 0
-    return active_bots_tasks.get(bot_id, {}).get("bot")
+    init_data = request.headers.get("Authorization", "")
+    user_data = validate_telegram_init_data(init_data, bot_ctx["bot"].token)
+    user_id = user_data.get("id") if user_data else None
+    
+    if not user_id and os.getenv("DEBUG_ALLOW_INSECURE_ID") == "1":
+        user_id = int(request.query.get("id", 0)) or None
+        
+    return user_id, bot_ctx["db"], bot_ctx["bot"]
 
+# =====================================================================
+# 3. ENDPOINTS API Y MINI APP
+# =====================================================================
 async def api_get_data(request):
-    user_id = await get_auth_user(request)
-    child_db = get_child_db(request)
-    bot = get_child_bot(request)
-    
-    if not user_id or child_db is None or not bot: 
-        return web.json_response({"error": "Unauthorized or missing parameters"}, status=401)
-    
+    user_id, child_db, bot = await authenticate_request(request)
+    if not user_id or child_db is None or not bot:
+        return web.json_response({"error": "No autorizado"}, status=401)
+        
     dp = active_bots_tasks[bot.id]["dp"]
     active_viewers = dp["active_viewers"]
     now = time.time()
@@ -105,7 +123,7 @@ async def api_get_data(request):
     
     for uid in list(active_viewers.keys()):
         if now - active_viewers[uid] > 60:
-            del active_viewers[uid]
+            active_viewers.pop(uid, None)
 
     user = await child_db.users.find_one({"_id": user_id}) or {}
     fotos = await child_db.inventory.count_documents({"user_id": user_id, "type": "photo"})
@@ -118,357 +136,349 @@ async def api_get_data(request):
             
     waiting_list = dp["waiting_list"]
     active_chats = dp["active_chats"]
-    online_users = []
-    
     active_ids = set(active_viewers.keys()) | set(waiting_list) | set(active_chats.keys())
     
+    online_users = []
     for uid in active_ids:
-        if uid == user_id: continue 
-        
-        status = "Libre 🟢"
+        if uid == user_id:
+            continue
+        status_txt = "Disponible"
+        is_free = True
         if uid in active_chats:
-            status = "Ocupado 🔴"
+            status_txt = "Ocupado"
+            is_free = False
         elif uid in waiting_list:
-            status = "Buscando 🟡"
+            status_txt = "Buscando..."
+            is_free = False
             
         u_data = await child_db.users.find_one({"_id": uid}) or {}
-        
         online_users.append({
             "id": uid,
             "rep": u_data.get("reputation", 0),
-            "status": status,
-            "is_free": status != "Ocupado 🔴"
+            "status": status_txt,
+            "is_free": is_free
         })
     
     last_bonus = user.get("last_bonus", 0)
-    time_left_bonus = max(0, (last_bonus + (6 * 3600)) - now)
+    time_left_bonus = max(0, int((last_bonus + (6 * 3600)) - now))
     
     return web.json_response({
-        "fotos": fotos, 
+        "fotos": fotos,
         "videos": videos,
-        "reputation": user.get("reputation", 0), 
+        "reputation": user.get("reputation", 0),
         "referrals": user.get("referrals", 0),
         "time_left": time_left_bonus,
-        "leaderboard": top_users, 
+        "leaderboard": top_users,
         "online_users": online_users
     })
 
 async def api_claim_bonus(request):
-    user_id = await get_auth_user(request)
-    child_db = get_child_db(request)
-    if not user_id or child_db is None: return web.json_response({"error": "Unauthorized"}, status=401)
-    
-    user = await child_db.users.find_one({"_id": user_id}) or {}
-    now = time.time()
-    last_bonus = user.get("last_bonus", 0)
-    cooldown = 6 * 3600
-    if now < last_bonus + cooldown: 
-        return web.json_response({"success": False, "error": "Cooldown active"})
+    user_id, child_db, _ = await authenticate_request(request)
+    if not user_id or child_db is None:
+        return web.json_response({"error": "No autorizado"}, status=401)
         
-    puntos = random.randint(1, 5)
-    nueva_rep = user.get("reputation", 0) + puntos
-    await child_db.users.update_one({"_id": user_id}, {"$set": {"last_bonus": now, "reputation": nueva_rep}}, upsert=True)
-    return web.json_response({"success": True, "bonus": puntos, "new_rep": nueva_rep, "time_left": cooldown})
+    now = time.time()
+    cooldown = 6 * 3600
+    pts = random.randint(1, 5)
+    
+    res = await child_db.users.find_one_and_update(
+        {"_id": user_id, "last_bonus": {"$lte": now - cooldown}},
+        {"$set": {"last_bonus": now}, "$inc": {"reputation": pts}},
+        return_document=True
+    )
+    
+    if not res:
+        user = await child_db.users.find_one({"_id": user_id}) or {}
+        time_left = max(0, int((user.get("last_bonus", 0) + cooldown) - now))
+        return web.json_response({"success": False, "error": "Cooldown activo", "time_left": time_left})
+        
+    return web.json_response({
+        "success": True, 
+        "bonus": pts, 
+        "new_rep": res.get("reputation", 0), 
+        "time_left": cooldown
+    })
 
 async def api_clear_inv(request):
-    user_id = await get_auth_user(request)
-    child_db = get_child_db(request)
-    if not user_id or child_db is None: return web.json_response({"error": "Unauthorized"}, status=401)
+    user_id, child_db, _ = await authenticate_request(request)
+    if not user_id or child_db is None:
+        return web.json_response({"error": "No autorizado"}, status=401)
     await child_db.inventory.delete_many({"user_id": user_id})
     return web.json_response({"success": True})
 
 async def handle_webapp(request):
-    html_content = """
-    <!DOCTYPE html>
-    <html lang="es">
-    <head>
-        <meta charset="UTF-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>Exchange Panel</title>
-        <script src="https://telegram.org/js/telegram-web-app.js"></script>
-        <script src="https://cdn.jsdelivr.net/npm/canvas-confetti@1.6.0/dist/confetti.browser.min.js"></script>
-        <link href="https://fonts.googleapis.com/css2?family=Poppins:wght@400;500;600;700;800&display=swap" rel="stylesheet">
-        <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
-        <style>
-            :root {
-                --bg: #0d1117; --card-bg: #161b22; --card-border: #30363d;
-                --text: #c9d1d9; --text-strong: #ffffff; --hint: #8b949e;
-                --accent: #58a6ff; --danger: #f85149; --success: #2ea043; --gold: #e3b341;
-                --gradient-gold: linear-gradient(135deg, #f9d423 0%, #ff4e50 100%);
-            }
-            * { box-sizing: border-box; margin: 0; padding: 0; font-family: 'Poppins', sans-serif; }
-            body { background: var(--bg); color: var(--text); padding: 16px; padding-bottom: 24px; max-width: 500px; margin: 0 auto; }
-            .header { text-align: center; margin-bottom: 20px; margin-top: 10px; display: flex; justify-content: center; align-items: center; gap: 10px; }
-            .header h1 { font-size: 24px; font-weight: 800; color: var(--text-strong); text-transform: uppercase; }
-            .header-icon { font-size: 28px; color: var(--accent); }
-            .tabs { display: flex; background: var(--card-bg); border-radius: 14px; padding: 6px; margin-bottom: 24px; overflow-x: auto; border: 1px solid var(--card-border); scrollbar-width: none; gap: 6px; -webkit-overflow-scrolling: touch; }
-            .tab { flex: 0 0 22%; text-align: center; padding: 12px 4px; font-size: 13px; font-weight: 600; color: var(--hint); cursor: pointer; display: flex; flex-direction: column; gap: 4px; white-space: nowrap; transition: all 0.2s; }
-            .tab.active { background: var(--accent); color: #fff; box-shadow: 0 4px 12px rgba(88, 166, 255, 0.3); border-radius: 10px; }
-            .section { display: none; flex-direction: column; gap: 16px; animation: fadeIn 0.3s ease-in-out; }
-            .section.active { display: flex; }
-            @keyframes fadeIn { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: translateY(0); } }
-            .card { background: var(--card-bg); border-radius: 16px; padding: 20px; border: 1px solid var(--card-border); }
-            .card-title { font-size: 16px; font-weight: 700; color: var(--text-strong); margin-bottom: 12px; }
-            .card-title-flex { display: flex; justify-content: space-between; align-items: center; }
-            .btn-main { background: var(--accent); color: #fff; border: none; border-radius: 12px; padding: 14px; width: 100%; font-size: 15px; font-weight: 700; cursor: pointer; }
-            .btn-outline { background: transparent; border: 2px solid var(--accent); color: var(--accent); }
-            .btn-danger { background: rgba(248, 81, 73, 0.1); color: var(--danger); border: 1px solid var(--danger); }
-            .action-btn { flex: 1; padding: 8px 12px; border-radius: 8px; font-size: 12px; font-weight: 600; cursor: pointer; display: inline-flex; align-items: center; justify-content: center; gap: 6px; text-decoration: none; border: none; }
-            .btn-connect { background: rgba(88, 166, 255, 0.15); border: 1px solid rgba(88, 166, 255, 0.3); color: var(--accent); }
-            .progress-bg { background: rgba(255,255,255,0.05); border-radius: 10px; height: 14px; width: 100%; }
-            .progress-fill { background: var(--gradient-gold); height: 100%; width: 0%; border-radius: 10px; transition: width 0.8s ease-in-out; }
-            .chests-container { display: flex; justify-content: center; gap: 15px; margin: 20px 0; }
-            .chest-wrapper { width: 90px; height: 90px; cursor: pointer; position: relative; transition: transform 0.2s;}
-            .chest-wrapper:hover { transform: scale(1.08); }
-            .chest-wrapper.disabled { opacity: 0.4; filter: grayscale(100%); pointer-events: none; }
-            .chest-img { width: 100%; height: 100%; object-fit: contain; animation: pulseChest 2s infinite ease-in-out; }
-            @keyframes pulseChest { 0%, 100% { transform: scale(1); } 50% { transform: scale(1.03); } }
-            .list-item { background: rgba(255,255,255,0.03); padding: 16px; border-radius: 12px; margin-bottom: 12px; border: 1px solid var(--card-border); }
-            .badge { font-size: 10px; padding: 2px 6px; border-radius: 6px; font-weight: 700; background: rgba(227, 179, 65, 0.15); color: var(--gold); border: 1px solid rgba(227, 179, 65, 0.3); }
-        </style>
-    </head>
-    <body>
-        <div class="header"><i class="fa-solid fa-bolt header-icon"></i><h1>Exchange Hub</h1></div>
+    html_content = """<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+    <title>Exchange Hub</title>
+    <script src="https://telegram.org/js/telegram-web-app.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/canvas-confetti@1.6.0/dist/confetti.browser.min.js"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
+    <style>
+        :root {
+            --bg-color: var(--tg-theme-bg-color, #0a0e17);
+            --secondary-bg: var(--tg-theme-secondary-bg-color, #121826);
+            --text-color: var(--tg-theme-text-color, #f1f5f9);
+            --hint-color: var(--tg-theme-hint-color, #64748b);
+            --link-color: var(--tg-theme-link-color, #38bdf8);
+            --accent-grad: linear-gradient(135deg, #38bdf8 0%, #2563eb 100%);
+            --card-border: rgba(255, 255, 255, 0.08);
+            --card-glass: rgba(18, 24, 38, 0.75);
+        }
+        * { box-sizing: border-box; margin: 0; padding: 0; font-family: 'Plus Jakarta Sans', sans-serif; -webkit-tap-highlight-color: transparent; }
+        body { background: var(--bg-color); color: var(--text-color); padding: 16px 16px 100px; }
         
-        <div class="tabs" id="nav-tabs">
-            <div class="tab active" onclick="switchTab('mercado', this)"><i class="fa-solid fa-satellite-dish"></i> Radar</div>
-            <div class="tab" onclick="switchTab('cofres', this)"><i class="fa-solid fa-box-open"></i> Bonus</div>
-            <div class="tab" onclick="switchTab('stats', this)"><i class="fa-solid fa-star"></i> VIP</div>
-            <div class="tab" onclick="switchTab('rank', this)"><i class="fa-solid fa-trophy"></i> Top</div>
-            <div class="tab" onclick="switchTab('inventory', this)"><i class="fa-solid fa-vault"></i> Cofre</div>
-        </div>
+        .header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 18px; }
+        .header-title { font-size: 20px; font-weight: 800; display: flex; align-items: center; gap: 8px; }
+        .header-title i { color: #38bdf8; }
+        .status-pill { font-size: 11px; padding: 4px 10px; border-radius: 20px; background: rgba(56, 189, 248, 0.1); border: 1px solid rgba(56, 189, 248, 0.2); color: #38bdf8; font-weight: 600; }
+        
+        .nav-dock { position: fixed; bottom: 16px; left: 16px; right: 16px; background: var(--card-glass); backdrop-filter: blur(20px); border: 1px solid var(--card-border); border-radius: 24px; padding: 6px; display: flex; justify-content: space-around; z-index: 100; box-shadow: 0 10px 30px rgba(0,0,0,0.5); }
+        .nav-item { flex: 1; display: flex; flex-direction: column; align-items: center; gap: 4px; padding: 8px 0; color: var(--hint-color); font-size: 11px; font-weight: 600; border-radius: 16px; cursor: pointer; transition: 0.2s all; }
+        .nav-item.active { color: #fff; background: var(--accent-grad); box-shadow: 0 4px 12px rgba(37, 99, 235, 0.35); }
+        
+        .tab-content { display: none; flex-direction: column; gap: 14px; animation: slideUp 0.25s ease-out; }
+        .tab-content.active { display: flex; }
+        @keyframes slideUp { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
+        
+        .card { background: var(--card-glass); backdrop-filter: blur(14px); border: 1px solid var(--card-border); border-radius: 20px; padding: 18px; }
+        .card-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; }
+        .card-title { font-size: 15px; font-weight: 700; color: #fff; }
+        
+        .stat-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+        .stat-box { background: rgba(255, 255, 255, 0.03); border: 1px solid var(--card-border); border-radius: 16px; padding: 14px; text-align: center; }
+        .stat-val { font-size: 20px; font-weight: 800; color: #fff; margin-top: 4px; }
+        
+        .progress-track { height: 8px; background: rgba(255,255,255,0.05); border-radius: 8px; overflow: hidden; margin: 10px 0 6px; }
+        .progress-fill { height: 100%; width: 0%; background: var(--accent-grad); border-radius: 8px; transition: width 0.6s ease; }
+        
+        .btn-action { width: 100%; border: none; border-radius: 14px; padding: 13px; font-size: 13px; font-weight: 700; cursor: pointer; display: flex; align-items: center; justify-content: center; gap: 8px; }
+        .btn-outline { background: transparent; border: 1px solid rgba(56, 189, 248, 0.4); color: #38bdf8; }
+        .btn-danger { background: rgba(239, 68, 68, 0.1); border: 1px solid rgba(239, 68, 68, 0.3); color: #ef4444; }
+        
+        .chest-row { display: flex; justify-content: space-around; margin: 20px 0; }
+        .chest-card { width: 88px; height: 88px; border-radius: 18px; background: rgba(255,255,255,0.03); border: 1px solid var(--card-border); display: flex; align-items: center; justify-content: center; cursor: pointer; transition: 0.2s transform; }
+        .chest-card.ready:active { transform: scale(0.92); }
+        .chest-card.disabled { opacity: 0.35; filter: grayscale(1); pointer-events: none; }
+        .chest-card i { font-size: 36px; color: #f59e0b; }
+        
+        .user-row { display: flex; justify-content: space-between; align-items: center; padding: 12px; background: rgba(255,255,255,0.02); border: 1px solid var(--card-border); border-radius: 14px; margin-bottom: 8px; }
+        .badge { font-size: 10px; font-weight: 700; padding: 2px 8px; border-radius: 6px; }
+        .badge-free { background: rgba(34, 197, 94, 0.1); color: #22c55e; border: 1px solid rgba(34, 197, 94, 0.2); }
+        .badge-busy { background: rgba(239, 68, 68, 0.1); color: #ef4444; border: 1px solid rgba(239, 68, 68, 0.2); }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <div class="header-title"><i class="fa-solid fa-arrows-split-up-and-left"></i> Exchange Hub</div>
+        <div class="status-pill"><i class="fa-solid fa-circle fa-fade"></i> Online</div>
+    </div>
 
-        <div id="mercado" class="section active">
-            <div class="card">
-                <div class="card-title card-title-flex" style="margin-bottom:12px;">
-                    <span><i class="fa-solid fa-satellite-dish"></i> Radar en Vivo</span>
-                    <button class="btn-main" style="width:auto; padding:6px 12px; font-size:12px;" onclick="loadData()"><i class="fa-solid fa-rotate-right"></i></button>
+    <!-- RADAR -->
+    <div id="tab-radar" class="tab-content active">
+        <div class="card">
+            <div class="card-header">
+                <span class="card-title"><i class="fa-solid fa-radar"></i> Radar en Vivo</span>
+                <button class="status-pill" style="cursor:pointer;" onclick="fetchData()"><i class="fa-solid fa-rotate-right"></i></button>
+            </div>
+            <div id="radar-list"><p style="color:var(--hint-color); font-size:13px; text-align:center;">Buscando usuarios...</p></div>
+        </div>
+    </div>
+
+    <!-- BONOS -->
+    <div id="tab-bonus" class="tab-content">
+        <div class="card" style="text-align:center;">
+            <span class="card-title" style="display:block; margin-bottom:4px;">Cofre de Recompensa</span>
+            <p style="font-size:12px; color:var(--hint-color);">Reclama entre +1 y +5 reputación cada 6 horas.</p>
+            <div class="chest-row">
+                <div class="chest-card disabled" onclick="claimChest()"><i class="fa-solid fa-gem"></i></div>
+                <div class="chest-card disabled" onclick="claimChest()"><i class="fa-solid fa-vault"></i></div>
+                <div class="chest-card disabled" onclick="claimChest()"><i class="fa-solid fa-cube"></i></div>
+            </div>
+            <p id="bonus-countdown" style="font-size:13px; font-weight:700; color:var(--hint-color);">Sincronizando...</p>
+        </div>
+    </div>
+
+    <!-- PERFIL / VIP -->
+    <div id="tab-profile" class="tab-content">
+        <div class="card">
+            <div class="card-header">
+                <span class="card-title">Métricas de Reputación</span>
+                <span id="vip-ratio" style="font-weight:800; font-size:13px; color:#38bdf8;">--/20</span>
+            </div>
+            <div class="progress-track"><div class="progress-fill" id="vip-fill"></div></div>
+            <div class="stat-grid" style="margin-top:14px;">
+                <div class="stat-box">
+                    <span style="font-size:11px; color:var(--hint-color);">Referidos</span>
+                    <div class="stat-val" id="ref-count">0</div>
                 </div>
-                <p style="font-size:12px; color:var(--hint); margin-bottom:12px;">Usuarios buscando intercambios en este momento.</p>
-                <div id="offers-list">Buscando usuarios en línea...</div>
+                <div class="stat-box">
+                    <span style="font-size:11px; color:var(--hint-color);">Reputación</span>
+                    <div class="stat-val" id="rep-count">0</div>
+                </div>
             </div>
+            <button class="btn-action btn-outline" style="margin-top:14px;" onclick="copyLink()"><i class="fa-solid fa-share-nodes"></i> Enlace de Invitación</button>
         </div>
-
-        <div id="cofres" class="section">
-            <div class="card" style="text-align: center;">
-                <div class="card-title" style="color:var(--gold); text-align:center;">Recompensa de Cofres</div>
-                <p style="font-size:12px; color:var(--hint); margin-bottom:15px;">Elige un cofre cada 6 horas para ganar entre 1 y 5 puntos de reputación gratis.</p>
-                <div class="chests-container" id="chests-container"></div>
-                <div id="bonus-status" style="font-weight:700; color:var(--hint); margin-top:10px;">Calculando...</div>
+        <div class="card">
+            <span class="card-title" style="display:block; margin-bottom:10px;">Caja Fuerte Multimedia</span>
+            <div class="stat-grid">
+                <div class="stat-box"><i class="fa-regular fa-images"></i><div class="stat-val" id="cnt-photos">0</div></div>
+                <div class="stat-box"><i class="fa-solid fa-film"></i><div class="stat-val" id="cnt-videos">0</div></div>
             </div>
+            <button class="btn-action btn-danger" style="margin-top:14px;" onclick="wipeInventory()"><i class="fa-solid fa-trash"></i> Vaciar Inventario</button>
         </div>
+    </div>
 
-        <div id="stats" class="section">
-            <div class="card">
-                <div class="card-title">Progreso VIP</div>
-                <div style="display:flex; justify-content:space-between;"><span>Reputación</span><strong id="vip-text">--/20</strong></div>
-                <div class="progress-bg" style="margin-top:10px;"><div class="progress-fill" id="vip-fill"></div></div>
-            </div>
-            <div class="card">
-                <div class="card-title">Referidos (<span id="ref-count">0</span>/3)</div>
-                <button class="btn-main btn-outline" onclick="copyRefLink()"><i class="fa-solid fa-link"></i> Copiar Link Invitación</button>
-            </div>
+    <!-- RANKING -->
+    <div id="tab-top" class="tab-content">
+        <div class="card">
+            <div class="card-header"><span class="card-title"><i class="fa-solid fa-trophy"></i> Top 10 Red</span></div>
+            <div id="leaderboard-list">Cargando clasificación...</div>
         </div>
+    </div>
 
-        <div id="rank" class="section">
-            <div class="card"><div class="card-title">Top 10 Global</div><div id="ranking-list">Cargando...</div></div>
-        </div>
+    <!-- BARRA DOCK -->
+    <div class="nav-dock">
+        <div class="nav-item active" onclick="setTab('tab-radar', this)"><i class="fa-solid fa-satellite-dish"></i>Radar</div>
+        <div class="nav-item" onclick="setTab('tab-bonus', this)"><i class="fa-solid fa-gift"></i>Bonus</div>
+        <div class="nav-item" onclick="setTab('tab-profile', this)"><i class="fa-solid fa-id-badge"></i>Perfil</div>
+        <div class="nav-item" onclick="setTab('tab-top', this)"><i class="fa-solid fa-crown"></i>Top</div>
+    </div>
 
-        <div id="inventory" class="section">
-            <div class="card">
-                <div class="card-title">Tu Caja Fuerte</div>
-                <p>📷 Fotos: <strong id="photo-count">--</strong> | 🎥 Videos: <strong id="video-count">--</strong></p>
-                <br>
-                <button class="btn-main btn-danger" onclick="clearInventory()"><i class="fa-solid fa-trash-can"></i> Vaciar Inventario</button>
-            </div>
-        </div>
+    <script>
+        const tg = window.Telegram.WebApp;
+        tg.expand();
+        tg.ready();
 
-        <script>
-            let tg = window.Telegram.WebApp;
-            tg.expand();
-            
-            let urlParams = new URLSearchParams(window.location.search);
-            let botUsername = urlParams.get('bot') || "";
-            let botId = urlParams.get('bot_id') || "";
-            let userId = parseInt(urlParams.get('user_id')) || tg.initDataUnsafe?.user?.id || 0;
-            let reqHeaders = { "Content-Type": "application/json", "Authorization": tg.initData || "" };
+        const params = new URLSearchParams(window.location.search);
+        const botUsername = params.get('bot') || "";
+        const botId = params.get('bot_id') || "";
+        const userId = tg.initDataUnsafe?.user?.id || params.get('user_id');
 
-            function switchTab(tabId, el) {
-                tg.HapticFeedback.impactOccurred('light');
-                document.querySelectorAll('.section').forEach(s => s.classList.remove('active'));
-                document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
-                document.getElementById(tabId).classList.add('active');
-                el.classList.add('active');
-                el.scrollIntoView({ behavior: 'smooth', inline: 'center', block: 'nearest' });
+        const headers = { "Content-Type": "application/json", "Authorization": tg.initData || "" };
+
+        function setTab(tabId, el) {
+            tg.HapticFeedback.selectionChanged();
+            document.querySelectorAll('.tab-content').forEach(t => t.classList.remove('active'));
+            document.querySelectorAll('.nav-item').forEach(n => n.classList.remove('active'));
+            document.getElementById(tabId).classList.add('active');
+            el.classList.add('active');
+        }
+
+        let timerInterval;
+        function renderTimer(seconds) {
+            clearInterval(timerInterval);
+            const display = document.getElementById("bonus-countdown");
+            const cards = document.querySelectorAll(".chest-card");
+            if (seconds <= 0) {
+                display.innerText = "¡Cofre listo! Toca para abrir";
+                display.style.color = "#22c55e";
+                cards.forEach(c => { c.classList.remove('disabled'); c.classList.add('ready'); });
+                return;
             }
-
-            function copyToClipboard(text, successMessage) {
-                tg.HapticFeedback.impactOccurred('medium');
-                let temp = document.createElement("input");
-                temp.value = text;
-                document.body.appendChild(temp);
-                temp.select();
-                try {
-                    document.execCommand("copy");
-                    tg.showAlert(successMessage + "\n\n" + text);
-                } catch (err) {
-                    tg.showAlert("No se pudo copiar.\n\n" + text);
+            cards.forEach(c => { c.classList.add('disabled'); c.classList.remove('ready'); });
+            display.style.color = "var(--hint-color)";
+            let s = seconds;
+            timerInterval = setInterval(() => {
+                s--;
+                if (s <= 0) renderTimer(0);
+                else {
+                    let h = Math.floor(s / 3600);
+                    let m = Math.floor((s % 3600) / 60);
+                    let sec = s % 60;
+                    display.innerText = `Disponible en: ${h}h ${m}m ${sec}s`;
                 }
-                document.body.removeChild(temp);
-            }
+            }, 1000);
+        }
 
-            function copyRefLink() {
-                let link = `https://t.me/${botUsername}?start=${userId}`;
-                copyToClipboard(link, "✅ Link copiado al portapapeles.");
-            }
+        async function fetchData() {
+            try {
+                const res = await fetch(`/api/data?bot_id=${botId}&id=${userId}`, { headers });
+                const d = await res.json();
+                if (d.error) return;
 
-            let chestsContainer = document.getElementById('chests-container');
-            let isBonusReady = false;
-            
-            function initChests(ready) {
-                isBonusReady = ready;
-                chestsContainer.innerHTML = "";
-                for(let i=0; i<3; i++) {
-                    let w = document.createElement('div');
-                    w.className = `chest-wrapper ${ready ? '' : 'disabled'}`;
-                    w.onclick = () => ready ? openChest(w) : null;
-                    w.innerHTML = `<img src="https://img.icons8.com/color/96/treasure-chest.png" class="chest-img">`;
-                    chestsContainer.appendChild(w);
-                }
-            }
+                document.getElementById("cnt-photos").innerText = d.fotos;
+                document.getElementById("cnt-videos").innerText = d.videos;
+                document.getElementById("rep-count").innerText = d.reputation;
+                document.getElementById("ref-count").innerText = d.referrals;
+                document.getElementById("vip-ratio").innerText = `${d.reputation}/20`;
+                document.getElementById("vip-fill").style.width = Math.min(100, (d.reputation / 20) * 100) + "%";
 
-            let bonusTimer;
-            function updateBonusUI(timeLeft) {
-                let txt = document.getElementById("bonus-status");
-                clearInterval(bonusTimer);
-                if (timeLeft <= 0) {
-                    if(!isBonusReady) initChests(true);
-                    txt.innerText = "¡Elige un cofre para reclamar!";
-                    txt.style.color = "var(--success)";
+                renderTimer(d.time_left);
+
+                const radarList = document.getElementById("radar-list");
+                if (!d.online_users || d.online_users.length === 0) {
+                    radarList.innerHTML = '<p style="font-size:12px; color:var(--hint-color); text-align:center; padding:10px;">No hay otros usuarios en línea.</p>';
                 } else {
-                    if(isBonusReady) initChests(false);
-                    txt.style.color = "var(--hint)";
-                    bonusTimer = setInterval(() => {
-                        timeLeft--;
-                        if (timeLeft <= 0) updateBonusUI(0);
-                        else {
-                            let h = Math.floor(timeLeft / 3600);
-                            let m = Math.floor((timeLeft % 3600) / 60);
-                            let s = Math.floor(timeLeft % 60);
-                            txt.innerText = `⏳ Disponible en: ${h}h ${m}m ${s}s`;
-                        }
-                    }, 1000);
-                }
-            }
-
-            async function openChest(el) {
-                if(!isBonusReady) return;
-                tg.HapticFeedback.impactOccurred('heavy');
-                document.querySelectorAll('.chest-wrapper').forEach(w => w.classList.add('disabled'));
-                document.getElementById("bonus-status").innerText = "Abriendo cofre...";
-                
-                try {
-                    let res = await fetch(`/api/bonus?id=${userId}&bot_id=${botId}`, { method: "POST", headers: reqHeaders, body: "{}" });
-                    let data = await res.json();
-                    
-                    if(data.success) {
-                        el.classList.remove('disabled');
-                        el.querySelector('.chest-img').src = "https://img.icons8.com/color/96/open-box.png";
-                        confetti({ particleCount: 130, spread: 90, origin: { y: 0.6 } });
-                        tg.showAlert(`🎉 ¡Felicidades! Ganaste ${data.bonus} Puntos de Reputación.`);
-                        loadData();
-                    } else {
-                        tg.showAlert("⚠️ Aún debes esperar el tiempo indicado.");
-                        loadData();
-                    }
-                } catch(e) { 
-                    tg.showAlert("❌ Error de conexión al servidor."); 
-                    document.querySelectorAll('.chest-wrapper').forEach(w => w.classList.remove('disabled'));
-                    document.getElementById("bonus-status").innerText = "¡Elige un cofre!";
-                    loadData(); 
-                }
-            }
-
-            async function loadData() {
-                if (!userId || !botId) {
-                    document.getElementById("offers-list").innerHTML = '<div style="text-align:center;color:var(--danger); font-size:14px; padding: 20px 0;">Error: Faltan credenciales en la URL.</div>';
-                    return;
-                }
-                
-                try {
-                    let res = await fetch(`/api/data?id=${userId}&bot_id=${botId}`, { headers: reqHeaders });
-                    let data = await res.json();
-                    
-                    if (data.error) throw new Error(data.error);
-
-                    document.getElementById("photo-count").innerText = data.fotos;
-                    document.getElementById("video-count").innerText = data.videos;
-                    document.getElementById("vip-text").innerText = `${data.reputation}/20`;
-                    document.getElementById("vip-fill").style.width = Math.min(100, (data.reputation / 20) * 100) + "%";
-                    document.getElementById("ref-count").innerText = data.referrals;
-                    
-                    updateBonusUI(data.time_left);
-                    
-                    let rHTML = "";
-                    data.leaderboard.forEach((u, i) => {
-                        let icon = i === 0 ? "👑" : i === 1 ? "🥈" : i === 2 ? "🥉" : `<strong>#${i+1}</strong>`;
-                        rHTML += `<div class="list-item" style="display:flex; justify-content:space-between;"><span>${icon} ID: ${u.id}</span><strong>${u.rep} Pts</strong></div>`;
-                    });
-                    document.getElementById("ranking-list").innerHTML = rHTML || '<div style="text-align:center;color:var(--hint); font-size:14px;">Aún no hay datos.</div>';
-
-                    renderRadar(data.online_users || []);
-                } catch(e) { 
-                    console.error("Error loading data", e); 
-                    document.getElementById("offers-list").innerHTML = '<div style="text-align:center;color:var(--danger); font-size:14px; padding: 20px 0;">Error de conexión.</div>';
-                }
-            }
-
-            function renderRadar(users) {
-                let oHTML = "";
-                if(users.length === 0) {
-                    oHTML = '<div style="text-align:center;color:var(--hint); font-size:14px; padding: 20px 0;">No hay otros usuarios en línea ahora.</div>';
-                } else {
-                    users.forEach(u => {
-                        let deepLink = `https://t.me/${botUsername}?start=connect_${u.id}`;
-                        oHTML += `<div class="list-item" style="display:flex; justify-content:space-between; align-items:center;">
+                    radarList.innerHTML = d.online_users.map(u => `
+                        <div class="user-row">
                             <div>
-                                <div style="font-weight:700; font-size:14px;"><i class="fa-solid fa-user-astronaut"></i> ID: ${u.id} <span class="badge">⭐ ${u.rep} Pts</span></div>
-                                <div style="font-size:11px; color:var(--hint); margin-top:4px;">Estado: <strong>${u.status}</strong></div>
+                                <div style="font-weight:700; font-size:13px;">ID: ${u.id}</div>
+                                <span class="badge ${u.is_free ? 'badge-free' : 'badge-busy'}">${u.status}</span>
+                                <span style="font-size:11px; color:var(--hint-color); margin-left:6px;">⭐ ${u.rep}</span>
                             </div>
-                            ${u.is_free ? `<a href="${deepLink}" onclick="tg.close()" class="action-btn btn-connect" style="text-decoration:none;"><i class="fa-solid fa-link"></i> Conectar</a>` : `<button class="action-btn" style="background:rgba(255,255,255,0.1); color:var(--hint);" disabled>Ocupado</button>`}
-                        </div>`;
-                    });
+                            ${u.is_free ? `<button class="btn-action btn-outline" style="width:auto; padding:6px 12px; font-size:12px;" onclick="connectUser('${u.id}')">Conectar</button>` : ''}
+                        </div>
+                    `).join('');
                 }
-                document.getElementById("offers-list").innerHTML = oHTML;
-            }
 
-            async function clearInventory() {
-                tg.showConfirm("⚠️ ¿Vaciar todas tus fotos y videos permanentemente?", async (ok) => {
-                    if(ok) {
-                        try {
-                            await fetch(`/api/clear?id=${userId}&bot_id=${botId}`, { method: "POST", headers: reqHeaders });
-                            tg.HapticFeedback.notificationOccurred('success');
-                            tg.showAlert("🗑️ Caja fuerte vaciada.");
-                            loadData();
-                        } catch(e) {
-                            tg.showAlert("❌ Error al vaciar inventario.");
-                        }
-                    }
-                });
-            }
+                const lb = document.getElementById("leaderboard-list");
+                lb.innerHTML = d.leaderboard.map((u, i) => `
+                    <div class="user-row">
+                        <span><strong>#${i+1}</strong> ID: ${u.id}</span>
+                        <span style="font-weight:800; color:#38bdf8;">${u.rep} PTS</span>
+                    </div>
+                `).join('') || '<p style="color:var(--hint-color); font-size:12px;">Sin datos aún.</p>';
+            } catch (e) { console.error(e); }
+        }
 
-            setInterval(() => { if (userId && botId) loadData(); }, 20000);
-            initChests(false);
-            loadData();
-        </script>
-    </body>
-    </html>
-    """
+        async function claimChest() {
+            tg.HapticFeedback.impactOccurred('medium');
+            try {
+                const res = await fetch(`/api/bonus?bot_id=${botId}&id=${userId}`, { method: "POST", headers });
+                const d = await res.json();
+                if (d.success) {
+                    confetti({ particleCount: 120, spread: 80, origin: { y: 0.6 } });
+                    tg.HapticFeedback.notificationOccurred('success');
+                    tg.showAlert(`¡Recompensa desbloqueada! +${d.bonus} Puntos.`);
+                    fetchData();
+                } else tg.showAlert("El cofre aún no está disponible.");
+            } catch(e) { tg.showAlert("Error de conexión."); }
+        }
+
+        function connectUser(targetId) {
+            tg.HapticFeedback.impactOccurred('light');
+            tg.openTelegramLink(`https://t.me/${botUsername}?start=connect_${targetId}`);
+        }
+
+        function copyLink() {
+            tg.HapticFeedback.notificationOccurred('success');
+            const link = `https://t.me/${botUsername}?start=${userId}`;
+            navigator.clipboard.writeText(link).then(() => tg.showAlert("Enlace copiado al portapapeles."));
+        }
+
+        function wipeInventory() {
+            tg.showConfirm("¿Eliminar todos tus archivos de forma permanente?", async (ok) => {
+                if(ok) {
+                    await fetch(`/api/clear?bot_id=${botId}&id=${userId}`, { method: "POST", headers });
+                    tg.HapticFeedback.notificationOccurred('warning');
+                    fetchData();
+                }
+            });
+        }
+
+        fetchData();
+        setInterval(fetchData, 15000);
+    </script>
+</body>
+</html>"""
     return web.Response(text=html_content, content_type="text/html")
 
-
 # =====================================================================
-# 3. CORE SAAS: FÁBRICA DE BOTS HIJOS
+# 4. CORE SAAS: DISPATCHER BOT HIJO
 # =====================================================================
 def get_new_child_dp(child_config: dict, child_db) -> Dispatcher:
     dp = Dispatcher(storage=MemoryStorage())
@@ -476,26 +486,27 @@ def get_new_child_dp(child_config: dict, child_db) -> Dispatcher:
     active_chats = {}
     waiting_list = []
     pending_trades = {}
-    active_viewers = {} 
+    active_viewers = {}
+    chat_threads = {}
     pending_notifications = {}
-    chat_threads = {} 
     backup_queue = asyncio.Queue()
     
-    dp["backup_queue"] = backup_queue 
+    dp["backup_queue"] = backup_queue
     dp["active_viewers"] = active_viewers
     dp["active_chats"] = active_chats
     dp["waiting_list"] = waiting_list
 
-    FORCE_SUB_CHANNEL_ID = child_config.get("force_sub_id", 0)
-    if FORCE_SUB_CHANNEL_ID: FORCE_SUB_CHANNEL_ID = int(FORCE_SUB_CHANNEL_ID)
+    FORCE_SUB_CHANNEL_ID = int(child_config.get("force_sub_id", 0)) if child_config.get("force_sub_id") else 0
     FORCE_SUB_CHANNEL_LINK = child_config.get("force_sub_link", "")
     VIP_GROUP_ID = int(child_config.get("vip_group_id", 0)) if child_config.get("vip_group_id") else 0
     LOG_GROUP_ID = int(child_config.get("log_group_id", 0)) if child_config.get("log_group_id") else 0
     PAID_VIP_CHANNEL_ID = int(child_config.get("paid_vip_channel_id", 0)) if child_config.get("paid_vip_channel_id") else 0
 
     async def get_or_create_chat_topic(bot: Bot, u_id: int, t_id: int):
-        if not LOG_GROUP_ID: return None
-        if u_id in chat_threads: return chat_threads[u_id]
+        if not LOG_GROUP_ID:
+            return None
+        if u_id in chat_threads:
+            return chat_threads[u_id]
         if t_id in chat_threads:
             chat_threads[u_id] = chat_threads[t_id]
             return chat_threads[t_id]
@@ -505,18 +516,22 @@ def get_new_child_dp(child_config: dict, child_db) -> Dispatcher:
             chat_threads[t_id] = topic.message_thread_id
             return topic.message_thread_id
         except Exception as e:
-            logging.error(f"❌ Error creando tema de foro: {e}")
+            logging.error(f"Error creando tema de foro: {e}")
             return None
 
     async def set_other_user_state(bot: Bot, chat_id: int, state: State):
         key = StorageKey(bot_id=bot.id, chat_id=chat_id, user_id=chat_id)
-        fsm_ctx = FSMContext(storage=dp.storage, key=key)
-        await fsm_ctx.set_state(state)
+        await FSMContext(storage=dp.storage, key=key).set_state(state)
 
     async def get_user(user_id):
         user = await child_db.users.find_one({"_id": user_id})
         if not user:
-            user = {"_id": user_id, "lang": "es", "referrals": 0, "reputation": 0, "mode": "anon", "in_vip": False, "notified_vip": False, "last_bonus": 0, "vip_until": 0, "paid_vip_active": False}
+            user = {
+                "_id": user_id, "lang": "es", "referrals": 0, "reputation": 0,
+                "mode": "anon", "in_vip": False, "notified_vip": False,
+                "last_bonus": 0, "vip_until": 0, "paid_vip_active": False,
+                "blacklisted": False
+            }
             await child_db.users.insert_one(user)
         return user
 
@@ -528,62 +543,63 @@ def get_new_child_dp(child_config: dict, child_db) -> Dispatcher:
         return cfg.get("maintenance", False) if cfg else False
 
     async def is_blacklisted(user_id):
-        user = await get_user(user_id)
-        return user.get("blacklisted", False)
+        u = await get_user(user_id)
+        return u.get("blacklisted", False)
 
     async def check_force_sub(user_id, bot: Bot):
-        if user_id in SUPER_ADMIN_IDS: return True
-        if not FORCE_SUB_CHANNEL_ID: return True
+        if user_id in SUPER_ADMIN_IDS or not FORCE_SUB_CHANNEL_ID:
+            return True
         try:
             member = await bot.get_chat_member(FORCE_SUB_CHANNEL_ID, user_id)
             return member.status in ["member", "administrator", "creator"]
-        except Exception as e: 
-            logging.error(f"Error Force Sub: {e}")
+        except Exception:
             return False
 
     async def check_vip_status(user_id, bot: Bot):
-        if not VIP_GROUP_ID: return
+        if not VIP_GROUP_ID:
+            return
         try:
             user = await get_user(user_id)
-            if user.get("referrals", 0) >= 3 or user.get("reputation", 0) >= 20:
-                if not user.get("notified_vip"):
-                    invite = await bot.create_chat_invite_link(chat_id=VIP_GROUP_ID, member_limit=1, creates_join_request=False)
-                    lang = user.get("lang", "es")
-                    btn = "🌟 Entrar al Grupo VIP (Referidos/Puntos)" if lang == "es" else "🌟 Join VIP Group"
-                    msg = "🎉 **¡Tienes acceso al Grupo VIP por referidos/puntos!** Aquí tienes tu enlace exclusivo:" if lang == "es" else "🎉 **You have VIP access!** Here is your exclusive invite link:"
-                    markup = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=btn, url=invite.invite_link)]])
-                    await bot.send_message(user_id, msg, reply_markup=markup, parse_mode="Markdown")
-                    await save_user(user_id, {"notified_vip": True, "in_vip": True})
+            if (user.get("referrals", 0) >= 3 or user.get("reputation", 0) >= 20) and not user.get("notified_vip"):
+                invite = await bot.create_chat_invite_link(chat_id=VIP_GROUP_ID, member_limit=1)
+                lang = user.get("lang", "es")
+                btn = "🌟 Entrar al Grupo VIP" if lang == "es" else "🌟 Join VIP Group"
+                msg = "🎉 <b>¡Tienes acceso al Grupo VIP por referidos o reputación!</b> Enlace exclusivo:" if lang == "es" else "🎉 <b>VIP Access Granted!</b> Here is your exclusive link:"
+                kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=btn, url=invite.invite_link)]])
+                await bot.send_message(user_id, msg, reply_markup=kb, parse_mode="HTML")
+                await save_user(user_id, {"notified_vip": True, "in_vip": True})
         except Exception as e:
-            logging.error(f"❌ Error crítico en check_vip_status: {e}")
+            logging.error(f"Error en check_vip_status: {e}")
 
     async def send_rating_request(user_id, target_id, bot: Bot):
         user = await get_user(user_id)
         lang = user.get("lang", "es")
         btn_g = "👍 Buen usuario" if lang == "es" else "👍 Good user"
         btn_b = "👎 Malo" if lang == "es" else "👎 Bad"
-        msg = "¿Deseas darle un punto extra a tu compañero?" if lang == "es" else "Do you want to give your partner an extra point?"
-        markup = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text=btn_g, callback_data=f"rate_good_{target_id}"), InlineKeyboardButton(text=btn_b, callback_data=f"rate_bad_{target_id}")]
-        ])
-        await bot.send_message(user_id, msg, reply_markup=markup)
+        msg = "¿Deseas otorgarle un punto de reputación a tu compañero?" if lang == "es" else "Do you want to award a reputation point to your partner?"
+        kb = InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text=btn_g, callback_data=f"rate_good_{target_id}"),
+            InlineKeyboardButton(text=btn_b, callback_data=f"rate_bad_{target_id}")
+        ]])
+        await bot.send_message(user_id, msg, reply_markup=kb)
 
     async def send_delayed_notification(u_id, lang, bot: Bot):
-        await asyncio.sleep(2.5) 
+        await asyncio.sleep(2.5)
         total = await child_db.inventory.count_documents({"user_id": u_id})
-        msg_es = f"📥 **Lote de archivos guardado.** (Total en inventario: {total})\n\n⚠️ **Importante:** No elimines los mensajes que subas aquí."
-        msg_en = f"📥 **Batch of files saved.** (Total inventory: {total})\n\n⚠️ **Important:** Do not delete the messages you upload here."
+        msg = f"📥 <b>Lote guardado en tu cofre.</b> (Total: <code>{total}</code>)\n\n⚠️ No borres estos mensajes en tu chat con el bot." if lang == "es" else f"📥 <b>Batch saved.</b> (Total: <code>{total}</code>)\n\n⚠️ Do not delete these uploaded messages."
         try:
-            await bot.send_message(u_id, msg_es if lang == "es" else msg_en, parse_mode="Markdown")
-        except Exception: pass
-        finally: pending_notifications.pop(u_id, None)
-        
+            await bot.send_message(u_id, msg, parse_mode="HTML")
+        except Exception:
+            pass
+        finally:
+            pending_notifications.pop(u_id, None)
+
     async def get_random_batch(sender_id: int, receiver_id: int, category: str, amount: int):
         already_sent = [doc["file_unique_id"] async for doc in child_db.exchange_history.find({"sender_id": sender_id, "receiver_id": receiver_id}, {"file_unique_id": 1})]
         match_query = {"user_id": sender_id, "file_unique_id": {"$nin": already_sent}}
-        if category != "mixed": match_query["type"] = category
-        safe_amount = (amount * 2) + 50
-        pipeline = [{"$match": match_query}, {"$sample": {"size": safe_amount}}]
+        if category != "mixed":
+            match_query["type"] = category
+        pipeline = [{"$match": match_query}, {"$sample": {"size": (amount * 2) + 50}}]
         selected = [doc async for doc in child_db.inventory.aggregate(pipeline)]
         return len(selected) >= amount, selected
 
@@ -592,422 +608,386 @@ def get_new_child_dp(child_config: dict, child_db) -> Dispatcher:
         lang = user.get("lang", "es")
         bot_info = await bot.get_me()
         my_link = f"https://t.me/{bot_info.username}?start={user['_id']}"
-        
         webapp_url = f"{RENDER_URL}/?bot={bot_info.username}&bot_id={bot.id}&user_id={user_id}"
         
+        btn_panel = "✨ Mini App de Intercambio" if lang == "es" else "✨ Exchange Mini App"
         btn_rnd = "💬 Buscar Chat" if lang == "es" else "💬 Random Chat"
         btn_id = "🆔 Conectar ID" if lang == "es" else "🆔 Connect ID"
         btn_prof = "👤 Mi Perfil" if lang == "es" else "👤 My Profile"
+        btn_lang = "⚙️ Idioma / Lang"
         btn_share = "🔗 Compartir Link" if lang == "es" else "🔗 Share Link"
-        btn_panel = "✨ Mini App de Intercambio" if lang == "es" else "✨ Exchange Mini App"
-        
-        markup = InlineKeyboardMarkup(inline_keyboard=[
+
+        kb = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text=btn_panel, web_app=WebAppInfo(url=webapp_url))],
             [InlineKeyboardButton(text=btn_rnd, callback_data="find_chat"), InlineKeyboardButton(text=btn_id, callback_data="connect_id")],
-            [InlineKeyboardButton(text=btn_prof, callback_data="my_profile"), InlineKeyboardButton(text="⚙️ Idioma / Language", callback_data="change_lang")],
+            [InlineKeyboardButton(text=btn_prof, callback_data="my_profile"), InlineKeyboardButton(text=btn_lang, callback_data="change_lang")],
             [InlineKeyboardButton(text=btn_share, url=f"https://t.me/share/url?url={my_link}")]
         ])
-        
-        if lang == "es":
-            txt = (
-                "👋 <b>¡Bienvenido a la red de intercambio!</b>\n\n"
-                "⚠️ <b>REQUISITO CLAVE:</b> Sube material propio a este chat para poder hacer intercambios. "
-                "¡Sin videos o fotos en tu inventario, no podrás recibir nada!\n\n"
-                "🎁 Utiliza la nueva <b>Mini App</b> para reclamar tu bonus diario y ver tu progreso VIP. 🚀"
-            )
-        else:
-            txt = (
-                "👋 <b>Welcome to the exchange network!</b>\n\n"
-                "⚠️ <b>KEY REQUIREMENT:</b> Upload your own media to this chat to be able to trade. "
-                "Without videos or photos in your inventory, you won't receive anything!\n\n"
-                "🎁 Use the new <b>Mini App</b> to claim your daily bonus and check your VIP progress. 🚀"
-            )
-        await bot.send_message(chat_id=user_id, text=txt, reply_markup=markup, parse_mode="HTML")
 
-    # ================= COMANDOS ADMINISTRATIVOS Y MODERACIÓN (BOT HIJO) =================
+        txt = (
+            "👋 <b>Bienvenido a la red de intercambio P2P</b>\n\n"
+            "⚠️ <b>Requisito:</b> Envía fotos o videos a este bot para cargarlos en tu cofre privado.\n\n"
+            "🎁 Utiliza la <b>Mini App</b> para verificar usuarios en vivo, abrir cofres diarios y revisar tu estado VIP."
+        ) if lang == "es" else (
+            "👋 <b>Welcome to the P2P exchange network</b>\n\n"
+            "⚠️ <b>Requirement:</b> Send photos or videos to this chat to load your private vault.\n\n"
+            "🎁 Use the <b>Mini App</b> to see live users, open reward chests, and view VIP progress."
+        )
+        await bot.send_message(chat_id=user_id, text=txt, reply_markup=kb, parse_mode="HTML")
+
+    # ---- Comandos Administrativos del Bot Hijo ----
     @dp.message(Command("add_receiver"))
-    async def cmd_add_receiver(message: Message, bot: Bot):
+    async def cmd_add_receiver(message: Message):
         if message.from_user.id not in SUPER_ADMIN_IDS: return
         try:
             new_id = int(message.text.split()[1])
             await child_db.settings.update_one({"_id": "config"}, {"$addToSet": {"extra_receivers": new_id}}, upsert=True)
-            await message.answer(f"✅ Añadido `{new_id}`.")
-        except: await message.answer("⚠️ Uso: `/add_receiver ID`")
+            await message.answer(f"✅ Receptor <code>{new_id}</code> agregado.")
+        except Exception:
+            await message.answer("Uso: <code>/add_receiver ID</code>")
 
     @dp.message(Command("del_receiver"))
-    async def cmd_del_receiver(message: Message, bot: Bot):
+    async def cmd_del_receiver(message: Message):
         if message.from_user.id not in SUPER_ADMIN_IDS: return
         try:
             rem_id = int(message.text.split()[1])
             await child_db.settings.update_one({"_id": "config"}, {"$pull": {"extra_receivers": rem_id}}, upsert=True)
-            await message.answer(f"✅ ID `{rem_id}` eliminado.")
-        except: await message.answer("⚠️ Uso: `/del_receiver ID`")
+            await message.answer(f"✅ Receptor <code>{rem_id}</code> eliminado.")
+        except Exception:
+            await message.answer("Uso: <code>/del_receiver ID</code>")
 
     @dp.message(Command("mantenimiento"))
-    async def cmd_maintenance(message: Message, bot: Bot):
+    async def cmd_maintenance(message: Message):
         if message.from_user.id not in SUPER_ADMIN_IDS: return
         cfg = await child_db.settings.find_one({"_id": "config"})
-        current = cfg.get("maintenance", False) if cfg else False
-        new_state = not current
+        new_state = not (cfg.get("maintenance", False) if cfg else False)
         await child_db.settings.update_one({"_id": "config"}, {"$set": {"maintenance": new_state}}, upsert=True)
-        status_txt = "activado 🔴" if new_state else "desactivado 🟢"
-        await message.answer(f"🛠️ Modo mantenimiento {status_txt}.")
+        await message.answer(f"🛠️ Mantenimiento: <b>{'Activado 🔴' if new_state else 'Desactivado 🟢'}</b>")
 
     @dp.message(Command("blacklist"))
-    async def cmd_blacklist_user(message: Message, bot: Bot):
+    async def cmd_blacklist(message: Message):
         if message.from_user.id not in SUPER_ADMIN_IDS: return
         try:
             target_id = int(message.text.split()[1])
             await save_user(target_id, {"blacklisted": True})
-            await message.answer(f"🚫 Usuario `{target_id}` agregado a la lista negra.")
-        except: await message.answer("⚠️ Uso: `/blacklist ID`")
+            await message.answer(f"🚫 Usuario <code>{target_id}</code> bloqueado.")
+        except Exception:
+            await message.answer("Uso: <code>/blacklist ID</code>")
 
     @dp.message(Command("unblacklist"))
-    async def cmd_unblacklist_user(message: Message, bot: Bot):
+    async def cmd_unblacklist(message: Message):
         if message.from_user.id not in SUPER_ADMIN_IDS: return
         try:
             target_id = int(message.text.split()[1])
             await save_user(target_id, {"blacklisted": False})
-            await message.answer(f"✅ Usuario `{target_id}` removido de la lista negra.")
-        except: await message.answer("⚠️ Uso: `/unblacklist ID`")
+            await message.answer(f"✅ Usuario <code>{target_id}</code> desbloqueado.")
+        except Exception:
+            await message.answer("Uso: <code>/unblacklist ID</code>")
 
     @dp.message(Command("broadcast"))
     async def cmd_broadcast(message: Message, bot: Bot):
         if message.from_user.id not in SUPER_ADMIN_IDS: return
         text = message.text.replace("/broadcast", "").strip()
-        if not text: return await message.answer("⚠️ Escribe el mensaje a difundir.")
-        await message.answer("⏳ Iniciando difusión...")
+        if not text: return await message.answer("Escribe el mensaje tras el comando.")
+        await message.answer("⏳ Transmitiendo aviso...")
         count = 0
-        async for user in child_db.users.find():
+        async for u in child_db.users.find():
             try:
-                await bot.send_message(user["_id"], f"📢 <b>Aviso:</b>\n\n{text}", parse_mode="HTML")
+                await bot.send_message(u["_id"], f"📢 <b>Aviso General:</b>\n\n{html.quote(text)}", parse_mode="HTML")
                 count += 1
-                await asyncio.sleep(0.05) 
-            except: pass
-        await message.answer(f"✅ Difusión completada a <code>{count}</code> usuarios.", parse_mode="HTML")
+                await asyncio.sleep(0.05)
+            except Exception:
+                pass
+        await message.answer(f"✅ Difusión completada a <code>{count}</code> usuarios.")
 
     @dp.message(Command("estadisticas"))
-    async def cmd_stats(message: Message, bot: Bot):
+    async def cmd_stats(message: Message):
         if message.from_user.id not in SUPER_ADMIN_IDS: return
-        total_users = await child_db.users.count_documents({})
-        total_files = await child_db.inventory.count_documents({})
-        active_chats_count = len(active_chats) // 2
-        total_archivos_enviados = await child_db.exchange_history.count_documents({})
-        operaciones_reales = total_archivos_enviados // 2
-        vip_users = await child_db.users.count_documents({"in_vip": True})
-        stats_text = (
-            "📊 **ESTADÍSTICAS DEL BOT**\n\n"
-            f"👥 Usuarios registrados: `{total_users}`\n"
-            f"🌟 Usuarios VIP (Referidos/Puntos): `{vip_users}`\n"
-            f"📁 Archivos en cofre: `{total_files}`\n"
-            f"🔄 Intercambios exitosos: `{operaciones_reales}`\n"
-            f"💬 Chats en vivo: `{active_chats_count}`"
+        users = await child_db.users.count_documents({})
+        files = await child_db.inventory.count_documents({})
+        trades = (await child_db.exchange_history.count_documents({})) // 2
+        vips = await child_db.users.count_documents({"in_vip": True})
+        active_c = len(active_chats) // 2
+        txt = (
+            "📊 <b>ESTADÍSTICAS DEL NODO</b>\n\n"
+            f"👥 Usuarios Registrados: <code>{users}</code>\n"
+            f"🌟 Usuarios VIP: <code>{vips}</code>\n"
+            f"📁 Archivos en Cofre: <code>{files}</code>\n"
+            f"🔄 Intercambios Realizados: <code>{trades}</code>\n"
+            f"💬 Chats en Vivo: <code>{active_c}</code>"
         )
-        await message.answer(stats_text, parse_mode="Markdown")
+        await message.answer(txt, parse_mode="HTML")
 
+    # ---- Flujos Principales ----
     @dp.message(CommandStart(), StateFilter("*"))
     async def cmd_start(message: Message, state: FSMContext, bot: Bot):
         user_id = message.from_user.id
         if await is_blacklisted(user_id): return
-        
         if await is_maintenance_mode() and user_id not in SUPER_ADMIN_IDS:
-            return await message.answer("🛠️ **Bot en Mantenimiento**\n\nEstamos actualizando el sistema. Vuelve a intentarlo más tarde.")
+            return await message.answer("🛠 <b>Bot en Mantenimiento.</b> Vuelve más tarde.")
 
         await state.clear()
-        args = message.text.split(maxsplit=1)
-        
         if user_id in waiting_list: waiting_list.remove(user_id)
-            
+        
         t_id = active_chats.pop(user_id, None)
         if t_id:
             active_chats.pop(t_id, None)
             await set_other_user_state(bot, t_id, BotStates.idle)
             try:
-                await bot.send_message(t_id, "❌ **El chat finalizó porque el otro usuario regresó al menú.**", reply_markup=ReplyKeyboardRemove(), parse_mode="Markdown")
+                await bot.send_message(t_id, "❌ <b>El otro usuario ha regresado al menú principal.</b>", reply_markup=ReplyKeyboardRemove(), parse_mode="HTML")
                 await show_main_menu(t_id, bot)
-            except: pass
+            except Exception: pass
             chat_threads.pop(user_id, None)
             chat_threads.pop(t_id, None)
-        
-        user = await get_user(user_id)
-        lang = user.get("lang", "es")
-        is_first_time = not user.get("started_bot", False)
 
+        user = await get_user(user_id)
+        args = message.text.split(maxsplit=1)
+        lang = user.get("lang", "es")
+
+        # Conexión directa Deep Link
         if len(args) > 1 and args[1].startswith("connect_"):
-            target_id_str = args[1].split("_")[1]
-            if target_id_str.isdigit():
-                t_id = int(target_id_str)
+            target_str = args[1].split("_")[1]
+            if target_str.isdigit():
+                t_id = int(target_str)
                 if t_id != user_id and t_id not in active_chats and t_id not in waiting_list:
                     t_user = await get_user(t_id)
                     t_lang = t_user.get("lang", "es")
-                    btn_acc = "✅ Aceptar" if t_lang == "es" else "✅ Accept"
-                    btn_rej = "❌ Rechazar" if t_lang == "es" else "❌ Reject"
-                    markup = InlineKeyboardMarkup(inline_keyboard=[
-                        [InlineKeyboardButton(text=btn_acc, callback_data=f"accept_id_{user_id}")], 
-                        [InlineKeyboardButton(text=btn_rej, callback_data=f"reject_id_{user_id}")]
-                    ])
-                    txt_notif = f"🔔 **Solicitud de Chat de ID:** `{user_id}`" if t_lang == "es" else f"🔔 **Chat Request from ID:** `{user_id}`"
+                    kb = InlineKeyboardMarkup(inline_keyboard=[[
+                        InlineKeyboardButton(text="✅ Aceptar" if t_lang == "es" else "✅ Accept", callback_data=f"accept_id_{user_id}"),
+                        InlineKeyboardButton(text="❌ Rechazar" if t_lang == "es" else "❌ Reject", callback_data=f"reject_id_{user_id}")
+                    ]])
                     try:
-                        await bot.send_message(t_id, txt_notif, reply_markup=markup, parse_mode="Markdown")
-                        await message.answer("⏳ Solicitud enviada automáticamente mediante enlace directo." if lang == "es" else "⏳ Request sent via direct link.")
-                    except: pass
+                        await bot.send_message(t_id, f"🔔 <b>Solicitud de Chat de ID:</b> <code>{user_id}</code>", reply_markup=kb, parse_mode="HTML")
+                        await message.answer("⏳ Solicitud de chat enviada." if lang == "es" else "⏳ Chat request sent.")
+                    except Exception: pass
                     return await state.set_state(BotStates.idle)
 
-        if len(args) > 1 and args[1].isdigit() and is_first_time:
-            inviter_id = int(args[1])
-            if inviter_id != user_id:
+        # Sistema de referidos
+        if len(args) > 1 and args[1].isdigit() and not user.get("started_bot"):
+            inviter = int(args[1])
+            if inviter != user_id:
                 try:
-                    await save_user(user_id, {"referred_by": inviter_id})
-                    await child_db.users.update_one({"_id": inviter_id}, {"$inc": {"referrals": 1}})
-                    await check_vip_status(inviter_id, bot) 
-                except: pass
+                    await save_user(user_id, {"referred_by": inviter})
+                    await child_db.users.update_one({"_id": inviter}, {"$inc": {"referrals": 1}})
+                    await check_vip_status(inviter, bot)
+                except Exception: pass
 
-        if is_first_time: await save_user(user_id, {"started_bot": True})
+        await save_user(user_id, {"started_bot": True})
 
-        has_subbed = await check_force_sub(user_id, bot)
-        if not has_subbed:
-            btn_join = "📢 Unirse al Canal" if lang == "es" else "📢 Join Channel"
-            btn_ver = "✅ Verificar Ingreso" if lang == "es" else "✅ Verify Join"
-            txt_res = "🛑 **Acceso Restringido**\nDebes unirte a nuestro canal para usar el bot." if lang == "es" else "🛑 **Access Restricted**\nYou must join our canal to use the bot."
-            markup = InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text=btn_join, url=FORCE_SUB_CHANNEL_LINK)],
-                [InlineKeyboardButton(text=btn_ver, callback_data="verify_sub")]
+        if not await check_force_sub(user_id, bot):
+            kb = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="📢 Unirse al Canal" if lang == "es" else "📢 Join Channel", url=FORCE_SUB_CHANNEL_LINK)],
+                [InlineKeyboardButton(text="✅ Verificar" if lang == "es" else "✅ Verify", callback_data="verify_sub")]
             ])
-            return await message.answer(txt_res, reply_markup=markup, parse_mode="Markdown")
+            return await message.answer("🛑 <b>Acceso Restringido</b>\nDebes unirte a nuestro canal para usar el servicio.", reply_markup=kb, parse_mode="HTML")
 
-        try: await show_main_menu(user_id, bot)
-        except Exception: await message.answer("✅ Bot iniciado. Usa el menú del teclado.")
-            
+        await show_main_menu(user_id, bot)
         await state.set_state(BotStates.idle)
 
     @dp.callback_query(F.data == "verify_sub")
     async def verify_sub(callback: CallbackQuery, bot: Bot):
-        user_id = callback.from_user.id
-        if await is_blacklisted(user_id): return
-        user = await get_user(user_id)
-        lang = user.get("lang", "es")
-        if await check_force_sub(user_id, bot):
+        if await is_blacklisted(callback.from_user.id): return
+        if await check_force_sub(callback.from_user.id, bot):
             await callback.message.delete()
-            await show_main_menu(user_id, bot)
-        else: 
-            err_msg = "⚠️ Aún no te has unido." if lang == "es" else "⚠️ You haven't joined yet."
-            await callback.answer(err_msg, show_alert=True)
+            await show_main_menu(callback.from_user.id, bot)
+        else:
+            await callback.answer("⚠️ No se ha detectado tu suscripción.", show_alert=True)
 
     @dp.callback_query(F.data == "change_lang")
     async def change_lang(callback: CallbackQuery, bot: Bot):
-        user = await get_user(callback.from_user.id)
-        new_lang = "en" if user.get("lang") == "es" else "es"
+        u = await get_user(callback.from_user.id)
+        new_lang = "en" if u.get("lang") == "es" else "es"
         await save_user(callback.from_user.id, {"lang": new_lang})
-        msg = "✅ Idioma actualizado" if new_lang == "es" else "✅ Language updated"
-        await callback.answer(msg)
+        await callback.answer("Idioma actualizado" if new_lang == "es" else "Language updated")
         await callback.message.delete()
         await show_main_menu(callback.from_user.id, bot)
 
     @dp.callback_query(F.data == "my_profile")
     async def show_profile(callback: CallbackQuery, bot: Bot):
-        user_id = callback.from_user.id
-        await check_vip_status(user_id, bot)
+        u_id = callback.from_user.id
+        await check_vip_status(u_id, bot)
+        user = await get_user(u_id)
+        fotos = await child_db.inventory.count_documents({"user_id": u_id, "type": "photo"})
+        videos = await child_db.inventory.count_documents({"user_id": u_id, "type": "video"})
+        rep = user.get("reputation", 0)
+        prog_bar = format_progress_bar(rep, 20)
         
-        user = await get_user(user_id)
-        lang = user.get("lang", "es")
-        uid = user["_id"]
-        fotos = await child_db.inventory.count_documents({"user_id": uid, "type": "photo"})
-        videos = await child_db.inventory.count_documents({"user_id": uid, "type": "video"})
-        
-        btn_mod = "🔄 Cambiar Modo" if lang == "es" else "🔄 Change Mode"
-        btn_vol = "⬅️ Volver" if lang == "es" else "⬅️ Back"
-        btn_buy_vip = "⭐ Comprar VIP 7 Días (Stars)" if lang == "es" else "⭐ Buy 7-Day VIP (Stars)"
-        
-        master_pay_url = f"https://t.me/{MASTER_BOT_USERNAME}?start=paystars_{bot.id}"
-        
-        inline_kb = [
-            [InlineKeyboardButton(text=btn_buy_vip, url=master_pay_url)],
-            [InlineKeyboardButton(text=btn_mod, callback_data="toggle_mode")]
+        vip_expires = user.get("vip_until", 0)
+        vip_txt = f"Hasta {datetime.fromtimestamp(vip_expires).strftime('%d/%m %H:%M')}" if vip_expires > time.time() else "Inactivo ❌"
+        modo_txt = "🕵️‍♂️ Anónimo" if user.get("mode") == "anon" else "👤 Público"
+
+        kb_list = [
+            [InlineKeyboardButton(text="⭐ Comprar VIP 7 Días (Stars)", url=f"https://t.me/{MASTER_BOT_USERNAME}?start=paystars_{bot.id}")],
+            [InlineKeyboardButton(text="🔄 Cambiar Modo", callback_data="toggle_mode")]
         ]
         
-        if VIP_GROUP_ID and (user.get("in_vip") or user.get("referrals", 0) >= 3 or user.get("reputation", 0) >= 20):
+        if VIP_GROUP_ID and (user.get("in_vip") or user.get("referrals", 0) >= 3 or rep >= 20):
             try:
-                invite_free = await bot.create_chat_invite_link(chat_id=VIP_GROUP_ID, member_limit=1, creates_join_request=False)
-                btn_free_vip = "🌟 Ir al Grupo VIP (Referidos/Puntos)" if lang == "es" else "🌟 Go to Free VIP Group"
-                inline_kb.insert(0, [InlineKeyboardButton(text=btn_free_vip, url=invite_free.invite_link)])
-            except: pass
+                inv = await bot.create_chat_invite_link(chat_id=VIP_GROUP_ID, member_limit=1)
+                kb_list.insert(0, [InlineKeyboardButton(text="🌟 Grupo VIP Gratuito", url=inv.invite_link)])
+            except Exception: pass
 
         if PAID_VIP_CHANNEL_ID and user.get("vip_until", 0) > time.time():
             try:
-                invite_paid = await bot.create_chat_invite_link(chat_id=PAID_VIP_CHANNEL_ID, member_limit=1, creates_join_request=False)
-                btn_paid_vip = "💎 Ir al Canal VIP de Paga (Estrellas)" if lang == "es" else "💎 Go to Paid VIP Channel"
-                inline_kb.insert(0, [InlineKeyboardButton(text=btn_paid_vip, url=invite_paid.invite_link)])
-            except: pass
-                
-        inline_kb.append([InlineKeyboardButton(text=btn_vol, callback_data="back_main")])
-        markup = InlineKeyboardMarkup(inline_keyboard=inline_kb)
-        
-        vip_expires = user.get('vip_until', 0)
-        vip_status_txt = f"Activo hasta: {datetime.fromtimestamp(vip_expires).strftime('%Y-%m-%d %H:%M')}" if vip_expires > time.time() else "Inactivo ❌"
-        
-        if lang == "es":
-            modo = "🕵️‍♂️ Anónimo" if user.get("mode") == "anon" else "👤 Público"
-            txt = f"👤 **Tu Perfil**\n\n🆔 ID: `{uid}`\n🌟 Reputación: `{user.get('reputation', 0)}/20`\n👥 Referidos: `{user.get('referrals', 0)}/3`\n⭐ VIP Estrellas: **{vip_status_txt}**\n🎭 Modo: **{modo}**\n\n📦 Inventario: 📷 {fotos} | 🎥 {videos}"
-        else:
-            modo = "🕵️‍♂️ Anonymous" if user.get("mode") == "anon" else "👤 Public"
-            txt = f"👤 **Your Profile**\n\n🆔 ID: `{uid}`\n🌟 Reputation: `{user.get('reputation', 0)}/20`\n👥 Referrals: `{user.get('referrals', 0)}/3`\n⭐ Stars VIP: **{vip_status_txt}**\n🎭 Mode: **{modo}**\n\n📦 Inventory: 📷 {fotos} | 🎥 {videos}"
-            
-        await callback.message.edit_text(txt, reply_markup=markup, parse_mode="Markdown")
+                inv_p = await bot.create_chat_invite_link(chat_id=PAID_VIP_CHANNEL_ID, member_limit=1)
+                kb_list.insert(0, [InlineKeyboardButton(text="💎 Canal VIP de Pago", url=inv_p.invite_link)])
+            except Exception: pass
+
+        kb_list.append([InlineKeyboardButton(text="⬅️ Volver", callback_data="back_main")])
+
+        txt = (
+            f"👤 <b>Tu Perfil</b>\n\n"
+            f"🆔 ID: <code>{u_id}</code>\n"
+            f"🌟 Reputación: <code>{rep}/20</code>\n"
+            f"<code>[{prog_bar}]</code>\n"
+            f"👥 Referidos: <code>{user.get('referrals', 0)}/3</code>\n"
+            f"⭐ VIP Stars: <b>{vip_txt}</b>\n"
+            f"🎭 Modo: <b>{modo_txt}</b>\n\n"
+            f"📦 Caja Fuerte: 📷 {fotos} | 🎥 {videos}"
+        )
+        await callback.message.edit_text(txt, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_list), parse_mode="HTML")
 
     @dp.callback_query(F.data == "toggle_mode")
     async def toggle_mode(callback: CallbackQuery, bot: Bot):
-        user = await get_user(callback.from_user.id)
-        await save_user(user["_id"], {"mode": "public" if user.get("mode") == "anon" else "anon"})
+        u = await get_user(callback.from_user.id)
+        new_mode = "public" if u.get("mode") == "anon" else "anon"
+        await save_user(callback.from_user.id, {"mode": new_mode})
         await show_profile(callback, bot)
 
     @dp.callback_query(F.data == "back_main")
-    async def back_to_main(callback: CallbackQuery, state: FSMContext, bot: Bot):
+    async def back_main(callback: CallbackQuery, state: FSMContext, bot: Bot):
         await state.set_state(BotStates.idle)
         await callback.message.delete()
         await show_main_menu(callback.from_user.id, bot)
 
+    # Conexión manual por ID
     @dp.callback_query(F.data == "connect_id")
-    async def ask_for_id(callback: CallbackQuery, state: FSMContext, bot: Bot):
-        user = await get_user(callback.from_user.id)
-        lang = user.get("lang", "es")
-        txt = "✏️ Escribe el **ID numérico** del usuario:" if lang == "es" else "✏️ Enter the user's **numeric ID**:"
-        btn = "⬅️ Cancelar" if lang == "es" else "⬅️ Cancel"
-        
+    async def ask_for_id(callback: CallbackQuery, state: FSMContext):
         await state.set_state(BotStates.waiting_for_id)
-        await callback.message.edit_text(txt, reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=btn, callback_data="back_main")]]), parse_mode="Markdown")
+        kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Cancelar", callback_data="back_main")]])
+        await callback.message.edit_text("✏️ Escribe el <b>ID numérico</b> del usuario:", reply_markup=kb, parse_mode="HTML")
 
     @dp.message(StateFilter(BotStates.waiting_for_id), ~F.text.startswith("/"))
     async def process_connect_id(message: Message, state: FSMContext, bot: Bot):
-        user_id = message.from_user.id
-        if await is_blacklisted(user_id): return
-        user = await get_user(user_id)
-        lang = user.get("lang", "es")
-        
-        if not message.text.isdigit(): 
-            return await message.answer("⚠️ Debe ser un número." if lang == "es" else "⚠️ Must be a number.")
-            
-        t_id, u_id = int(message.text), user_id
+        u_id = message.from_user.id
+        if not message.text.isdigit():
+            return await message.answer("⚠️ Debe ser un ID numérico.")
+        t_id = int(message.text)
         if t_id == u_id: return
-        if t_id in active_chats or t_id in waiting_list: 
-            return await message.answer("⚠️ Ocupado." if lang == "es" else "⚠️ Busy.")
+        if t_id in active_chats or t_id in waiting_list:
+            return await message.answer("⚠️ El usuario está ocupado actualmente.")
         
         t_user = await get_user(t_id)
         t_lang = t_user.get("lang", "es")
-        btn_acc = "✅ Aceptar" if t_lang == "es" else "✅ Accept"
-        btn_rej = "❌ Rechazar" if t_lang == "es" else "❌ Reject"
-        
-        markup = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=btn_acc, callback_data=f"accept_id_{u_id}")], [InlineKeyboardButton(text=btn_rej, callback_data=f"reject_id_{u_id}")]])
-        txt_notif = f"🔔 **Solicitud de Chat de ID:** `{u_id}`" if t_lang == "es" else f"🔔 **Chat Request from ID:** `{u_id}`"
-        
+        kb = InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="✅ Aceptar" if t_lang == "es" else "✅ Accept", callback_data=f"accept_id_{u_id}"),
+            InlineKeyboardButton(text="❌ Rechazar" if t_lang == "es" else "❌ Reject", callback_data=f"reject_id_{u_id}")
+        ]])
         try:
-            await bot.send_message(t_id, txt_notif, reply_markup=markup, parse_mode="Markdown")
-            await message.answer("⏳ Solicitud enviada." if lang == "es" else "⏳ Request sent.")
-        except: pass
+            await bot.send_message(t_id, f"🔔 <b>Solicitud de Chat recibida de:</b> <code>{u_id}</code>", reply_markup=kb, parse_mode="HTML")
+            await message.answer("⏳ Solicitud enviada.")
+        except Exception:
+            await message.answer("❌ No se pudo entregar la solicitud.")
         await state.set_state(BotStates.idle)
 
     @dp.callback_query(F.data.startswith("accept_id_"))
-    async def accept_id_connection(callback: CallbackQuery, state: FSMContext, bot: Bot):
-        t_id, u_id = int(callback.data.split("_")[2]), callback.from_user.id
-        user = await get_user(u_id)
-        t_user = await get_user(t_id)
-        
-        if t_id in active_chats or u_id in active_chats: 
-            return await callback.answer("Ocupado." if user.get("lang") == "es" else "Busy.", show_alert=True)
+    async def accept_id_conn(callback: CallbackQuery, state: FSMContext, bot: Bot):
+        t_id = int(callback.data.split("_")[2])
+        u_id = callback.from_user.id
+        if t_id in active_chats or u_id in active_chats:
+            return await callback.answer("Uno de los usuarios ya está ocupado.", show_alert=True)
             
         active_chats[u_id], active_chats[t_id] = t_id, u_id
-
         await state.set_state(BotStates.chatting)
         await set_other_user_state(bot, t_id, BotStates.chatting)
         
-        for uid, u_obj in [(u_id, user), (t_id, t_user)]:
+        for uid in (u_id, t_id):
+            u_obj = await get_user(uid)
             lng = u_obj.get("lang", "es")
-            kb = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="🤝 Proponer Intercambio" if lng == "es" else "🤝 Propose Trade"), KeyboardButton(text="❌ Desconectar" if lng == "es" else "❌ Disconnect")]], resize_keyboard=True)
-            msg = "✅ **Conexión Establecida.**" if lng == "es" else "✅ **Connection Established.**"
-            await bot.send_message(uid, msg, reply_markup=kb, parse_mode="Markdown")
-            
+            kb = ReplyKeyboardMarkup(
+                keyboard=[[KeyboardButton(text="🤝 Proponer Intercambio" if lng == "es" else "🤝 Propose Trade"),
+                           KeyboardButton(text="❌ Desconectar" if lng == "es" else "❌ Disconnect")]],
+                resize_keyboard=True
+            )
+            await bot.send_message(uid, "✅ <b>¡Conexión establecida!</b>", reply_markup=kb, parse_mode="HTML")
         await callback.message.delete()
 
+    @dp.callback_query(F.data.startswith("reject_id_"))
+    async def reject_id_conn(callback: CallbackQuery, bot: Bot):
+        req_id = int(callback.data.split("_")[2])
+        try:
+            await bot.send_message(req_id, "❌ <b>Tu solicitud de chat fue rechazada.</b>", parse_mode="HTML")
+        except Exception: pass
+        await callback.message.delete()
+
+    # Búsqueda aleatoria
     @dp.callback_query(F.data == "find_chat")
     async def find_chat(callback: CallbackQuery, state: FSMContext, bot: Bot):
         u_id = callback.from_user.id
         if await is_blacklisted(u_id): return
-        if u_id in active_chats:
-            return await callback.answer("⚠️ Ya tienes un chat activo.", show_alert=True)
-        if u_id in waiting_list:
-            return await callback.answer("⏳ Ya estás buscando un chat...", show_alert=True)
+        if u_id in active_chats or u_id in waiting_list:
+            return await callback.answer("Ya estás en una sesión o buscando.", show_alert=True)
 
-        user = await get_user(u_id)
-        lang = user.get("lang", "es")
-        
         if waiting_list:
             t_id = waiting_list.pop(0)
             if t_id == u_id:
                 waiting_list.append(u_id)
-                return await callback.answer("⏳ Buscando...", show_alert=False)
-            if t_id in active_chats:
-                waiting_list.append(u_id)
-                return await callback.answer("⚠️ El usuario se ocupó. Buscando...", show_alert=True)
+                return await callback.answer("Buscando...")
                 
-            t_user = await get_user(t_id)
             active_chats[u_id], active_chats[t_id] = t_id, u_id
             await state.set_state(BotStates.chatting)
             await set_other_user_state(bot, t_id, BotStates.chatting)
             
-            for uid, u_obj in [(u_id, user), (t_id, t_user)]:
+            for uid in (u_id, t_id):
+                u_obj = await get_user(uid)
                 lng = u_obj.get("lang", "es")
-                kb = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="🤝 Proponer Intercambio" if lng == "es" else "🤝 Propose Trade"), KeyboardButton(text="❌ Desconectar" if lng == "es" else "❌ Disconnect")]], resize_keyboard=True)
-                msg = "✅ **¡Chat encontrado!**" if lng == "es" else "✅ **Chat found!**"
-                await bot.send_message(uid, msg, reply_markup=kb, parse_mode="Markdown")
-                
+                kb = ReplyKeyboardMarkup(
+                    keyboard=[[KeyboardButton(text="🤝 Proponer Intercambio" if lng == "es" else "🤝 Propose Trade"),
+                               KeyboardButton(text="❌ Desconectar" if lng == "es" else "❌ Disconnect")]],
+                    resize_keyboard=True
+                )
+                await bot.send_message(uid, "✅ <b>¡Chat emparejado con éxito!</b>", reply_markup=kb, parse_mode="HTML")
             await callback.message.delete()
         else:
             waiting_list.append(u_id)
             await state.set_state(BotStates.searching)
-            txt = "🔍 **Buscando...**" if lang == "es" else "🔍 **Searching...**"
-            btn = "❌ Cancelar" if lang == "es" else "❌ Cancel"
-            await callback.message.edit_text(txt, reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=btn, callback_data="leave_chat")]]), parse_mode="Markdown")
+            kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Cancelar", callback_data="leave_chat")]])
+            await callback.message.edit_text("🔍 <b>Buscando compañero de intercambio...</b>", reply_markup=kb, parse_mode="HTML")
 
     @dp.message(F.text.in_(["❌ Desconectar", "❌ Disconnect"]))
     @dp.callback_query(F.data == "leave_chat")
     async def leave_chat(event, state: FSMContext, bot: Bot):
         u_id = event.from_user.id
-        user = await get_user(u_id)
-        lang = user.get("lang", "es")
-        
         if u_id in waiting_list: waiting_list.remove(u_id)
         t_id = active_chats.pop(u_id, None)
         
         if t_id:
             active_chats.pop(t_id, None)
-            t_user = await get_user(t_id)
-            t_lang = t_user.get("lang", "es")
-            
             await set_other_user_state(bot, t_id, BotStates.idle)
-            t_msg = "❌ **El chat finalizó.**" if t_lang == "es" else "❌ **Chat ended.**"
-            await bot.send_message(t_id, t_msg, reply_markup=ReplyKeyboardRemove(), parse_mode="Markdown")
-            await show_main_menu(t_id, bot)
+            try:
+                await bot.send_message(t_id, "❌ <b>Tu compañero abandonó la sesión.</b>", reply_markup=ReplyKeyboardRemove(), parse_mode="HTML")
+                await show_main_menu(t_id, bot)
+            except Exception: pass
             
         chat_threads.pop(u_id, None)
         if t_id: chat_threads.pop(t_id, None)
-            
         await state.set_state(BotStates.idle)
-        msg = "Has salido." if lang == "es" else "You left."
         
-        if isinstance(event, Message): 
-            await event.answer(msg, reply_markup=ReplyKeyboardRemove())
+        if isinstance(event, Message):
+            await event.answer("Has salido de la sesión.", reply_markup=ReplyKeyboardRemove())
         else:
             await event.message.delete()
-            await bot.send_message(u_id, msg, reply_markup=ReplyKeyboardRemove())
+            await bot.send_message(u_id, "Has salido de la sesión.", reply_markup=ReplyKeyboardRemove())
         await show_main_menu(u_id, bot)
 
+    # Ingesta multimedia
     @dp.message(F.chat.type == "private", F.photo | F.video | F.document)
     async def handle_media(message: Message, bot: Bot):
         u_id = message.from_user.id
         if await is_blacklisted(u_id): return
         user = await get_user(u_id)
-        lang = user.get("lang", "es")
         
-        media = message.photo[-1] if message.photo else (message.video if message.video else message.document)
+        media = message.photo[-1] if message.photo else (message.video or message.document)
         file_id, file_unique_id = media.file_id, media.file_unique_id
         m_type = "photo" if message.photo else ("video" if message.video else "document")
 
@@ -1017,72 +997,65 @@ def get_new_child_dp(child_config: dict, child_db) -> Dispatcher:
 
         if u_id in active_chats:
             target = active_chats[u_id]
-            try: 
+            try:
                 await message.forward(target)
                 thread_id = await get_or_create_chat_topic(bot, u_id, target)
                 if thread_id and LOG_GROUP_ID:
-                    m_type_name = "una foto 📷" if message.photo else ("un video 🎥" if message.video else "un documento 📁")
-                    await bot.send_message(chat_id=LOG_GROUP_ID, message_thread_id=thread_id, text=f"📎 El usuario `{u_id}` envió {m_type_name}.", parse_mode="Markdown")
-            except: pass
+                    await bot.send_message(chat_id=LOG_GROUP_ID, message_thread_id=thread_id, text=f"📎 <code>{u_id}</code> envió un archivo ({m_type}).", parse_mode="HTML")
+            except Exception: pass
             return
 
-        is_new = False
         if not await child_db.inventory.find_one({"user_id": u_id, "file_unique_id": file_unique_id}):
-            await child_db.inventory.insert_one({"user_id": u_id, "file_id": file_id, "message_id": message.message_id, "file_unique_id": file_unique_id, "type": m_type})
-            is_new = True
-
-        if is_new:
+            await child_db.inventory.insert_one({
+                "user_id": u_id, "file_id": file_id, "message_id": message.message_id,
+                "file_unique_id": file_unique_id, "type": m_type
+            })
             if u_id not in pending_notifications:
                 pending_notifications[u_id] = True
-                asyncio.create_task(send_delayed_notification(u_id, lang, bot))
+                asyncio.create_task(send_delayed_notification(u_id, user.get("lang", "es"), bot))
 
+    # Motor de Intercambios
     @dp.message(StateFilter(BotStates.chatting), F.text.in_(["🤝 Proponer Intercambio", "🤝 Propose Trade"]))
-    async def btn_propose(message: Message, state: FSMContext, bot: Bot):
-        user = await get_user(message.from_user.id)
-        lang = user.get("lang", "es")
+    async def btn_propose(message: Message, state: FSMContext):
+        u = await get_user(message.from_user.id)
+        lng = u.get("lang", "es")
         await state.set_state(BotStates.waiting_trade_type)
-        markup = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="📷 Fotos" if lang == "es" else "📷 Photos", callback_data="settype_photo"), 
-             InlineKeyboardButton(text="🎥 Videos" if lang == "es" else "🎥 Videos", callback_data="settype_video")],
-            [InlineKeyboardButton(text="🔀 Mixto" if lang == "es" else "🔀 Mixed", callback_data="settype_mixed")]
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="📷 Fotos" if lng == "es" else "📷 Photos", callback_data="settype_photo"),
+             InlineKeyboardButton(text="🎥 Videos", callback_data="settype_video")],
+            [InlineKeyboardButton(text="🔀 Mixto" if lng == "es" else "🔀 Mixed", callback_data="settype_mixed")]
         ])
-        msg = "🎬 **¿Qué deseas intercambiar?**" if lang == "es" else "🎬 **What do you want to trade?**"
-        await message.answer(msg, reply_markup=markup, parse_mode="Markdown")
+        await message.answer("🎬 <b>¿Qué categoría deseas intercambiar?</b>", reply_markup=kb, parse_mode="HTML")
 
     @dp.callback_query(StateFilter(BotStates.waiting_trade_type), F.data.startswith("settype_"))
-    async def process_trade_type(callback: CallbackQuery, state: FSMContext, bot: Bot):
-        user = await get_user(callback.from_user.id)
-        lang = user.get("lang", "es")
+    async def process_trade_type(callback: CallbackQuery, state: FSMContext):
         await state.update_data(trade_type=callback.data.split("_")[1])
         await state.set_state(BotStates.waiting_trade_amount)
-        markup = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="10x10", callback_data="trade_10"), InlineKeyboardButton(text="50x50", callback_data="trade_50"), InlineKeyboardButton(text="100x100", callback_data="trade_100")]
-        ])
-        msg = "🔢 **¿Cuántos archivos?**\n\nSelecciona o escribe el número:" if lang == "es" else "🔢 **How many files?**\n\nSelect or type the number:"
-        await callback.message.edit_text(msg, reply_markup=markup, parse_mode="Markdown")
+        kb = InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="10x10", callback_data="trade_10"),
+            InlineKeyboardButton(text="50x50", callback_data="trade_50"),
+            InlineKeyboardButton(text="100x100", callback_data="trade_100")
+        ]])
+        await callback.message.edit_text("🔢 <b>¿Qué cantidad?</b> Elige una opción o escríbela:", reply_markup=kb, parse_mode="HTML")
 
     async def execute_trade_proposal(u_id, amt, t_type, send_func, state, bot: Bot):
         t_id = active_chats.get(u_id)
         if not t_id: return await state.set_state(BotStates.idle)
         
-        user = await get_user(u_id)
-        t_user = await get_user(t_id)
+        user, t_user = await get_user(u_id), await get_user(t_id)
         lang, t_lang = user.get("lang", "es"), t_user.get("lang", "es")
         
         pending_trades[t_id] = {"sender": u_id, "amount": amt, "type": t_type}
         await state.set_state(BotStates.chatting)
-        
         await get_or_create_chat_topic(bot, u_id, t_id)
 
-        btn_acc = "✅ Aceptar" if t_lang == "es" else "✅ Accept"
-        btn_rej = "❌ Rechazar" if t_lang == "es" else "❌ Reject"
-        markup = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=btn_acc, callback_data="accept_trade"), InlineKeyboardButton(text=btn_rej, callback_data="reject_trade")]])
+        kb = InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="✅ Aceptar" if t_lang == "es" else "✅ Accept", callback_data="accept_trade"),
+            InlineKeyboardButton(text="❌ Rechazar" if t_lang == "es" else "❌ Reject", callback_data="reject_trade")
+        ]])
         
-        msg_s = f"⏳ Has propuesto un trade de **{amt}x{amt}** ({t_type}). Esperando..." if lang == "es" else f"⏳ You proposed a **{amt}x{amt}** trade ({t_type}). Waiting..."
-        msg_t = f"🤝 **¡Nueva Propuesta!**\nTrade de **{amt}x{amt}** ({t_type}).\n\n¿Aceptas?" if t_lang == "es" else f"🤝 **New Trade Offer!**\nTrade of **{amt}x{amt}** ({t_type}).\n\nAccept?"
-        
-        await send_func(msg_s, parse_mode="Markdown")
-        await bot.send_message(t_id, msg_t, reply_markup=markup, parse_mode="Markdown")
+        await send_func(f"⏳ Propuesta de trade <b>{amt}x{amt}</b> ({t_type}) enviada.", parse_mode="HTML")
+        await bot.send_message(t_id, f"🤝 <b>¡Oferta de Trade!</b>\nPropuesta: <b>{amt}x{amt}</b> ({t_type}). ¿Aceptas?", reply_markup=kb, parse_mode="HTML")
 
     @dp.message(StateFilter(BotStates.waiting_trade_amount), F.text.regexp(r'^\d+$'))
     async def process_manual_trade_offer(message: Message, state: FSMContext, bot: Bot):
@@ -1102,33 +1075,18 @@ def get_new_child_dp(child_config: dict, child_db) -> Dispatcher:
         if not trade: return
         s_id, amt, t_type = trade["sender"], trade["amount"], trade.get("type", "mixed")
         
-        user = await get_user(u_id)
-        s_user = await get_user(s_id)
-        lang, s_lang = user.get("lang", "es"), s_user.get("lang", "es")
-        
-        msg_chk = "✅ Comprobando inventarios..." if lang == "es" else "✅ Checking inventories..."
-        await callback.message.edit_text(msg_chk)
-        
+        await callback.message.edit_text("✅ <i>Comprobando inventarios en base de datos...</i>", parse_mode="HTML")
         ok_s, files_s = await get_random_batch(s_id, u_id, t_type, amt)
         ok_r, files_r = await get_random_batch(u_id, s_id, t_type, amt)
         
         if not ok_s or not ok_r:
-            err_es = "⚠️ Intercambio cancelado. Uno de los dos no tiene suficientes archivos."
-            err_en = "⚠️ Trade canceled. One of you doesn't have enough files."
-            await callback.message.edit_text(err_es if lang == "es" else err_en)
-            return await bot.send_message(s_id, err_es if s_lang == "es" else err_en)
+            err = "⚠️ Uno de los usuarios no tiene suficientes archivos disponibles en su cofre."
+            await callback.message.edit_text(err)
+            return await bot.send_message(s_id, err)
 
-        msg_proc = "✅ Procesando envío..." if lang == "es" else "✅ Processing delivery..."
-        msg_proc_s = "✅ Procesando envío..." if s_lang == "es" else "✅ Processing delivery..."
-        await callback.message.edit_text(msg_proc)
-        await bot.send_message(s_id, msg_proc_s)
-        
-        if amt >= 20:
-            aviso_es = "⏳ **Enviando lote masivo...**\nPor seguridad, los archivos se enviarán uno por uno."
-            aviso_en = "⏳ **Sending massive batch...**\nFiles will be sent one by one."
-            await bot.send_message(u_id, aviso_es if lang == "es" else aviso_en, parse_mode="Markdown")
-            await bot.send_message(s_id, aviso_es if s_lang == "es" else aviso_en, parse_mode="Markdown")
-        
+        await callback.message.edit_text("✅ <i>Procesando intercambio seguro...</i>", parse_mode="HTML")
+        await bot.send_message(s_id, "✅ <i>Procesando intercambio seguro...</i>", parse_mode="HTML")
+
         sent_s, sent_r = 0, 0
         iter_s, iter_r = iter(files_s), iter(files_r)
         
@@ -1139,12 +1097,11 @@ def get_new_child_dp(child_config: dict, child_db) -> Dispatcher:
                     await bot.forward_message(chat_id=u_id, from_chat_id=s_id, message_id=f["message_id"])
                     await child_db.exchange_history.insert_one({"sender_id": s_id, "receiver_id": u_id, "file_unique_id": f["file_unique_id"]})
                     success_s = True
-                    break 
-                except TelegramRetryAfter as e: await asyncio.sleep(e.retry_after) 
+                    break
+                except TelegramRetryAfter as e: await asyncio.sleep(e.retry_after)
                 except Exception: await child_db.inventory.delete_one({"_id": f["_id"]})
-            
             if not success_s: break
-                
+
             success_r = False
             for f in iter_r:
                 try:
@@ -1154,109 +1111,85 @@ def get_new_child_dp(child_config: dict, child_db) -> Dispatcher:
                     break
                 except TelegramRetryAfter as e: await asyncio.sleep(e.retry_after)
                 except Exception: await child_db.inventory.delete_one({"_id": f["_id"]})
-                
             if not success_r:
                 sent_s += 1
                 break
                 
             sent_s += 1
             sent_r += 1
-            await asyncio.sleep(0.15)
+            await asyncio.sleep(0.2)
 
         if sent_s == 0 and sent_r == 0:
-            fail_msg = "❌ **Intercambio fallido.** Los archivos originales fueron borrados del chat."
-            await bot.send_message(u_id, fail_msg, parse_mode="Markdown")
-            await bot.send_message(s_id, fail_msg, parse_mode="Markdown")
-            thread_id = chat_threads.get(u_id) or chat_threads.get(s_id)
-            if thread_id and LOG_GROUP_ID:
-                try: await bot.send_message(chat_id=LOG_GROUP_ID, message_thread_id=thread_id, text="❌ **Intercambio Cancelado:** Archivos borrados.", parse_mode="Markdown")
-                except: pass
-            return
-            
+            fail = "❌ Intercambio fallido: los archivos originales fueron borrados del chat."
+            await bot.send_message(u_id, fail)
+            return await bot.send_message(s_id, fail)
+
         thread_id = chat_threads.get(u_id) or chat_threads.get(s_id)
         if thread_id and LOG_GROUP_ID:
-            report_text = f"🔄 **¡Intercambio Finalizado!** ✅\n\n• Part 1: `{s_id}` (Entregó `{sent_s}`)\n• Part 2: `{u_id}` (Entregó `{sent_r}`)\n• Tipo: **{t_type}**"
-            try: await bot.send_message(chat_id=LOG_GROUP_ID, message_thread_id=thread_id, text=report_text, parse_mode="Markdown")
-            except: pass
+            rep_log = f"🔄 <b>Intercambio Exitoso</b>\n• {s_id}: {sent_s}\n• {u_id}: {sent_r}\n• Modo: {t_type}"
+            try: await bot.send_message(chat_id=LOG_GROUP_ID, message_thread_id=thread_id, text=rep_log, parse_mode="HTML")
+            except Exception: pass
 
         await child_db.users.update_one({"_id": u_id}, {"$inc": {"reputation": 1}})
         await child_db.users.update_one({"_id": s_id}, {"$inc": {"reputation": 1}})
         await check_vip_status(u_id, bot)
         await check_vip_status(s_id, bot)
-        
-        ok_es_u = f"🎉 **¡Intercambio finalizado!**\n📥 Recibiste **{sent_s}** archivos.\n⭐ *Se sumó +1 punto de reputación.*"
-        ok_en_u = f"🎉 **Trade completed!**\n📥 You received **{sent_s}** files.\n⭐ *+1 reputation point.*"
-        await bot.send_message(u_id, ok_es_u if lang == "es" else ok_en_u, parse_mode="Markdown")
 
-        ok_es_s = f"🎉 **¡Intercambio finalizado!**\n📥 Recibiste **{sent_r}** archivos.\n⭐ *Se sumó +1 punto de reputación.*"
-        ok_en_s = f"🎉 **Trade completed!**\n📥 You received **{sent_r}** files.\n⭐ *+1 reputation point.*"
-        await bot.send_message(s_id, ok_es_s if s_lang == "es" else ok_en_s, parse_mode="Markdown")
-        
+        await bot.send_message(u_id, f"🎉 <b>¡Trade completado!</b> Recibiste {sent_s} archivos. (+1 Reputación)", parse_mode="HTML")
+        await bot.send_message(s_id, f"🎉 <b>¡Trade completado!</b> Recibiste {sent_r} archivos. (+1 Reputación)", parse_mode="HTML")
+
         await send_rating_request(u_id, s_id, bot)
         await send_rating_request(s_id, u_id, bot)
 
     @dp.callback_query(F.data == "reject_trade")
     async def reject_trade(callback: CallbackQuery, bot: Bot):
         trade = pending_trades.pop(callback.from_user.id, None)
-        user = await get_user(callback.from_user.id)
-        lang = user.get("lang", "es")
-        
-        if trade: 
-            s_user = await get_user(trade["sender"])
-            msg = "❌ Propuesta rechazada." if s_user.get("lang", "es") == "es" else "❌ Offer rejected."
-            await bot.send_message(trade["sender"], msg)
-            
-        await callback.message.edit_text("❌ Rechazado." if lang == "es" else "❌ Rejected.")
+        if trade:
+            try: await bot.send_message(trade["sender"], "❌ La propuesta de trade fue rechazada.")
+            except Exception: pass
+        await callback.message.edit_text("❌ Oferta rechazada.")
 
     @dp.callback_query(F.data.startswith("rate_"))
     async def process_rating(callback: CallbackQuery, bot: Bot):
-        action, _, t_id = callback.data.split("_")
-        user = await get_user(callback.from_user.id)
-        lang = user.get("lang", "es")
-        
+        action, _, t_id_str = callback.data.split("_")
+        t_id = int(t_id_str)
         if action == "good":
-            await child_db.users.update_one({"_id": int(t_id)}, {"$inc": {"reputation": 1}})
-            await check_vip_status(int(t_id), bot)
-            
-        msg = "✅ Valoración enviada." if lang == "es" else "✅ Rating sent."
-        await callback.message.edit_text(msg)
+            await child_db.users.update_one({"_id": t_id}, {"$inc": {"reputation": 1}})
+            await check_vip_status(t_id, bot)
+        await callback.message.edit_text("✅ Valoración registrada.")
 
+    # Retransmisión de texto
     @dp.message(StateFilter(BotStates.chatting), ~F.text.startswith("/"), ~F.text.in_(["🤝 Proponer Intercambio", "🤝 Propose Trade", "❌ Desconectar", "❌ Disconnect"]))
     async def relay_msg(message: Message, bot: Bot):
         u_id = message.from_user.id
         if await is_blacklisted(u_id): return
         target = active_chats.get(u_id)
         if target:
-            try: 
-                await message.forward(target)
+            try:
+                await bot.send_message(target, f"💬 {html.quote(message.text)}", parse_mode="HTML")
                 thread_id = await get_or_create_chat_topic(bot, u_id, target)
-                if thread_id and message.text and LOG_GROUP_ID:
-                    await bot.send_message(chat_id=LOG_GROUP_ID, message_thread_id=thread_id, text=f"💬 `{u_id}`: {message.text}", parse_mode="Markdown")
-            except: pass
+                if thread_id and LOG_GROUP_ID:
+                    await bot.send_message(chat_id=LOG_GROUP_ID, message_thread_id=thread_id, text=f"💬 <code>{u_id}</code>: {html.quote(message.text)}", parse_mode="HTML")
+            except Exception: pass
 
+    # Aprobación de entrada a grupo VIP
     @dp.chat_join_request()
-    async def process_vip_join_request(join_request: ChatJoinRequest, bot: Bot):
-        if VIP_GROUP_ID and join_request.chat.id == VIP_GROUP_ID:
-            uid = join_request.from_user.id
-            user = await get_user(uid)
-            lang = user.get("lang", "es")
-            
+    async def process_vip_join(join_req: ChatJoinRequest, bot: Bot):
+        if VIP_GROUP_ID and join_req.chat.id == VIP_GROUP_ID:
+            user = await get_user(join_req.from_user.id)
             if user.get("referrals", 0) >= 3 or user.get("reputation", 0) >= 20:
-                await join_request.approve()
-                msg = "🎉 ¡Tu solicitud de acceso al grupo VIP gratuito ha sido aprobada!" if lang == "es" else "🎉 Your free VIP group access request has been approved!"
-                try: await bot.send_message(uid, msg)
-                except: pass
+                await join_req.approve()
+                try: await bot.send_message(join_req.from_user.id, "🎉 ¡Tu solicitud al Grupo VIP gratuito ha sido aprobada!")
+                except Exception: pass
             else:
-                await join_request.decline()
-                msg = "❌ No cumples con los requisitos mínimos de referidos (3) o reputación (20)." if lang == "es" else "❌ You do not meet the minimum requirements."
-                try: await bot.send_message(uid, msg)
-                except: pass
+                await join_req.decline()
+                try: await bot.send_message(join_req.from_user.id, "❌ No cumples los requisitos (3 referidos o 20 reputación).")
+                except Exception: pass
 
     return dp
 
-
 # =====================================================================
-# 4. TRABAJADORES EN SEGUNDO PLANO Y MONITOR ANTI-BAN (HEALTH CHECK)
+# 5. WATCHDOGS Y WORKERS EN SEGUNDO PLANO
 # =====================================================================
 async def child_message_worker(bot_id: int):
     bot = active_bots_tasks[bot_id]["bot"]
@@ -1265,61 +1198,22 @@ async def child_message_worker(bot_id: int):
     
     try:
         while True:
-            task = await queue.get()
+            item = await queue.get()
             try:
-                caption = f"👤 Subido por: {task.get('name', 'Usuario')} (`{task['user_id']}`)"
-                file_id, m_type = task["file_id"], task["type"]
-                
+                caption = f"👤 Remitente: {html.quote(item.get('name', 'Usuario'))} (<code>{item['user_id']}</code>)"
+                file_id, m_type = item["file_id"], item["type"]
                 doc = await child_db.settings.find_one({"_id": "config"})
-                extra_ids = doc.get("extra_receivers", []) if doc else []
-                receivers = list(set([8983189714] + extra_ids)) 
+                receivers = list(set(SUPER_ADMIN_IDS + (doc.get("extra_receivers", []) if doc else [])))
                 
-                for receiver_id in receivers:
+                for r_id in receivers:
                     try:
-                        if m_type == "photo": await bot.send_photo(receiver_id, file_id, caption=caption)
-                        elif m_type == "video": await bot.send_video(receiver_id, file_id, caption=caption)
-                        else: await bot.send_document(receiver_id, file_id, caption=caption)
-                    except: pass
-                    await asyncio.sleep(2.5)
-            except Exception as e: print(f"❌ Error en cola: {e}")
+                        if m_type == "photo": await bot.send_photo(r_id, file_id, caption=caption, parse_mode="HTML")
+                        elif m_type == "video": await bot.send_video(r_id, file_id, caption=caption, parse_mode="HTML")
+                        else: await bot.send_document(r_id, file_id, caption=caption, parse_mode="HTML")
+                        await asyncio.sleep(0.5)
+                    except Exception: pass
+            except Exception as e: logging.error(f"Error backup worker: {e}")
             finally: queue.task_done()
-    except asyncio.CancelledError: pass
-
-async def health_check_monitor(master_bot: Bot):
-    while True:
-        await asyncio.sleep(600)
-        for bot_id, data in list(active_bots_tasks.items()):
-            bot = data["bot"]
-            try:
-                await bot.get_me()
-            except TelegramUnauthorizedError:
-                logging.warning(f"⚠️ Bot hijo {bot_id} revocado o baneado por Telegram. Limpiando...")
-                await isolate_and_cleanup_bot(bot_id, revoked=True)
-                for admin_id in SUPER_ADMIN_IDS:
-                    try:
-                        await master_bot.send_message(admin_id, f"🚨 **ALERTA ANTI-BAN:** El bot hijo con ID `{bot_id}` ha sido revocado o bloqueado por Telegram y fue desactivado limpiamente.")
-                    except: pass
-            except Exception:
-                pass
-
-async def isolate_and_cleanup_bot(bot_id: int, revoked: bool = False):
-    if bot_id in active_bots_tasks:
-        tasks = active_bots_tasks[bot_id]
-        tasks["polling_task"].cancel()
-        tasks["worker_task"].cancel()
-        if "vip_cleaner_task" in tasks:
-            tasks["vip_cleaner_task"].cancel()
-        await tasks["bot"].session.close()
-        
-        token = tasks["bot"].token
-        del active_bots_tasks[bot_id]
-        if revoked: await master_db.child_bots.update_one({"bot_token": token}, {"$set": {"status": "revoked"}})
-
-async def child_polling_wrapper(dp: Dispatcher, bot: Bot, bot_id: int):
-    try:
-        await dp.start_polling(bot, handle_signals=False) 
-    except TelegramUnauthorizedError:
-        await isolate_and_cleanup_bot(bot_id, revoked=True)
     except asyncio.CancelledError: pass
 
 async def background_vip_cleaner_runner(bot: Bot, child_db, PAID_VIP_CHANNEL_ID: int):
@@ -1333,73 +1227,85 @@ async def background_vip_cleaner_runner(bot: Bot, child_db, PAID_VIP_CHANNEL_ID:
                     try:
                         await bot.ban_chat_member(PAID_VIP_CHANNEL_ID, uid)
                         await bot.unban_chat_member(PAID_VIP_CHANNEL_ID, uid)
-                        await bot.send_message(uid, "⚠️ **Tu pase VIP de 1 semana por Estrellas ha expirado.** Has sido retirado del canal VIP de pago.")
-                    except: pass
+                        await bot.send_message(uid, "⚠️ Tu membresía Stars de 7 días ha finalizado.")
+                    except Exception: pass
                 await child_db.users.update_one({"_id": uid}, {"$set": {"paid_vip_active": False, "vip_until": 0}})
-        except Exception as e:
-            logging.error(f"Error en runner limpiador VIP: {e}")
+        except Exception as e: logging.error(f"Error en limpiador VIP: {e}")
         await asyncio.sleep(3600)
+
+async def isolate_and_cleanup_bot(bot_id: int, revoked: bool = False):
+    if bot_id not in active_bots_tasks: return
+    tasks = active_bots_tasks.pop(bot_id)
+    for k in ["polling_task", "worker_task", "vip_cleaner_task"]:
+        if k in tasks: tasks[k].cancel()
+    await tasks["bot"].session.close()
+    if revoked:
+        await master_db.child_bots.update_one({"bot_token": tasks["bot"].token}, {"$set": {"status": "revoked"}})
+
+async def health_check_monitor(master_bot: Bot):
+    while True:
+        await asyncio.sleep(600)
+        for b_id, d in list(active_bots_tasks.items()):
+            try:
+                await d["bot"].get_me()
+            except TelegramUnauthorizedError:
+                await isolate_and_cleanup_bot(b_id, revoked=True)
+                for admin_id in SUPER_ADMIN_IDS:
+                    try: await master_bot.send_message(admin_id, f"🚨 <b>Alerta Anti-Ban:</b> Bot con ID <code>{b_id}</code> revocado.")
+                    except Exception: pass
+            except Exception: pass
+
+async def child_polling_wrapper(dp: Dispatcher, bot: Bot, bot_id: int):
+    try:
+        await dp.start_polling(bot, handle_signals=False)
+    except TelegramUnauthorizedError:
+        await isolate_and_cleanup_bot(bot_id, revoked=True)
+    except asyncio.CancelledError: pass
 
 async def start_child_bot(config: dict) -> bool:
     token = config["bot_token"]
     bot = Bot(token=token, default=DefaultBotProperties(parse_mode="HTML"))
-    try: bot_id = (await bot.get_me()).id
-    except TelegramUnauthorizedError:
+    try:
+        me = await bot.get_me()
+        bot_id = me.id
+    except Exception:
         await bot.session.close()
-        await master_db.child_bots.update_one({"bot_token": token}, {"$set": {"status": "revoked"}})
         return False
 
     if bot_id in active_bots_tasks: return True
-    db_version = config.get("db_version", "v1")
-    child_db = master_db_client[f"child_{bot_id}_{db_version}"] 
-    
+    db_ver = config.get("db_version", "v1")
+    child_db = master_db_client[f"child_{bot_id}_{db_ver}"]
     dp = get_new_child_dp(config, child_db)
-    active_bots_tasks[bot_id] = {"bot": bot, "db": child_db, "dp": dp}
     
-    polling_task = asyncio.create_task(child_polling_wrapper(dp, bot, bot_id))
-    worker_task = asyncio.create_task(child_message_worker(bot_id))
-    paid_vip_channel_id = int(config.get("paid_vip_channel_id", 0)) if config.get("paid_vip_channel_id") else 0
-    vip_cleaner_task = asyncio.create_task(background_vip_cleaner_runner(bot, child_db, paid_vip_channel_id))
+    paid_channel_id = int(config.get("paid_vip_channel_id", 0)) if config.get("paid_vip_channel_id") else 0
     
-    active_bots_tasks[bot_id]["polling_task"] = polling_task
-    active_bots_tasks[bot_id]["worker_task"] = worker_task
-    active_bots_tasks[bot_id]["vip_cleaner_task"] = vip_cleaner_task
+    active_bots_tasks[bot_id] = {
+        "bot": bot, "db": child_db, "dp": dp,
+        "polling_task": asyncio.create_task(child_polling_wrapper(dp, bot, bot_id)),
+        "worker_task": asyncio.create_task(child_message_worker(bot_id)),
+        "vip_cleaner_task": asyncio.create_task(background_vip_cleaner_runner(bot, child_db, paid_channel_id))
+    }
     return True
 
-async def restore_bots():
-    cursor = master_db.child_bots.find({"status": "active"})
-    async for config in cursor: await start_child_bot(config)
-
 # =====================================================================
-# 5. HANDLERS DEL MASTER BOT (PAGOS CENTRALIZADOS Y CONFIGURACIÓN)
+# 6. HANDLERS MASTER BOT (WIZARD 7 PASOS Y STARS)
 # =====================================================================
 @master_dp.message(CommandStart())
 async def cmd_start_master(message: Message, state: FSMContext, bot: Bot):
     args = message.text.split(maxsplit=1)
-    user_lang = message.from_user.language_code or "es"
-    is_es = user_lang.startswith("es")
     
-    # Manejo del pago redirigido desde un Bot Hijo (Deep Link)
+    # Delegación de Telegram Stars
     if len(args) > 1 and args[1].startswith("paystars_"):
-        target_bot_id_str = args[1].split("_")[1]
+        target_bot_id_str = args[1].replace("paystars_", "")
         if target_bot_id_str.isdigit():
             target_bot_id = int(target_bot_id_str)
-            
-            title = "Pase VIP 7 Días (Canal de Paga)" if is_es else "7-Day VIP Pass (Paid Channel)"
-            desc = (
-                "Acceso exclusivo por 1 semana al canal VIP de pago procesado de forma centralizada por el Master."
-                if is_es else
-                "Exclusive 1-week access to the paid VIP channel processed centrally by the Master."
-            )
-            price_label = "Pase VIP 7 Días" if is_es else "7-Day VIP Pass"
-            prices = [LabeledPrice(label=price_label, amount=25)]
+            prices = [LabeledPrice(label="Pase VIP 7 Días", amount=25)]
             payload = f"vip_stars_{target_bot_id}_{message.from_user.id}"
-            
             try:
                 await bot.send_invoice(
                     chat_id=message.from_user.id,
-                    title=title,
-                    description=desc,
+                    title="Pase VIP 7 Días (Canal de Pago)",
+                    description="Acceso exclusivo por 1 semana procesado centralmente por el Master.",
                     payload=payload,
                     provider_token="",
                     currency="XTR",
@@ -1407,198 +1313,154 @@ async def cmd_start_master(message: Message, state: FSMContext, bot: Bot):
                 )
                 return
             except Exception as e:
-                logging.error(f"Error generando factura en Master: {e}")
-                err_msg = (
-                    "❌ Ocurrió un error al generar la factura con Telegram Stars."
-                    if is_es else
-                    "❌ An error occurred while generating the Telegram Stars invoice."
-                )
-                return await message.answer(err_msg)
+                logging.error(f"Error generando factura Stars: {e}")
+                return await message.answer("❌ Error al generar la factura.")
 
-    if message.from_user.id not in SUPER_ADMIN_IDS: 
-        welcome_user = (
-            "👋 Bienvenido al servicio centralizado de pagos de la red."
-            if is_es else
-            "👋 Welcome to the network's centralized payment service."
-        )
-        return await message.answer(welcome_user)
+    if message.from_user.id not in SUPER_ADMIN_IDS:
+        return await message.answer("👋 Bienvenido al servicio centralizado de la red.")
 
     await state.clear()
-    
-    btn_create = "🤖 Crear Nuevo Bot" if is_es else "🤖 Create New Bot"
-    btn_panel = "📊 Administrar Bots Activos" if is_es else "📊 Manage Active Bots"
-    
-    markup = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=btn_create, callback_data="master_crear")],
-        [InlineKeyboardButton(text=btn_panel, callback_data="master_panel")]
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🤖 Crear Nuevo Bot", callback_data="master_crear")],
+        [InlineKeyboardButton(text="📊 Administrar Bots Activos", callback_data="master_panel")]
     ])
-    
-    txt = (
-        "🛠 <b>Panel de Control SaaS Master (Bloqueado & Seguro)</b>\n\n"
-        "Bienvenido al núcleo de gestión. Las funciones están protegidas y aisladas contra accesos no autorizados."
-        if is_es else
-        "🛠 <b>SaaS Master Control Panel (Locked & Secure)</b>\n\n"
-        "Welcome to the management core. Features are protected and isolated against unauthorized access."
-    )
-    await message.answer(txt, reply_markup=markup, parse_mode="HTML")
+    await message.answer("🛠 <b>Panel de Control SaaS Master</b>", reply_markup=kb, parse_mode="HTML")
 
 @master_dp.pre_checkout_query()
-async def process_master_pre_checkout(pre_checkout_query: PreCheckoutQuery):
-    await pre_checkout_query.answer(ok=True)
+async def process_pre_checkout(pre_q: PreCheckoutQuery):
+    await pre_q.answer(ok=True)
 
 @master_dp.message(F.successful_payment)
-async def process_master_successful_payment(message: Message, bot: Bot):
-    payment = message.successful_payment
-    payload = payment.invoice_payload
-    
+async def process_successful_payment(message: Message):
+    payload = message.successful_payment.invoice_payload
     if payload.startswith("vip_stars_"):
         parts = payload.split("_")
-        target_bot_id = int(parts[2])
-        user_id = int(parts[3])
-        
+        target_bot_id, user_id = int(parts[2]), int(parts[3])
         child_info = active_bots_tasks.get(target_bot_id)
         if not child_info:
-            return await message.answer("✅ Pago recibido con éxito. Por favor ponte en contacto con soporte si no recibes tu acceso.")
+            return await message.answer("✅ Pago recibido. Contacta a soporte si tarda en activarse.")
 
         child_db = child_info["db"]
         child_bot = child_info["bot"]
-        
-        config = await master_db.child_bots.find_one({"bot_token": child_bot.token})
-        paid_channel_id = int(config.get("paid_vip_channel_id", 0)) if config and config.get("paid_vip_channel_id") else 0
+        cfg = await master_db.child_bots.find_one({"bot_token": child_bot.token})
+        paid_ch = int(cfg.get("paid_vip_channel_id", 0)) if cfg and cfg.get("paid_vip_channel_id") else 0
         
         user = await child_db.users.find_one({"_id": user_id}) or {}
         now = time.time()
-        current_until = user.get("vip_until", 0)
-        base_time = max(now, current_until)
-        new_vip_until = base_time + (7 * 86400)
+        base = max(now, user.get("vip_until", 0))
+        new_vip = base + (7 * 86400)
         
-        await child_db.users.update_one(
-            {"_id": user_id}, 
-            {"$set": {"vip_until": new_vip_until, "paid_vip_active": True}}, 
-            upsert=True
-        )
+        await child_db.users.update_one({"_id": user_id}, {"$set": {"vip_until": new_vip, "paid_vip_active": True}}, upsert=True)
         
-        if paid_channel_id:
+        if paid_ch:
             try:
-                invite = await child_bot.create_chat_invite_link(chat_id=paid_channel_id, member_limit=1, creates_join_request=False)
-                markup = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="💎 Entrar al Canal VIP de Paga", url=invite.invite_link)]])
-                await message.answer("🎉 <b>¡Pago con Estrellas confirmado!</b> Aquí tienes tu acceso exclusivo de 7 días al canal VIP:", reply_markup=markup, parse_mode="HTML")
-            except Exception as ex:
-                logging.error(f"Error generando invitación al canal VIP desde Master: {ex}")
-                await message.answer("🎉 <b>¡Pago confirmado!</b> Tu cuenta ha sido actualizada en la base de datos.")
+                inv = await child_bot.create_chat_invite_link(chat_id=paid_ch, member_limit=1)
+                kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="💎 Entrar al Canal VIP", url=inv.invite_link)]])
+                await message.answer("🎉 <b>¡Pago con Estrellas confirmado!</b> Acceso exclusivo de 7 días:", reply_markup=kb, parse_mode="HTML")
+            except Exception:
+                await message.answer("🎉 <b>¡Pago confirmado!</b> Membresía actualizada en base de datos.")
         else:
-            await message.answer("🎉 <b>¡Pago confirmado!</b> Tu tiempo VIP de 7 días ha sido registrado exitosamente.")
+            await message.answer("🎉 <b>¡Pago confirmado!</b> Tu tiempo VIP de 7 días ha sido registrado.")
 
+# Wizard 7 Pasos
 @master_dp.callback_query(F.data == "master_crear")
-async def cb_crear_bot(callback: CallbackQuery, state: FSMContext):
+async def step1_token(callback: CallbackQuery, state: FSMContext):
     if callback.from_user.id not in SUPER_ADMIN_IDS: return
-    await callback.message.edit_text("🤖 <b>Paso 1/7:</b> Envíame el <b>Token</b> del bot proporcionado por @BotFather:", parse_mode="HTML")
+    await callback.message.edit_text("🤖 <b>Paso 1/7:</b> Envía el <b>Token</b> del bot dado por @BotFather:", parse_mode="HTML")
     await state.set_state(CreateChildBot.waiting_for_token)
 
 @master_dp.message(CreateChildBot.waiting_for_token)
-async def process_token(message: Message, state: FSMContext):
-    if message.from_user.id not in SUPER_ADMIN_IDS: return
+async def step2_sub_id(message: Message, state: FSMContext):
     await state.update_data(token=message.text.strip())
-    await message.answer("📢 <b>Paso 2/7:</b> Envía el <b>ID del Canal de Suscripción Obligatoria</b> o reenvíame un mensaje de ese canal:", parse_mode="HTML")
+    await message.answer("📢 <b>Paso 2/7:</b> Envía el <b>ID del Canal de Suscripción Obligatoria</b> (o reenvía un mensaje):", parse_mode="HTML")
     await state.set_state(CreateChildBot.waiting_for_sub_id)
 
 @master_dp.message(CreateChildBot.waiting_for_sub_id)
-async def process_sub_id(message: Message, state: FSMContext):
-    if message.from_user.id not in SUPER_ADMIN_IDS: return
+async def step3_sub_link(message: Message, state: FSMContext):
     await state.update_data(sub_id=extract_chat_id(message))
-    await message.answer("🔗 <b>Paso 3/7:</b> Envía el <b>Enlace de invitación al Canal de Suscripción</b> (Ej: <code>https://t.me/tu_canal</code>):", parse_mode="HTML")
+    await message.answer("🔗 <b>Paso 3/7:</b> Envía el <b>Enlace de invitación</b> del canal obligatorio:", parse_mode="HTML")
     await state.set_state(CreateChildBot.waiting_for_sub_link)
 
 @master_dp.message(CreateChildBot.waiting_for_sub_link)
-async def process_sub_link(message: Message, state: FSMContext):
-    if message.from_user.id not in SUPER_ADMIN_IDS: return
+async def step4_vip_id(message: Message, state: FSMContext):
     await state.update_data(sub_link=message.text.strip())
-    await message.answer("🌟 <b>Paso 4/7:</b> Envía el <b>ID del Grupo VIP Gratuito</b> (para 3 referidos o 20 puntos de reputación) o reenvía un mensaje del mismo:", parse_mode="HTML")
+    await message.answer("🌟 <b>Paso 4/7:</b> Envía el <b>ID del Grupo VIP Gratuito</b> (referidos/puntos):", parse_mode="HTML")
     await state.set_state(CreateChildBot.waiting_for_vip_id)
 
 @master_dp.message(CreateChildBot.waiting_for_vip_id)
-async def process_vip_id(message: Message, state: FSMContext):
-    if message.from_user.id not in SUPER_ADMIN_IDS: return
+async def step5_log_id(message: Message, state: FSMContext):
     await state.update_data(vip_id=extract_chat_id(message))
-    markup = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⏭️ Omitir / No usar Logs", callback_data="skip_logs")]])
-    await message.answer("📂 <b>Paso 5/7:</b> Envía el <b>ID del Grupo de Logs</b> o reenvíame un mensaje de ese grupo (puedes omitirlo):", reply_markup=markup, parse_mode="HTML")
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⏭️ Omitir Logs", callback_data="skip_logs")]])
+    await message.answer("📂 <b>Paso 5/7:</b> Envía el <b>ID del Grupo de Logs</b>:", reply_markup=kb, parse_mode="HTML")
     await state.set_state(CreateChildBot.waiting_for_log_id)
 
 @master_dp.callback_query(CreateChildBot.waiting_for_log_id, F.data == "skip_logs")
-async def process_skip_logs(callback: CallbackQuery, state: FSMContext):
-    if callback.from_user.id not in SUPER_ADMIN_IDS: return
+async def step5_skip_logs(callback: CallbackQuery, state: FSMContext):
     await state.update_data(log_id="0")
-    markup = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⏭️ Omitir / No usar VIP de Pago", callback_data="skip_paid_vip")]])
-    await callback.message.edit_text("💎 <b>Paso 6/7:</b> Envía el <b>ID del Canal VIP de Paga con Estrellas (XTR)</b> o reenvía un mensaje del mismo (puedes omitirlo):", reply_markup=markup, parse_mode="HTML")
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⏭️ Omitir VIP Paga", callback_data="skip_paid_vip")]])
+    await callback.message.edit_text("💎 <b>Paso 6/7:</b> Envía el <b>ID del Canal VIP de Paga (Stars)</b>:", reply_markup=kb, parse_mode="HTML")
     await state.set_state(CreateChildBot.waiting_for_paid_vip_id)
 
 @master_dp.message(CreateChildBot.waiting_for_log_id)
-async def process_log_id(message: Message, state: FSMContext):
-    if message.from_user.id not in SUPER_ADMIN_IDS: return
+async def step5_msg_logs(message: Message, state: FSMContext):
     await state.update_data(log_id=extract_chat_id(message))
-    markup = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⏭️ Omitir / No usar VIP de Pago", callback_data="skip_paid_vip")]])
-    await message.answer("💎 <b>Paso 6/7:</b> Envía el <b>ID del Canal VIP de Paga con Estrellas (XTR)</b> o reenvía un mensaje del mismo (puedes omitirlo):", reply_markup=markup, parse_mode="HTML")
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⏭️ Omitir VIP Paga", callback_data="skip_paid_vip")]])
+    await message.answer("💎 <b>Paso 6/7:</b> Envía el <b>ID del Canal VIP de Paga (Stars)</b>:", reply_markup=kb, parse_mode="HTML")
     await state.set_state(CreateChildBot.waiting_for_paid_vip_id)
 
 @master_dp.callback_query(CreateChildBot.waiting_for_paid_vip_id, F.data == "skip_paid_vip")
-async def process_skip_paid_vip(callback: CallbackQuery, state: FSMContext):
-    if callback.from_user.id not in SUPER_ADMIN_IDS: return
+async def step6_skip_paid_vip(callback: CallbackQuery, state: FSMContext):
     await state.update_data(paid_vip_id="0")
-    await callback.message.edit_text("🗄️ <b>Paso 7/7:</b> Escribe manualmente el nombre identificador para la <b>Versión de la Base de Datos</b> en MongoDB (Ej: <code>v1</code>, <code>cluster_a</code>, <code>bot_vip_db</code>):", parse_mode="HTML")
+    await callback.message.edit_text("🗄️ <b>Paso 7/7:</b> Escribe el identificador de la <b>Versión de Base de Datos</b> (ej: <code>v1</code>):", parse_mode="HTML")
     await state.set_state(CreateChildBot.waiting_for_db_version)
 
 @master_dp.message(CreateChildBot.waiting_for_paid_vip_id)
-async def process_paid_vip_id(message: Message, state: FSMContext):
-    if message.from_user.id not in SUPER_ADMIN_IDS: return
+async def step6_msg_paid_vip(message: Message, state: FSMContext):
     await state.update_data(paid_vip_id=extract_chat_id(message))
-    await message.answer("🗄️ <b>Paso 7/7:</b> Escribe manualmente el nombre identificador para la <b>Versión de la Base de Datos</b> en MongoDB (Ej: <code>v1</code>, <code>cluster_a</code>, <code>bot_vip_db</code>):", parse_mode="HTML")
+    await message.answer("🗄️ <b>Paso 7/7:</b> Escribe el identificador de la <b>Versión de Base de Datos</b> (ej: <code>v1</code>):", parse_mode="HTML")
     await state.set_state(CreateChildBot.waiting_for_db_version)
 
 @master_dp.message(CreateChildBot.waiting_for_db_version)
-async def process_db_version_manual(message: Message, state: FSMContext):
-    if message.from_user.id not in SUPER_ADMIN_IDS: return
-    db_version = message.text.strip()
-    if not db_version: db_version = "v1"
-    
-    await message.answer("⏳ <i>Desplegando infraestructura y conectando base de datos...</i>", parse_mode="HTML")
+async def step7_final(message: Message, state: FSMContext):
+    db_ver = message.text.strip() or "v1"
     data = await state.get_data()
     
-    new_bot_config = {
+    new_cfg = {
         "owner_id": message.from_user.id,
         "bot_token": data["token"],
         "status": "active",
-        "force_sub_id": data["sub_id"], 
+        "force_sub_id": data["sub_id"],
         "force_sub_link": data["sub_link"],
-        "vip_group_id": data["vip_id"], 
+        "vip_group_id": data["vip_id"],
         "log_group_id": data.get("log_id", "0"),
         "paid_vip_channel_id": data.get("paid_vip_id", "0"),
-        "db_version": db_version,
+        "db_version": db_ver,
         "created_at": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
     }
     
-    await master_db.child_bots.insert_one(new_bot_config)
-    success = await start_child_bot(new_bot_config)
+    await message.answer("⏳ <i>Desplegando bot hijo...</i>", parse_mode="HTML")
+    success = await start_child_bot(new_cfg)
     
     if success:
+        await master_db.child_bots.insert_one(new_cfg)
         temp_bot = Bot(token=data["token"])
         me = await temp_bot.get_me()
         await temp_bot.session.close()
         
         summary = (
-            "🎉 <b>¡BOT HIJO CONFIGURADO Y EN LÍNEA!</b>\n\n"
-            f"🤖 <b>Bot User:</b> <code>@{me.username}</code> (ID: <code>{me.id}</code>)\n"
-            f"📢 <b>Canal Sub:</b> <code>{data['sub_id']}</code>\n"
-            f"🌟 <b>Grupo VIP Gratuito:</b> <code>{data['vip_id']}</code>\n"
-            f"💎 <b>Canal VIP Paga (Stars):</b> <code>{data.get('paid_vip_id', '0')}</code>\n"
-            f"📋 <b>Grupo Logs:</b> <code>{new_bot_config['log_id']}</code>\n"
-            f"🗄️ <b>Base de Datos:</b> <code>{db_version}</code>\n\n"
-            "✅ <i>Estado de salud: Todos los sistemas operativos y monitor activo.</i>"
+            "🎉 <b>¡BOT HIJO ACTIVO Y EN LÍNEA!</b>\n\n"
+            f"🤖 Usuario: <code>@{me.username}</code> (ID: <code>{me.id}</code>)\n"
+            f"📢 Canal Sub: <code>{data['sub_id']}</code>\n"
+            f"🌟 VIP Gratis: <code>{data['vip_id']}</code>\n"
+            f"💎 VIP Stars: <code>{data.get('paid_vip_id', '0')}</code>\n"
+            f"📋 Logs: <code>{data.get('log_id', '0')}</code>\n"
+            f"🗄️ Versión BD: <code>{db_ver}</code>"
         )
-        markup = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="📊 Volver al Panel", callback_data="master_panel")]])
-        await message.answer(summary, reply_markup=markup, parse_mode="HTML")
+        kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="📊 Volver al Panel", callback_data="master_panel")]])
+        await message.answer(summary, reply_markup=kb, parse_mode="HTML")
     else:
-        markup = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔄 Reintentar", callback_data="master_crear")]])
-        await message.answer("❌ <b>Error:</b> El token proporcionado es inválido o no se pudo conectar.", reply_markup=markup, parse_mode="HTML")
+        kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔄 Reintentar", callback_data="master_crear")]])
+        await message.answer("❌ Error: Token inválido o problema al iniciar sesión.", reply_markup=kb, parse_mode="HTML")
     await state.clear()
 
 @master_dp.callback_query(F.data == "master_panel")
@@ -1606,32 +1468,25 @@ async def cb_master_panel(callback: CallbackQuery):
     if callback.from_user.id not in SUPER_ADMIN_IDS: return
     cursor = master_db.child_bots.find({"status": "active"})
     bots_list = [b async for b in cursor]
-    
-    txt = f"📊 <b>Panel de Control de Bots Hijos</b>\n\nBots activos en el sistema: <b>{len(bots_list)}</b>\n\n"
+    txt = f"📊 <b>Bots Activos en Red:</b> <code>{len(bots_list)}</code>\n\n"
     keyboard = []
     
     for b in bots_list:
-        token = b["bot_token"]
+        me = None
         try:
-            temp_b = Bot(token=token)
+            temp_b = Bot(token=b["bot_token"])
             me = await temp_b.get_me()
             await temp_b.session.close()
-            uname = f"@{me.username}"
-            db_v = b.get("db_version", "v1")
-            u_count = await master_db_client[f"child_{me.id}_{db_v}"].users.count_documents({})
-        except:
-            uname = "Bot Inaccesible"
-            u_count = 0
+            txt += f"• <b>@{me.username}</b> (ID: <code>{me.id}</code>)\n"
+            keyboard.append([InlineKeyboardButton(text=f"⚙️ @{me.username}", callback_data=f"manage_bot_{me.id}")])
+        except Exception:
+            txt += "• <i>Bot Inaccesible</i>\n"
             
-        txt += f"• <b>{uname}</b> — 👥 Usuarios: <code>{u_count}</code>\n"
-        keyboard.append([InlineKeyboardButton(text=f"⚙️ Administrar {uname}", callback_data=f"manage_bot_{me.id}")])
-        
     keyboard.append([InlineKeyboardButton(text="➕ Crear Nuevo Bot", callback_data="master_crear")])
-    markup = InlineKeyboardMarkup(inline_keyboard=keyboard)
-    await callback.message.edit_text(txt, reply_markup=markup, parse_mode="HTML")
+    await callback.message.edit_text(txt, reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard), parse_mode="HTML")
 
 # =====================================================================
-# 6. INICIO DEL SISTEMA (SERVER + BOTS + HEALTH CHECK)
+# 7. INICIO Y SERVIDOR WEB
 # =====================================================================
 async def web_server():
     app = web.Application()
@@ -1649,24 +1504,32 @@ async def web_server():
 async def main():
     global MASTER_BOT_USERNAME
     logging.basicConfig(level=logging.INFO)
-    master_bot = Bot(token=MASTER_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
     
+    if not MASTER_TOKEN or not MASTER_MONGO_URI:
+        raise RuntimeError("Configura MASTER_TOKEN y MONGO_URI en tus variables de entorno.")
+        
+    master_bot = Bot(token=MASTER_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
     me = await master_bot.get_me()
     MASTER_BOT_USERNAME = me.username
     
-    runner = None
+    runner = await web_server()
+    
+    cursor = master_db.child_bots.find({"status": "active"})
+    async for cfg in cursor:
+        await start_child_bot(cfg)
+        
+    await master_bot.delete_webhook(drop_pending_updates=True)
+    asyncio.create_task(health_check_monitor(master_bot))
+    print(f"🚀 SaaS Master (@{MASTER_BOT_USERNAME}) online en puerto {PORT}.")
+    
     try:
-        runner = await web_server()
-        await restore_bots()
-        await master_bot.delete_webhook(drop_pending_updates=True)
-        asyncio.create_task(health_check_monitor(master_bot))
-        print(f"🚀 Sistema Master (@{MASTER_BOT_USERNAME}) corriendo exitosamente con pagos centralizados y arquitectura robusta.")
         await master_dp.start_polling(master_bot)
     finally:
         await master_bot.session.close()
-        for bid in list(active_bots_tasks.keys()): await isolate_and_cleanup_bot(bid)
+        for bid in list(active_bots_tasks.keys()):
+            await isolate_and_cleanup_bot(bid)
         master_db_client.close()
-        if runner: await runner.cleanup()
+        await runner.cleanup()
 
 if __name__ == "__main__":
     asyncio.run(main())
