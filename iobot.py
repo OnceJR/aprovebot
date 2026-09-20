@@ -1593,10 +1593,13 @@ async def health_check_monitor(master_bot: Bot):
 
 async def child_polling_wrapper(dp: Dispatcher, bot: Bot, bot_id: int):
     try:
+        # Elimina cualquier webhook previo del bot hijo antes de hacer polling
+        await bot.delete_webhook(drop_pending_updates=True)
         await dp.start_polling(bot, handle_signals=False)
     except TelegramUnauthorizedError:
         await isolate_and_cleanup_bot(bot_id, revoked=True)
-    except asyncio.CancelledError: pass
+    except asyncio.CancelledError:
+        pass
 
 async def start_child_bot(config: dict) -> bool:
     token = config["bot_token"]
@@ -1880,17 +1883,24 @@ async def main():
     global MASTER_BOT_USERNAME
     logging.basicConfig(level=logging.INFO)
     
+    if not MASTER_TOKEN or not MASTER_MONGO_URI:
+        raise RuntimeError("Configura MASTER_TOKEN y MONGO_URI en tus variables de entorno.")
+        
     master_bot = Bot(token=MASTER_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
     me = await master_bot.get_me()
     MASTER_BOT_USERNAME = me.username
     
+    # 1. Limpieza inmediata del webhook en el bot Master
+    await master_bot.delete_webhook(drop_pending_updates=True)
+    
+    # 2. Iniciar servidor web aiohttp
     runner = await web_server()
     
+    # 3. Restaurar e iniciar bots hijos (cada uno limpiará su webhook al arrancar)
     cursor = master_db.child_bots.find({"status": "active"})
     async for cfg in cursor:
         await start_child_bot(cfg)
         
-    await master_bot.delete_webhook(drop_pending_updates=True)
     asyncio.create_task(health_check_monitor(master_bot))
     print(f"🚀 SaaS Master (@{MASTER_BOT_USERNAME}) online en puerto {PORT}.")
     
