@@ -1593,13 +1593,30 @@ async def health_check_monitor(master_bot: Bot):
 
 async def child_polling_wrapper(dp: Dispatcher, bot: Bot, bot_id: int):
     try:
-        # Elimina cualquier webhook previo del bot hijo antes de hacer polling
+        # 1. Forzar eliminación del webhook antes de que aiogram llame a getUpdates
         await bot.delete_webhook(drop_pending_updates=True)
+        
+        # 2. Iniciar polling aislado
         await dp.start_polling(bot, handle_signals=False)
+        
     except TelegramUnauthorizedError:
+        logging.error(f"❌ [Bot {bot_id}] Token revocado o inválido durante polling.")
         await isolate_and_cleanup_bot(bot_id, revoked=True)
+        
     except asyncio.CancelledError:
-        pass
+        logging.info(f"🛑 [Bot {bot_id}] Tarea de polling cancelada limpiamente.")
+        
+    except Exception as e:
+        logging.critical(f"💥 [Bot {bot_id}] Error crítico inesperado en polling: {e}")
+        await isolate_and_cleanup_bot(bot_id, revoked=False)
+        
+    finally:
+        # Asegurar cierre de la sesión si el bot sigue abierto
+        try:
+            if not bot.session.closed:
+                await bot.session.close()
+        except Exception:
+            pass
 
 async def start_child_bot(config: dict) -> bool:
     token = config["bot_token"]
@@ -1890,26 +1907,39 @@ async def main():
     me = await master_bot.get_me()
     MASTER_BOT_USERNAME = me.username
     
-    # 1. Limpieza inmediata del webhook en el bot Master
+    # 1. Purgar webhook activo y descartar updates acumulados
     await master_bot.delete_webhook(drop_pending_updates=True)
     
-    # 2. Iniciar servidor web aiohttp
+    # 2. Iniciar servidor web
     runner = await web_server()
     
-    # 3. Restaurar e iniciar bots hijos (cada uno limpiará su webhook al arrancar)
+    # 3. Iniciar bots hijos (cada uno purga su propio webhook en child_polling_wrapper)
     cursor = master_db.child_bots.find({"status": "active"})
     async for cfg in cursor:
         await start_child_bot(cfg)
         
-    asyncio.create_task(health_check_monitor(master_bot))
+    # 4. Guardar referencia de la tarea de monitoreo para control de ciclo de vida
+    monitor_task = asyncio.create_task(health_check_monitor(master_bot))
     print(f"🚀 SaaS Master (@{MASTER_BOT_USERNAME}) online en puerto {PORT}.")
     
     try:
         await master_dp.start_polling(master_bot)
     finally:
-        await master_bot.session.close()
+        # Cancelar tareas en segundo plano del Master
+        monitor_task.cancel()
+        
+        # Desconectar y limpiar todos los bots hijos activos
         for bid in list(active_bots_tasks.keys()):
             await isolate_and_cleanup_bot(bid)
+            
+        # Cerrar sesión del bot Master de forma segura
+        try:
+            if not master_bot.session.closed:
+                await master_bot.session.close()
+        except Exception:
+            pass
+            
+        # Cerrar conexiones a base de datos y servidor HTTP
         master_db_client.close()
         await runner.cleanup()
 
