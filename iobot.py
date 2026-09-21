@@ -715,21 +715,52 @@ def get_new_child_dp(child_config: dict, child_db) -> Dispatcher:
         except Exception:
             return False
 
-    async def check_vip_status(user_id, bot: Bot):
-        if not VIP_GROUP_ID:
+async def check_vip_status(user_id, bot: Bot):
+        if not VIP_GROUP_ID or str(VIP_GROUP_ID) in ("0", "None", ""):
             return
+            
         try:
             user = await get_user(user_id)
-            if (user.get("referrals", 0) >= 3 or user.get("reputation", 0) >= 20) and not user.get("notified_vip"):
-                invite = await bot.create_chat_invite_link(chat_id=VIP_GROUP_ID, member_limit=1)
+            if not user:
+                return
+
+            # Requisitos: 3 o más referidos O 20 o más de reputación
+            has_requirements = user.get("referrals", 0) >= 3 or user.get("reputation", 0) >= 20
+            
+            if has_requirements and not user.get("notified_vip"):
+                # 1. Normalizar y auto-corregir el ID al vuelo (por si la BD no tiene el -100)
+                raw_chat = str(VIP_GROUP_ID).strip()
+                if raw_chat.isdigit() and len(raw_chat) >= 9:
+                    raw_chat = f"-100{raw_chat}"
+                elif raw_chat.startswith("-") and not raw_chat.startswith("-100") and len(raw_chat) >= 10:
+                    raw_chat = f"-100{raw_chat.lstrip('-')}"
+                
+                target_chat_id = int(raw_chat)
+                
+                # 2. Generar el link con el bot hijo
+                invite = await bot.create_chat_invite_link(
+                    chat_id=target_chat_id, 
+                    member_limit=1
+                )
+                
                 lang = user.get("lang", "es")
                 btn = "🌟 Entrar al Grupo VIP" if lang == "es" else "🌟 Join VIP Group"
-                msg = "🎉 <b>¡Acceso al Grupo VIP desbloqueado!</b> Enlace exclusivo:" if lang == "es" else "🎉 <b>VIP Access Granted!</b> Exclusive link:"
-                kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=btn, url=invite.invite_link)]])
+                msg = (
+                    "🎉 <b>¡Acceso al Grupo VIP desbloqueado!</b> Enlace exclusivo:" 
+                    if lang == "es" else 
+                    "🎉 <b>VIP Access Granted!</b> Exclusive link:"
+                )
+                kb = InlineKeyboardMarkup(inline_keyboard=[[
+                    InlineKeyboardButton(text=btn, url=invite.invite_link)
+                ]])
+                
                 await bot.send_message(user_id, msg, reply_markup=kb, parse_mode="HTML")
                 await save_user(user_id, {"notified_vip": True, "in_vip": True})
+                
+        except TelegramBadRequest as e:
+            logging.error(f"❌ [check_vip_status] Telegram rechazó el chat {VIP_GROUP_ID} con el bot {bot.id}: {e}")
         except Exception as e:
-            logging.error(f"Error en check_vip_status: {e}")
+            logging.error(f"❌ Error inesperado en check_vip_status para el usuario {user_id}: {e}")
 
     async def send_rating_request(user_id, target_id, bot: Bot):
         user = await get_user(user_id)
