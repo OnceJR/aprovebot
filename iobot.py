@@ -13,7 +13,12 @@ from motor.motor_asyncio import AsyncIOMotorClient
 
 from aiogram import Bot, Dispatcher, F, html
 from aiogram.client.default import DefaultBotProperties
-from aiogram.exceptions import TelegramUnauthorizedError, TelegramRetryAfter, TelegramBadRequest
+from aiogram.exceptions import (
+    TelegramUnauthorizedError,
+    TelegramRetryAfter,
+    TelegramBadRequest,
+    TelegramForbiddenError
+)
 from aiogram.filters import Command, CommandStart, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -69,11 +74,28 @@ class BotStates(StatesGroup):
     waiting_trade_amount = State()
     waiting_for_id = State()
 
+def clean_chat_id(val) -> int:
+    """Sanitiza y normaliza cualquier ID de Telegram asegurando el prefijo -100 si corresponde."""
+    if not val:
+        return 0
+    s = str(val).strip()
+    if not s or s in ("0", "None"):
+        return 0
+    if s.isdigit() and len(s) >= 9:
+        s = f"-100{s}"
+    elif s.startswith("-") and not s.startswith("-100") and len(s) >= 10:
+        s = f"-100{s.lstrip('-')}"
+    try:
+        return int(s)
+    except ValueError:
+        return 0
+
 def extract_chat_id(msg: Message) -> str:
     if msg.forward_from_chat:
-        return str(msg.forward_from_chat.id)
+        return str(clean_chat_id(msg.forward_from_chat.id))
     if msg.text:
-        return msg.text.strip()
+        cleaned = clean_chat_id(msg.text.strip())
+        return str(cleaned) if cleaned != 0 else msg.text.strip()
     return "0"
 
 def format_progress_bar(current: int, total: int, length: int = 10) -> str:
@@ -656,11 +678,12 @@ def get_new_child_dp(child_config: dict, child_db) -> Dispatcher:
     dp["active_chats"] = active_chats
     dp["waiting_list"] = waiting_list
 
-    FORCE_SUB_CHANNEL_ID = int(child_config.get("force_sub_id", 0)) if child_config.get("force_sub_id") else 0
+    FORCE_SUB_CHANNEL_ID = clean_chat_id(child_config.get("force_sub_id"))
     FORCE_SUB_CHANNEL_LINK = child_config.get("force_sub_link", "")
-    VIP_GROUP_ID = int(child_config.get("vip_group_id", 0)) if child_config.get("vip_group_id") else 0
-    LOG_GROUP_ID = int(child_config.get("log_group_id", 0)) if child_config.get("log_group_id") else 0
-    PAID_VIP_CHANNEL_ID = int(child_config.get("paid_vip_channel_id", 0)) if child_config.get("paid_vip_channel_id") else 0
+    VIP_GROUP_ID = clean_chat_id(child_config.get("vip_group_id"))
+    LOG_GROUP_ID = clean_chat_id(child_config.get("log_group_id"))
+    PAID_VIP_CHANNEL_ID = clean_chat_id(child_config.get("paid_vip_channel_id"))
+    OWNER_ID = int(child_config.get("owner_id", 0)) if child_config.get("owner_id") else 0
 
     async def get_or_create_chat_topic(bot: Bot, u_id: int, t_id: int):
         if not LOG_GROUP_ID:
@@ -715,34 +738,20 @@ def get_new_child_dp(child_config: dict, child_db) -> Dispatcher:
         except Exception:
             return False
 
-async def check_vip_status(user_id, bot: Bot):
-        if not VIP_GROUP_ID or str(VIP_GROUP_ID) in ("0", "None", ""):
+    async def check_vip_status(user_id: int, bot: Bot):
+        if not VIP_GROUP_ID:
             return
-            
         try:
             user = await get_user(user_id)
             if not user:
                 return
 
-            # Requisitos: 3 o más referidos O 20 o más de reputación
-            has_requirements = user.get("referrals", 0) >= 3 or user.get("reputation", 0) >= 20
-            
+            has_requirements = (user.get("referrals", 0) >= 3 or user.get("reputation", 0) >= 20)
             if has_requirements and not user.get("notified_vip"):
-                # 1. Normalizar y auto-corregir el ID al vuelo (por si la BD no tiene el -100)
-                raw_chat = str(VIP_GROUP_ID).strip()
-                if raw_chat.isdigit() and len(raw_chat) >= 9:
-                    raw_chat = f"-100{raw_chat}"
-                elif raw_chat.startswith("-") and not raw_chat.startswith("-100") and len(raw_chat) >= 10:
-                    raw_chat = f"-100{raw_chat.lstrip('-')}"
-                
-                target_chat_id = int(raw_chat)
-                
-                # 2. Generar el link con el bot hijo
                 invite = await bot.create_chat_invite_link(
-                    chat_id=target_chat_id, 
+                    chat_id=VIP_GROUP_ID, 
                     member_limit=1
                 )
-                
                 lang = user.get("lang", "es")
                 btn = "🌟 Entrar al Grupo VIP" if lang == "es" else "🌟 Join VIP Group"
                 msg = (
@@ -753,14 +762,12 @@ async def check_vip_status(user_id, bot: Bot):
                 kb = InlineKeyboardMarkup(inline_keyboard=[[
                     InlineKeyboardButton(text=btn, url=invite.invite_link)
                 ]])
-                
                 await bot.send_message(user_id, msg, reply_markup=kb, parse_mode="HTML")
                 await save_user(user_id, {"notified_vip": True, "in_vip": True})
-                
         except TelegramBadRequest as e:
-            logging.error(f"❌ [check_vip_status] Telegram rechazó el chat {VIP_GROUP_ID} con el bot {bot.id}: {e}")
+            logging.warning(f"⚠️ [check_vip_status] Telegram rechazó crear link en chat {VIP_GROUP_ID} para bot {bot.id}: {e}")
         except Exception as e:
-            logging.error(f"❌ Error inesperado en check_vip_status para el usuario {user_id}: {e}")
+            logging.error(f"❌ Error inesperado en check_vip_status para usuario {user_id}: {e}")
 
     async def send_rating_request(user_id, target_id, bot: Bot):
         user = await get_user(user_id)
@@ -791,7 +798,6 @@ async def check_vip_status(user_id, bot: Bot):
         finally:
             pending_notifications.pop(u_id, None)
 
-    # Cálculo preciso de archivos totales vs únicos con respecto al compañero
     async def get_inventory_stats_for_trade(sender_id: int, receiver_id: int, category: str = "mixed"):
         total_query = {"user_id": sender_id}
         if category != "mixed":
@@ -853,7 +859,6 @@ async def check_vip_status(user_id, bot: Bot):
         )
         await bot.send_message(chat_id=user_id, text=txt, reply_markup=kb, parse_mode="HTML")
 
-    # ---- Manual de Uso en Dos Idiomas ----
     async def render_manual_text(lang: str) -> str:
         if lang == "es":
             return (
@@ -914,6 +919,111 @@ async def check_vip_status(user_id, bot: Bot):
         await message.answer(txt, parse_mode="HTML")
 
     # ---- Comandos Administrativos del Bot Hijo ----
+    @dp.message(Command("recuperar_vip"))
+    async def cmd_recuperar_vip(message: Message, bot: Bot):
+        if message.from_user.id not in SUPER_ADMIN_IDS and message.from_user.id != OWNER_ID:
+            return
+
+        if not VIP_GROUP_ID:
+            return await message.answer("❌ No hay un Grupo VIP configurado en este bot.")
+
+        status_msg = await message.answer("🔄 Buscando usuarios calificados en la base de datos...")
+        query = {
+            "$or": [
+                {"referrals": {"$gte": 3}},
+                {"reputation": {"$gte": 20}}
+            ]
+        }
+
+        qualifying_users = await child_db.users.find(query).to_list(length=1000)
+        total = len(qualifying_users)
+
+        if total == 0:
+            return await status_msg.edit_text("ℹ️ No hay ningún usuario que cumpla los requisitos todavía.")
+
+        await status_msg.edit_text(f"🚀 Enviando enlaces VIP a <b>{total}</b> usuarios calificados...", parse_mode="HTML")
+
+        sent, blocked, failed = 0, 0, 0
+        for u in qualifying_users:
+            uid = u["_id"]
+            try:
+                invite = await bot.create_chat_invite_link(chat_id=VIP_GROUP_ID, member_limit=1)
+                lang = u.get("lang", "es")
+                btn_txt = "🌟 Entrar al Grupo VIP" if lang == "es" else "🌟 Join VIP Group"
+                txt = (
+                    "🎉 <b>¡Tu acceso al Grupo VIP está listo!</b>\n\n"
+                    "Ya has alcanzado los requisitos. Aquí tienes tu enlace exclusivo:"
+                    if lang == "es" else
+                    "🎉 <b>Your VIP Group access is ready!</b>\n\n"
+                    "You met all requirements. Here is your exclusive link:"
+                )
+                kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=btn_txt, url=invite.invite_link)]])
+                await bot.send_message(chat_id=uid, text=txt, reply_markup=kb, parse_mode="HTML")
+                await child_db.users.update_one({"_id": uid}, {"$set": {"notified_vip": True, "in_vip": True}})
+                sent += 1
+                await asyncio.sleep(0.3)
+            except TelegramForbiddenError:
+                blocked += 1
+            except TelegramRetryAfter as e:
+                await asyncio.sleep(e.retry_after)
+            except Exception as e:
+                logging.error(f"Error recuperando VIP para {uid}: {e}")
+                failed += 1
+
+        res_report = (
+            f"✅ <b>Proceso completado</b>\n\n"
+            f"👥 Total calificados: <code>{total}</code>\n"
+            f"📩 Enviados con éxito: <code>{sent}</code>\n"
+            f"🚫 Bot bloqueado por usuario: <code>{blocked}</code>\n"
+            f"⚠️ Otros errores: <code>{failed}</code>"
+        )
+        await message.answer(res_report, parse_mode="HTML")
+
+    @dp.message(Command("enviar_vip"))
+    async def cmd_enviar_vip(message: Message, bot: Bot):
+        if message.from_user.id not in SUPER_ADMIN_IDS and message.from_user.id != OWNER_ID:
+            return
+            
+        args = message.text.split()
+        if len(args) < 2 or not args[1].isdigit():
+            return await message.answer("⚠️ Uso: <code>/enviar_vip ID_DEL_USUARIO</code>", parse_mode="HTML")
+            
+        target_uid = int(args[1])
+        if not PAID_VIP_CHANNEL_ID:
+            return await message.answer("❌ Este bot no tiene configurado un Canal VIP de pago.")
+            
+        try:
+            now = time.time()
+            u_data = await child_db.users.find_one({"_id": target_uid}) or {}
+            base_time = max(now, u_data.get("vip_until", 0))
+            new_vip_until = base_time + (7 * 86400)
+            
+            await child_db.users.update_one(
+                {"_id": target_uid},
+                {"$set": {"vip_until": new_vip_until, "paid_vip_active": True}},
+                upsert=True
+            )
+            
+            invite = await bot.create_chat_invite_link(
+                chat_id=PAID_VIP_CHANNEL_ID,
+                member_limit=1,
+                creates_join_request=False
+            )
+            
+            kb = InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text="💎 Entrar al Canal VIP", url=invite.invite_link)
+            ]])
+            txt_user = (
+                "🎉 <b>¡Tu acceso al Canal VIP ha sido activado!</b>\n\n"
+                "Aquí tienes tu enlace exclusivo para ingresar por 7 días:"
+            )
+            await bot.send_message(chat_id=target_uid, text=txt_user, reply_markup=kb, parse_mode="HTML")
+            await message.answer(f"✅ Acceso VIP de 7 días entregado al usuario <code>{target_uid}</code>.", parse_mode="HTML")
+        except TelegramBadRequest as e:
+            await message.answer(f"❌ Error de Telegram (¿El bot es admin con permiso de invitar?): {e}")
+        except Exception as e:
+            await message.answer(f"❌ Error al enviar acceso: {e}")
+
     @dp.message(Command("add_receiver"))
     async def cmd_add_receiver(message: Message):
         if message.from_user.id not in SUPER_ADMIN_IDS: return
@@ -1198,7 +1308,6 @@ async def check_vip_status(user_id, bot: Bot):
         except Exception: pass
         await callback.message.delete()
 
-    # Búsqueda aleatoria con mensaje de sala de espera explícito
     @dp.callback_query(F.data == "find_chat")
     async def find_chat(callback: CallbackQuery, state: FSMContext, bot: Bot):
         u_id = callback.from_user.id
@@ -1302,7 +1411,7 @@ async def check_vip_status(user_id, bot: Bot):
                 pending_notifications[u_id] = True
                 asyncio.create_task(send_delayed_notification(u_id, user.get("lang", "es"), bot))
 
-    # Motor de Intercambios con notificación de archivos totales vs únicos
+    # Motor de Intercambios
     @dp.message(StateFilter(BotStates.chatting), F.text.in_(["🤝 Proponer Intercambio", "🤝 Propose Trade"]))
     async def btn_propose(message: Message, state: FSMContext):
         u_id = message.from_user.id
@@ -1624,25 +1733,17 @@ async def health_check_monitor(master_bot: Bot):
 
 async def child_polling_wrapper(dp: Dispatcher, bot: Bot, bot_id: int):
     try:
-        # 1. Forzar eliminación del webhook antes de que aiogram llame a getUpdates
         await bot.delete_webhook(drop_pending_updates=True)
-        
-        # 2. Iniciar polling aislado
         await dp.start_polling(bot, handle_signals=False)
-        
     except TelegramUnauthorizedError:
         logging.error(f"❌ [Bot {bot_id}] Token revocado o inválido durante polling.")
         await isolate_and_cleanup_bot(bot_id, revoked=True)
-        
     except asyncio.CancelledError:
         logging.info(f"🛑 [Bot {bot_id}] Tarea de polling cancelada limpiamente.")
-        
     except Exception as e:
         logging.critical(f"💥 [Bot {bot_id}] Error crítico inesperado en polling: {e}")
         await isolate_and_cleanup_bot(bot_id, revoked=False)
-        
     finally:
-        # Asegurar cierre de la sesión si el bot sigue abierto
         try:
             if not bot.session.closed:
                 await bot.session.close()
@@ -1664,7 +1765,7 @@ async def start_child_bot(config: dict) -> bool:
     child_db = master_db_client[f"child_{bot_id}_{db_ver}"]
     dp = get_new_child_dp(config, child_db)
     
-    paid_channel_id = int(config.get("paid_vip_channel_id", 0)) if config.get("paid_vip_channel_id") else 0
+    paid_channel_id = clean_chat_id(config.get("paid_vip_channel_id"))
     
     active_bots_tasks[bot_id] = {
         "bot": bot, "db": child_db, "dp": dp,
@@ -1729,7 +1830,7 @@ async def process_successful_payment(message: Message):
         child_db = child_info["db"]
         child_bot = child_info["bot"]
         cfg = await master_db.child_bots.find_one({"bot_token": child_bot.token})
-        paid_ch = int(cfg.get("paid_vip_channel_id", 0)) if cfg and cfg.get("paid_vip_channel_id") else 0
+        paid_ch = clean_chat_id(cfg.get("paid_vip_channel_id")) if cfg else 0
         
         user = await child_db.users.find_one({"_id": user_id}) or {}
         now = time.time()
@@ -1743,7 +1844,8 @@ async def process_successful_payment(message: Message):
                 inv = await child_bot.create_chat_invite_link(chat_id=paid_ch, member_limit=1)
                 kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="💎 Entrar al Canal VIP", url=inv.invite_link)]])
                 await message.answer("🎉 <b>¡Pago con Estrellas confirmado!</b> Acceso exclusivo de 7 días:", reply_markup=kb, parse_mode="HTML")
-            except Exception:
+            except Exception as e:
+                logging.error(f"Error creando link pago Stars: {e}")
                 await message.answer("🎉 <b>¡Pago confirmado!</b> Membresía actualizada en base de datos.")
         else:
             await message.answer("🎉 <b>¡Pago confirmado!</b> Tu tiempo VIP de 7 días ha sido registrado.")
@@ -1841,7 +1943,7 @@ async def step7_final(message: Message, state: FSMContext):
             f"📢 Canal Sub: <code>{data['sub_id']}</code>\n"
             f"🌟 VIP Gratis: <code>{data['vip_id']}</code>\n"
             f"💎 VIP Stars: <code>{data.get('paid_vip_id', '0')}</code>\n"
-            f"📋 Logs: <code>{data.get('log_id', '0')}</code>\n"
+            f"📂 Logs: <code>{data.get('log_id', '0')}</code>\n"
             f"🗄️ Versión BD: <code>{db_ver}</code>"
         )
         kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="📊 Volver al Panel", callback_data="master_panel")]])
@@ -1944,33 +2046,28 @@ async def main():
     # 2. Iniciar servidor web
     runner = await web_server()
     
-    # 3. Iniciar bots hijos (cada uno purga su propio webhook en child_polling_wrapper)
+    # 3. Iniciar bots hijos
     cursor = master_db.child_bots.find({"status": "active"})
     async for cfg in cursor:
         await start_child_bot(cfg)
         
-    # 4. Guardar referencia de la tarea de monitoreo para control de ciclo de vida
+    # 4. Monitoreo en segundo plano
     monitor_task = asyncio.create_task(health_check_monitor(master_bot))
     print(f"🚀 SaaS Master (@{MASTER_BOT_USERNAME}) online en puerto {PORT}.")
     
     try:
         await master_dp.start_polling(master_bot)
     finally:
-        # Cancelar tareas en segundo plano del Master
         monitor_task.cancel()
-        
-        # Desconectar y limpiar todos los bots hijos activos
         for bid in list(active_bots_tasks.keys()):
             await isolate_and_cleanup_bot(bid)
             
-        # Cerrar sesión del bot Master de forma segura
         try:
             if not master_bot.session.closed:
                 await master_bot.session.close()
         except Exception:
             pass
             
-        # Cerrar conexiones a base de datos y servidor HTTP
         master_db_client.close()
         await runner.cleanup()
 
