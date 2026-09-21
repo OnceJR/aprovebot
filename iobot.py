@@ -31,7 +31,7 @@ from aiogram.types import (
 )
 
 # =====================================================================
-# 1. CONFIGURACIÓN DEL PANEL MASTER Y SEGURIDAD
+# 1. CONFIGURACIÓN DEL PANEL MASTER Y VARIABLES DE ENTORNO
 # =====================================================================
 MASTER_TOKEN = os.getenv("MASTER_TOKEN", "").strip()
 MASTER_MONGO_URI = os.getenv("MONGO_URI", "").strip()
@@ -39,16 +39,12 @@ PORT = int(os.environ.get("PORT", 8080))
 RENDER_URL = os.environ.get("RENDER_EXTERNAL_URL", "https://tu-dominio.onrender.com").rstrip('/')
 
 if not MASTER_MONGO_URI:
-    raise RuntimeError(
-        "❌ ERROR CRÍTICO: La variable 'MONGO_URI' está vacía o no existe en las variables de entorno."
-    )
+    raise RuntimeError("❌ ERROR CRÍTICO: La variable 'MONGO_URI' no está configurada.")
 
 if not MASTER_TOKEN:
-    raise RuntimeError(
-        "❌ ERROR CRÍTICO: La variable 'MASTER_TOKEN' no está configurada."
-    )
+    raise RuntimeError("❌ ERROR CRÍTICO: La variable 'MASTER_TOKEN' no está configurada.")
 
-raw_admins = os.getenv("SUPER_ADMINS", "8983189714,7452819858")
+raw_admins = os.getenv("SUPER_ADMINS", "")
 SUPER_ADMIN_IDS = [int(i.strip()) for i in raw_admins.split(",") if i.strip().isdigit()]
 
 master_db_client = AsyncIOMotorClient(MASTER_MONGO_URI)
@@ -75,7 +71,7 @@ class BotStates(StatesGroup):
     waiting_for_id = State()
 
 def clean_chat_id(val) -> int:
-    """Sanitiza y normaliza cualquier ID de Telegram asegurando el prefijo -100 si corresponde."""
+    """Sanitiza y normaliza cualquier ID de Telegram asegurando el prefijo -100."""
     if not val:
         return 0
     s = str(val).strip()
@@ -746,7 +742,10 @@ def get_new_child_dp(child_config: dict, child_db) -> Dispatcher:
             if not user:
                 return
 
-            has_requirements = (user.get("referrals", 0) >= 3 or user.get("reputation", 0) >= 20)
+            now = time.time()
+            is_paid_vip = user.get("paid_vip_active", False) or user.get("vip_until", 0) > now
+            has_requirements = (user.get("referrals", 0) >= 3 or user.get("reputation", 0) >= 20 or is_paid_vip)
+
             if has_requirements and not user.get("notified_vip"):
                 invite = await bot.create_chat_invite_link(
                     chat_id=VIP_GROUP_ID, 
@@ -879,7 +878,7 @@ def get_new_child_dp(child_config: dict, child_db) -> Dispatcher:
                 "4️⃣ <b>Reputación y Grupo VIP:</b>\n"
                 "• Cada intercambio exitoso suma +1 Reputación.\n"
                 "• Abre el Cofre en la Mini App cada 6 horas para ganar hasta +5 puntos gratis.\n"
-                "• Con <b>20 Puntos</b> o <b>3 Referidos</b> desbloqueas acceso automático al <b>Grupo VIP Gratuito</b>."
+                "• Con <b>20 Puntos</b>, <b>3 Referidos</b> o <b>VIP Stars activo</b> desbloqueas acceso directo al <b>Grupo VIP Gratuito</b>."
             )
         else:
             return (
@@ -900,7 +899,7 @@ def get_new_child_dp(child_config: dict, child_db) -> Dispatcher:
                 "4️⃣ <b>Reputation & VIP Access:</b>\n"
                 "• Every completed trade awards +1 Reputation.\n"
                 "• Open the Reward Chest in the Mini App every 6 hours for up to +5 points.\n"
-                "• Reaching <b>20 Reputation</b> or <b>3 Referrals</b> grants immediate free access to the <b>VIP Group</b>."
+                "• Reaching <b>20 Reputation</b>, <b>3 Referrals</b> or holding an <b>Active Stars VIP</b> grants full access to the <b>VIP Group</b>."
             )
 
     @dp.callback_query(F.data == "show_manual")
@@ -928,10 +927,13 @@ def get_new_child_dp(child_config: dict, child_db) -> Dispatcher:
             return await message.answer("❌ No hay un Grupo VIP configurado en este bot.")
 
         status_msg = await message.answer("🔄 Buscando usuarios calificados en la base de datos...")
+        now = time.time()
         query = {
             "$or": [
                 {"referrals": {"$gte": 3}},
-                {"reputation": {"$gte": 20}}
+                {"reputation": {"$gte": 20}},
+                {"paid_vip_active": True},
+                {"vip_until": {"$gt": now}}
             ]
         }
 
@@ -952,10 +954,10 @@ def get_new_child_dp(child_config: dict, child_db) -> Dispatcher:
                 btn_txt = "🌟 Entrar al Grupo VIP" if lang == "es" else "🌟 Join VIP Group"
                 txt = (
                     "🎉 <b>¡Tu acceso al Grupo VIP está listo!</b>\n\n"
-                    "Ya has alcanzado los requisitos. Aquí tienes tu enlace exclusivo:"
+                    "Ya has alcanzado los requisitos (o tienes suscripción activa). Aquí tienes tu enlace exclusivo:"
                     if lang == "es" else
                     "🎉 <b>Your VIP Group access is ready!</b>\n\n"
-                    "You met all requirements. Here is your exclusive link:"
+                    "You met the requirements or have an active pass. Here is your exclusive link:"
                 )
                 kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=btn_txt, url=invite.invite_link)]])
                 await bot.send_message(chat_id=uid, text=txt, reply_markup=kb, parse_mode="HTML")
@@ -998,27 +1000,37 @@ def get_new_child_dp(child_config: dict, child_db) -> Dispatcher:
             base_time = max(now, u_data.get("vip_until", 0))
             new_vip_until = base_time + (7 * 86400)
             
+            # Guardar pase VIP de pago y otorgar también estatus VIP para el grupo gratis
             await child_db.users.update_one(
                 {"_id": target_uid},
-                {"$set": {"vip_until": new_vip_until, "paid_vip_active": True}},
+                {"$set": {"vip_until": new_vip_until, "paid_vip_active": True, "in_vip": True, "notified_vip": True}},
                 upsert=True
             )
             
-            invite = await bot.create_chat_invite_link(
+            buttons = []
+            # 1. Enlace Canal VIP de Pago
+            invite_p = await bot.create_chat_invite_link(
                 chat_id=PAID_VIP_CHANNEL_ID,
                 member_limit=1,
                 creates_join_request=False
             )
+            buttons.append([InlineKeyboardButton(text="💎 Canal VIP Stars (7 Días)", url=invite_p.invite_link)])
             
-            kb = InlineKeyboardMarkup(inline_keyboard=[[
-                InlineKeyboardButton(text="💎 Entrar al Canal VIP", url=invite.invite_link)
-            ]])
+            # 2. Enlace Grupo VIP Gratuito (Bypass incluido)
+            if VIP_GROUP_ID:
+                try:
+                    invite_f = await bot.create_chat_invite_link(chat_id=VIP_GROUP_ID, member_limit=1)
+                    buttons.append([InlineKeyboardButton(text="🌟 Grupo VIP de la Comunidad", url=invite_f.invite_link)])
+                except Exception as e:
+                    logging.error(f"Error generando link grupo gratis en /enviar_vip: {e}")
+            
+            kb = InlineKeyboardMarkup(inline_keyboard=buttons)
             txt_user = (
-                "🎉 <b>¡Tu acceso al Canal VIP ha sido activado!</b>\n\n"
-                "Aquí tienes tu enlace exclusivo para ingresar por 7 días:"
+                "🎉 <b>¡Tu membresía VIP de 7 días ha sido activada!</b>\n\n"
+                "Como usuario VIP, dispones de acceso tanto al Canal VIP exclusivo como al Grupo VIP de la comunidad:"
             )
             await bot.send_message(chat_id=target_uid, text=txt_user, reply_markup=kb, parse_mode="HTML")
-            await message.answer(f"✅ Acceso VIP de 7 días entregado al usuario <code>{target_uid}</code>.", parse_mode="HTML")
+            await message.answer(f"✅ Membresía VIP entregada exitosamente al usuario <code>{target_uid}</code>.", parse_mode="HTML")
         except TelegramBadRequest as e:
             await message.answer(f"❌ Error de Telegram (¿El bot es admin con permiso de invitar?): {e}")
         except Exception as e:
@@ -1200,8 +1212,10 @@ def get_new_child_dp(child_config: dict, child_db) -> Dispatcher:
         rep = user.get("reputation", 0)
         prog_bar = format_progress_bar(rep, 20)
         
+        now = time.time()
         vip_expires = user.get("vip_until", 0)
-        vip_txt = f"Hasta {datetime.fromtimestamp(vip_expires).strftime('%d/%m %H:%M')}" if vip_expires > time.time() else "Inactivo ❌"
+        is_paid_vip = user.get("paid_vip_active", False) or vip_expires > now
+        vip_txt = f"Hasta {datetime.fromtimestamp(vip_expires).strftime('%d/%m %H:%M')}" if is_paid_vip else "Inactivo ❌"
         modo_txt = "🕵️‍♂️ Anónimo" if user.get("mode") == "anon" else "👤 Público"
 
         kb_list = [
@@ -1209,13 +1223,14 @@ def get_new_child_dp(child_config: dict, child_db) -> Dispatcher:
             [InlineKeyboardButton(text="🔄 Cambiar Modo", callback_data="toggle_mode")]
         ]
         
-        if VIP_GROUP_ID and (user.get("in_vip") or user.get("referrals", 0) >= 3 or rep >= 20):
+        # Acceso al grupo VIP si cumple requisitos O si tiene VIP Stars activo
+        if VIP_GROUP_ID and (user.get("in_vip") or user.get("referrals", 0) >= 3 or rep >= 20 or is_paid_vip):
             try:
                 inv = await bot.create_chat_invite_link(chat_id=VIP_GROUP_ID, member_limit=1)
                 kb_list.insert(0, [InlineKeyboardButton(text="🌟 Grupo VIP Gratuito", url=inv.invite_link)])
             except Exception: pass
 
-        if PAID_VIP_CHANNEL_ID and user.get("vip_until", 0) > time.time():
+        if PAID_VIP_CHANNEL_ID and is_paid_vip:
             try:
                 inv_p = await bot.create_chat_invite_link(chat_id=PAID_VIP_CHANNEL_ID, member_limit=1)
                 kb_list.insert(0, [InlineKeyboardButton(text="💎 Canal VIP de Pago", url=inv_p.invite_link)])
@@ -1648,18 +1663,20 @@ def get_new_child_dp(child_config: dict, child_db) -> Dispatcher:
                     await bot.send_message(chat_id=LOG_GROUP_ID, message_thread_id=thread_id, text=f"💬 <code>{u_id}</code>: {html.quote(message.text)}", parse_mode="HTML")
             except Exception: pass
 
-    # Aprobación de entrada a grupo VIP
+    # Aprobación de entrada a grupo VIP (Permite tanto requisitos estándar como VIP Stars)
     @dp.chat_join_request()
     async def process_vip_join(join_req: ChatJoinRequest, bot: Bot):
         if VIP_GROUP_ID and join_req.chat.id == VIP_GROUP_ID:
             user = await get_user(join_req.from_user.id)
-            if user.get("referrals", 0) >= 3 or user.get("reputation", 0) >= 20:
+            now = time.time()
+            is_paid_vip = user.get("paid_vip_active", False) or user.get("vip_until", 0) > now
+            if user.get("referrals", 0) >= 3 or user.get("reputation", 0) >= 20 or is_paid_vip:
                 await join_req.approve()
-                try: await bot.send_message(join_req.from_user.id, "🎉 ¡Tu solicitud al Grupo VIP gratuito ha sido aprobada!")
+                try: await bot.send_message(join_req.from_user.id, "🎉 ¡Tu solicitud al Grupo VIP ha sido aprobada!")
                 except Exception: pass
             else:
                 await join_req.decline()
-                try: await bot.send_message(join_req.from_user.id, "❌ No cumples los requisitos mínimos (3 referidos o 20 de reputación).")
+                try: await bot.send_message(join_req.from_user.id, "❌ No cumples los requisitos mínimos (3 referidos, 20 de reputación o VIP Stars activo).")
                 except Exception: pass
 
     return dp
@@ -1829,26 +1846,49 @@ async def process_successful_payment(message: Message):
 
         child_db = child_info["db"]
         child_bot = child_info["bot"]
-        cfg = await master_db.child_bots.find_one({"bot_token": child_bot.token})
-        paid_ch = clean_chat_id(cfg.get("paid_vip_channel_id")) if cfg else 0
+        cfg = await master_db.child_bots.find_one({"bot_token": child_bot.token}) or {}
+        paid_ch = clean_chat_id(cfg.get("paid_vip_channel_id"))
+        free_vip_id = clean_chat_id(cfg.get("vip_group_id"))
         
         user = await child_db.users.find_one({"_id": user_id}) or {}
         now = time.time()
         base = max(now, user.get("vip_until", 0))
         new_vip = base + (7 * 86400)
         
-        await child_db.users.update_one({"_id": user_id}, {"$set": {"vip_until": new_vip, "paid_vip_active": True}}, upsert=True)
+        # Activar VIP Stars y saltar requerimientos del grupo VIP gratis
+        await child_db.users.update_one(
+            {"_id": user_id}, 
+            {"$set": {"vip_until": new_vip, "paid_vip_active": True, "in_vip": True, "notified_vip": True}}, 
+            upsert=True
+        )
         
+        buttons = []
+        # Enlace 1: Canal de Pago (Stars)
         if paid_ch:
             try:
-                inv = await child_bot.create_chat_invite_link(chat_id=paid_ch, member_limit=1)
-                kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="💎 Entrar al Canal VIP", url=inv.invite_link)]])
-                await message.answer("🎉 <b>¡Pago con Estrellas confirmado!</b> Acceso exclusivo de 7 días:", reply_markup=kb, parse_mode="HTML")
+                inv_paid = await child_bot.create_chat_invite_link(chat_id=paid_ch, member_limit=1)
+                buttons.append([InlineKeyboardButton(text="💎 Canal VIP Stars (7 Días)", url=inv_paid.invite_link)])
             except Exception as e:
-                logging.error(f"Error creando link pago Stars: {e}")
-                await message.answer("🎉 <b>¡Pago confirmado!</b> Membresía actualizada en base de datos.")
+                logging.error(f"Error creando link canal pago: {e}")
+
+        # Enlace 2: Grupo VIP Gratuito (Acceso libre por comprar membresía)
+        if free_vip_id:
+            try:
+                inv_free = await child_bot.create_chat_invite_link(chat_id=free_vip_id, member_limit=1)
+                buttons.append([InlineKeyboardButton(text="🌟 Grupo VIP de la Comunidad", url=inv_free.invite_link)])
+            except Exception as e:
+                logging.error(f"Error creando link grupo gratis: {e}")
+
+        txt_pago = (
+            "🎉 <b>¡Pago con Estrellas confirmado con éxito!</b>\n\n"
+            "Tu membresía VIP de 7 días está activa. Al ser usuario VIP, también tienes <b>acceso completo al Grupo VIP de la comunidad</b> sin necesidad de referidos.\n\n"
+            "Únete a través de tus enlaces exclusivos:"
+        )
+
+        if buttons:
+            await message.answer(txt_pago, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="HTML")
         else:
-            await message.answer("🎉 <b>¡Pago confirmado!</b> Tu tiempo VIP de 7 días ha sido registrado.")
+            await message.answer("🎉 <b>¡Pago confirmado!</b> Tu membresía de 7 días ha sido registrada en el sistema.")
 
 # Wizard 7 Pasos
 @master_dp.callback_query(F.data == "master_crear")
