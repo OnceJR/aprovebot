@@ -33,6 +33,8 @@ from aiogram.types import (
 # =====================================================================
 # 1. CONFIGURACIÓN DEL PANEL MASTER Y VARIABLES DE ENTORNO
 # =====================================================================
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+
 MASTER_TOKEN = os.getenv("MASTER_TOKEN", "").strip()
 MASTER_MONGO_URI = os.getenv("MONGO_URI", "").strip()
 PORT = int(os.environ.get("PORT", 8080))
@@ -46,6 +48,12 @@ if not MASTER_TOKEN:
 
 raw_admins = os.getenv("SUPER_ADMINS", "")
 SUPER_ADMIN_IDS = [int(i.strip()) for i in raw_admins.split(",") if i.strip().isdigit()]
+
+# Reglas de negocio globales
+VIP_MIN_REFERRALS = 3
+VIP_MIN_REPUTATION = 20
+VIP_DURATION_DAYS = 7
+BONUS_COOLDOWN_SECONDS = 6 * 3600
 
 master_db_client = AsyncIOMotorClient(MASTER_MONGO_URI)
 master_db = master_db_client.saas_master_db
@@ -71,7 +79,7 @@ class BotStates(StatesGroup):
     waiting_for_id = State()
 
 def clean_chat_id(val) -> int:
-    """Sanitiza y normaliza cualquier ID de Telegram asegurando el prefijo -100."""
+    """Sanitiza y normaliza cualquier ID asegurando el prefijo -100."""
     if not val:
         return 0
     s = str(val).strip()
@@ -213,7 +221,7 @@ async def api_get_data(request):
         })
     
     last_bonus = user.get("last_bonus", 0)
-    time_left_bonus = max(0, int((last_bonus + (6 * 3600)) - now))
+    time_left_bonus = max(0, int((last_bonus + BONUS_COOLDOWN_SECONDS) - now))
     
     return web.json_response({
         "fotos": fotos,
@@ -233,14 +241,13 @@ async def api_claim_bonus(request):
         return web.json_response({"error": "No autorizado"}, status=401)
         
     now = time.time()
-    cooldown = 6 * 3600
     pts = random.randint(1, 5)
     
     res = await child_db.users.find_one_and_update(
         {
             "_id": user_id, 
             "$or": [
-                {"last_bonus": {"$lte": now - cooldown}},
+                {"last_bonus": {"$lte": now - BONUS_COOLDOWN_SECONDS}},
                 {"last_bonus": {"$exists": False}},
                 {"last_bonus": 0}
             ]
@@ -251,14 +258,14 @@ async def api_claim_bonus(request):
     
     if not res:
         user = await child_db.users.find_one({"_id": user_id}) or {}
-        time_left = max(0, int((user.get("last_bonus", 0) + cooldown) - now))
+        time_left = max(0, int((user.get("last_bonus", 0) + BONUS_COOLDOWN_SECONDS) - now))
         return web.json_response({"success": False, "error": "Cooldown activo", "time_left": time_left})
         
     return web.json_response({
         "success": True, 
         "bonus": pts, 
         "new_rep": res.get("reputation", 0), 
-        "time_left": cooldown
+        "time_left": BONUS_COOLDOWN_SECONDS
     })
 
 async def api_clear_inv(request):
@@ -275,8 +282,6 @@ async def handle_webapp(request):
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
     <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
-    <meta http-equiv="Pragma" content="no-cache">
-    <meta http-equiv="Expires" content="0">
     <title>Exchange Hub</title>
     <script src="https://telegram.org/js/telegram-web-app.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/canvas-confetti@1.6.0/dist/confetti.browser.min.js"></script>
@@ -295,82 +300,35 @@ async def handle_webapp(request):
         }
         * { box-sizing: border-box; margin: 0; padding: 0; font-family: 'Plus Jakarta Sans', sans-serif; -webkit-tap-highlight-color: transparent; }
         body { background: var(--bg-color); color: var(--text-color); padding: 16px 16px 110px; }
-        
         .header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 18px; }
         .header-title { font-size: 20px; font-weight: 800; display: flex; align-items: center; gap: 8px; color: #fff; }
         .header-title i { color: var(--accent-blue); }
         .status-pill { font-size: 11px; padding: 4px 10px; border-radius: 20px; background: rgba(56, 189, 248, 0.12); border: 1px solid rgba(56, 189, 248, 0.25); color: var(--accent-blue); font-weight: 600; }
-        
         .section-view { display: none; flex-direction: column; gap: 14px; }
         .section-view.active { display: flex !important; }
-        
         .card { background: var(--card-glass); backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px); border: 1px solid var(--card-border); border-radius: 20px; padding: 18px; }
         .card-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; }
         .card-title { font-size: 15px; font-weight: 700; color: #fff; }
-        
         .stat-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
         .stat-box { background: rgba(255, 255, 255, 0.03); border: 1px solid var(--card-border); border-radius: 16px; padding: 14px; text-align: center; }
         .stat-val { font-size: 20px; font-weight: 800; color: #fff; margin-top: 4px; }
-        
         .progress-track { height: 8px; background: rgba(255,255,255,0.06); border-radius: 8px; overflow: hidden; margin: 10px 0 6px; }
         .progress-fill { height: 100%; width: 0%; background: var(--accent-grad); border-radius: 8px; transition: width 0.6s ease; }
-        
         .btn-action { width: 100%; border: none; border-radius: 14px; padding: 13px; font-size: 13px; font-weight: 700; cursor: pointer; display: flex; align-items: center; justify-content: center; gap: 8px; }
         .btn-outline { background: transparent; border: 1px solid rgba(56, 189, 248, 0.4); color: var(--accent-blue); }
         .btn-danger { background: rgba(239, 68, 68, 0.1); border: 1px solid rgba(239, 68, 68, 0.3); color: #ef4444; }
-        
         .chest-row { display: flex; justify-content: space-around; margin: 20px 0; }
         .chest-card { width: 88px; height: 88px; border-radius: 18px; background: rgba(255,255,255,0.03); border: 1px solid var(--card-border); display: flex; align-items: center; justify-content: center; cursor: pointer; transition: 0.2s transform; }
         .chest-card.ready:active { transform: scale(0.92); }
         .chest-card.disabled { opacity: 0.35; filter: grayscale(1); pointer-events: none; }
         .chest-card i { font-size: 36px; color: #f59e0b; }
-        
         .user-row { display: flex; justify-content: space-between; align-items: center; padding: 12px; background: rgba(255,255,255,0.02); border: 1px solid var(--card-border); border-radius: 14px; margin-bottom: 8px; }
         .badge { font-size: 10px; font-weight: 700; padding: 2px 8px; border-radius: 6px; }
         .badge-free { background: rgba(34, 197, 94, 0.1); color: #22c55e; border: 1px solid rgba(34, 197, 94, 0.2); }
         .badge-busy { background: rgba(239, 68, 68, 0.1); color: #ef4444; border: 1px solid rgba(239, 68, 68, 0.2); }
-
-        .nav-dock {
-            position: fixed;
-            bottom: 16px;
-            left: 12px;
-            right: 12px;
-            background: rgba(19, 25, 39, 0.95);
-            backdrop-filter: blur(20px);
-            -webkit-backdrop-filter: blur(20px);
-            border: 1px solid rgba(255, 255, 255, 0.12);
-            border-radius: 20px;
-            padding: 6px;
-            display: flex;
-            justify-content: space-around;
-            align-items: center;
-            z-index: 99999;
-            box-shadow: 0 10px 30px rgba(0, 0, 0, 0.6);
-        }
-        .dock-btn {
-            flex: 1;
-            background: transparent;
-            border: none;
-            outline: none;
-            padding: 8px 4px;
-            color: var(--hint-color);
-            display: flex;
-            flex-direction: column;
-            align-items: center;
-            gap: 4px;
-            font-size: 11px;
-            font-weight: 600;
-            cursor: pointer;
-            border-radius: 14px;
-            transition: all 0.2s ease;
-        }
-        .dock-btn i { font-size: 17px; pointer-events: none; }
-        .dock-btn span { pointer-events: none; }
-        .dock-btn.active {
-            background: var(--accent-grad);
-            color: #ffffff;
-            box-shadow: 0 4px 12px rgba(56, 189, 248, 0.35);
-        }
+        .nav-dock { position: fixed; bottom: 16px; left: 12px; right: 12px; background: rgba(19, 25, 39, 0.95); backdrop-filter: blur(20px); border: 1px solid rgba(255, 255, 255, 0.12); border-radius: 20px; padding: 6px; display: flex; justify-content: space-around; align-items: center; z-index: 99999; }
+        .dock-btn { flex: 1; background: transparent; border: none; padding: 8px 4px; color: var(--hint-color); display: flex; flex-direction: column; align-items: center; gap: 4px; font-size: 11px; font-weight: 600; cursor: pointer; border-radius: 14px; }
+        .dock-btn.active { background: var(--accent-grad); color: #ffffff; }
     </style>
 </head>
 <body>
@@ -378,282 +336,144 @@ async def handle_webapp(request):
         <div class="header-title"><i class="fa-solid fa-arrows-split-up-and-left"></i> Exchange Hub</div>
         <div class="status-pill"><i class="fa-solid fa-circle fa-fade"></i> Online</div>
     </div>
-
-    <!-- RADAR -->
     <div id="sec-radar" class="section-view active">
         <div class="card">
-            <div class="card-header">
-                <span class="card-title"><i class="fa-solid fa-radar"></i> Radar en Vivo</span>
-                <button class="status-pill" style="cursor:pointer;" onclick="fetchData()"><i class="fa-solid fa-rotate-right"></i></button>
-            </div>
-            <div id="radar-list"><p style="color:var(--hint-color); font-size:13px; text-align:center; padding:10px;">Buscando usuarios...</p></div>
+            <div class="card-header"><span class="card-title"><i class="fa-solid fa-radar"></i> Radar en Vivo</span><button class="status-pill" onclick="fetchData()"><i class="fa-solid fa-rotate-right"></i></button></div>
+            <div id="radar-list"><p style="color:var(--hint-color); font-size:13px; text-align:center; padding:10px;">Buscando...</p></div>
         </div>
     </div>
-
-    <!-- BONOS -->
     <div id="sec-bonus" class="section-view">
         <div class="card" style="text-align:center;">
-            <span class="card-title" style="display:block; margin-bottom:4px;">Cofre de Recompensa</span>
-            <p style="font-size:12px; color:var(--hint-color);">Reclama entre +1 y +5 de reputación cada 6 horas.</p>
+            <span class="card-title">Cofre de Recompensa</span>
+            <p style="font-size:12px; color:var(--hint-color); margin: 6px 0;">Reclama hasta +5 de reputación cada 6 horas.</p>
             <div class="chest-row">
                 <div class="chest-card disabled" onclick="claimChest()"><i class="fa-solid fa-gem"></i></div>
                 <div class="chest-card disabled" onclick="claimChest()"><i class="fa-solid fa-vault"></i></div>
                 <div class="chest-card disabled" onclick="claimChest()"><i class="fa-solid fa-cube"></i></div>
             </div>
-            <p id="bonus-countdown" style="font-size:13px; font-weight:700; color:var(--hint-color);">Sincronizando...</p>
+            <p id="bonus-countdown" style="font-size:13px; font-weight:700; color:var(--hint-color);">Cargando...</p>
         </div>
     </div>
-
-    <!-- PERFIL -->
     <div id="sec-profile" class="section-view">
         <div class="card">
-            <div class="card-header">
-                <span class="card-title">Métricas de Reputación</span>
-                <span id="vip-ratio" style="font-weight:800; font-size:13px; color:var(--accent-blue);">--/20</span>
-            </div>
+            <div class="card-header"><span class="card-title">Métricas</span><span id="vip-ratio" style="font-weight:800; font-size:13px; color:var(--accent-blue);">--/20</span></div>
             <div class="progress-track"><div class="progress-fill" id="vip-fill"></div></div>
             <div class="stat-grid" style="margin-top:14px;">
-                <div class="stat-box">
-                    <span style="font-size:11px; color:var(--hint-color);">Referidos</span>
-                    <div class="stat-val" id="ref-count">0</div>
-                </div>
-                <div class="stat-box">
-                    <span style="font-size:11px; color:var(--hint-color);">Reputación</span>
-                    <div class="stat-val" id="rep-count">0</div>
-                </div>
+                <div class="stat-box"><span style="font-size:11px; color:var(--hint-color);">Referidos</span><div class="stat-val" id="ref-count">0</div></div>
+                <div class="stat-box"><span style="font-size:11px; color:var(--hint-color);">Reputación</span><div class="stat-val" id="rep-count">0</div></div>
             </div>
             <button class="btn-action btn-outline" style="margin-top:14px;" onclick="copyLink()"><i class="fa-solid fa-share-nodes"></i> Enlace de Invitación</button>
         </div>
         <div class="card">
-            <span class="card-title" style="display:block; margin-bottom:10px;">Caja Fuerte Multimedia</span>
-            <div class="stat-grid">
+            <span class="card-title">Caja Fuerte Multimedia</span>
+            <div class="stat-grid" style="margin-top:10px;">
                 <div class="stat-box"><i class="fa-regular fa-images"></i><div class="stat-val" id="cnt-photos">0</div></div>
                 <div class="stat-box"><i class="fa-solid fa-film"></i><div class="stat-val" id="cnt-videos">0</div></div>
             </div>
             <button class="btn-action btn-danger" style="margin-top:14px;" onclick="wipeInventory()"><i class="fa-solid fa-trash"></i> Vaciar Inventario</button>
         </div>
     </div>
-
-    <!-- TOP -->
     <div id="sec-top" class="section-view">
         <div class="card">
             <div class="card-header"><span class="card-title"><i class="fa-solid fa-trophy"></i> Top 10 Red</span></div>
-            <div id="leaderboard-list">Cargando clasificación...</div>
+            <div id="leaderboard-list">Cargando...</div>
         </div>
     </div>
-
-    <!-- BARRA DOCK NAVEGABLE -->
     <div class="nav-dock">
-        <button type="button" class="dock-btn active" data-target="sec-radar" onclick="switchSection('sec-radar', this)">
-            <i class="fa-solid fa-satellite-dish"></i>
-            <span>Radar</span>
-        </button>
-        <button type="button" class="dock-btn" data-target="sec-bonus" onclick="switchSection('sec-bonus', this)">
-            <i class="fa-solid fa-gift"></i>
-            <span>Bonus</span>
-        </button>
-        <button type="button" class="dock-btn" data-target="sec-profile" onclick="switchSection('sec-profile', this)">
-            <i class="fa-solid fa-id-badge"></i>
-            <span>Perfil</span>
-        </button>
-        <button type="button" class="dock-btn" data-target="sec-top" onclick="switchSection('sec-top', this)">
-            <i class="fa-solid fa-crown"></i>
-            <span>Top</span>
-        </button>
+        <button class="dock-btn active" onclick="switchSection('sec-radar', this)"><i class="fa-solid fa-satellite-dish"></i><span>Radar</span></button>
+        <button class="dock-btn" onclick="switchSection('sec-bonus', this)"><i class="fa-solid fa-gift"></i><span>Bonus</span></button>
+        <button class="dock-btn" onclick="switchSection('sec-profile', this)"><i class="fa-solid fa-id-badge"></i><span>Perfil</span></button>
+        <button class="dock-btn" onclick="switchSection('sec-top', this)"><i class="fa-solid fa-crown"></i><span>Top</span></button>
     </div>
-
     <script>
         const tg = window.Telegram?.WebApp;
-        if (tg) {
-            try { tg.expand(); tg.ready(); } catch(e) {}
-        }
-
+        if (tg) { try { tg.expand(); tg.ready(); } catch(e) {} }
         const params = new URLSearchParams(window.location.search);
         const botUsername = params.get('bot') || "";
         const botId = params.get('bot_id') || "";
-        const userId = (tg && tg.initDataUnsafe && tg.initDataUnsafe.user && tg.initDataUnsafe.user.id) ? tg.initDataUnsafe.user.id : (params.get('user_id') || "0");
+        const userId = tg?.initDataUnsafe?.user?.id || params.get('user_id') || "0";
+        const headers = { "Content-Type": "application/json", "Authorization": tg?.initData || "" };
 
-        const headers = {
-            "Content-Type": "application/json",
-            "Authorization": (tg && tg.initData) ? tg.initData : ""
-        };
-
-        function switchSection(sectionId, btnElement) {
-            try {
-                if (tg && tg.HapticFeedback && typeof tg.HapticFeedback.selectionChanged === 'function') {
-                    tg.HapticFeedback.selectionChanged();
-                }
-            } catch(err) {}
-
-            document.querySelectorAll('.section-view').forEach(s => {
-                s.classList.remove('active');
-                s.style.display = 'none';
-            });
-
-            document.querySelectorAll('.dock-btn').forEach(b => {
-                b.classList.remove('active');
-            });
-
-            const target = document.getElementById(sectionId);
-            if (target) {
-                target.classList.add('active');
-                target.style.display = 'flex';
-            }
-
-            if (btnElement) {
-                btnElement.classList.add('active');
-            }
+        function switchSection(id, btn) {
+            document.querySelectorAll('.section-view').forEach(s => s.classList.remove('active'));
+            document.querySelectorAll('.dock-btn').forEach(b => b.classList.remove('active'));
+            document.getElementById(id)?.classList.add('active');
+            btn?.classList.add('active');
             window.scrollTo({ top: 0, behavior: 'smooth' });
         }
-
-        let isBonusReady = false;
-        let timerInterval;
+        let isBonusReady = false, timerInterval;
         function renderTimer(seconds) {
             clearInterval(timerInterval);
-            const display = document.getElementById("bonus-countdown");
+            const d = document.getElementById("bonus-countdown");
             const cards = document.querySelectorAll(".chest-card");
-            
             if (seconds <= 0) {
-                isBonusReady = true;
-                display.innerText = "¡Cofre listo! Toca para abrir";
-                display.style.color = "#22c55e";
+                isBonusReady = true; d.innerText = "¡Cofre listo! Abre uno"; d.style.color = "#22c55e";
                 cards.forEach(c => { c.classList.remove('disabled'); c.classList.add('ready'); });
                 return;
             }
-            
-            isBonusReady = false;
-            cards.forEach(c => { c.classList.add('disabled'); c.classList.remove('ready'); });
-            display.style.color = "var(--hint-color)";
-            
+            isBonusReady = false; cards.forEach(c => { c.classList.add('disabled'); c.classList.remove('ready'); });
+            d.style.color = "var(--hint-color)";
             let s = seconds;
             timerInterval = setInterval(() => {
                 s--;
                 if (s <= 0) renderTimer(0);
                 else {
-                    let h = Math.floor(s / 3600);
-                    let m = Math.floor((s % 3600) / 60);
-                    let sec = s % 60;
-                    display.innerText = `Disponible en: ${h}h ${m}m ${sec}s`;
+                    let h = Math.floor(s/3600), m = Math.floor((s%3600)/60), sec = s%60;
+                    d.innerText = `Disponible en: ${h}h ${m}m ${sec}s`;
                 }
             }, 1000);
         }
-
         async function fetchData() {
             try {
                 const res = await fetch(`/api/data?bot_id=${botId}&id=${userId}&t=${Date.now()}`, { headers });
                 const d = await res.json();
                 if (d.error) return;
-
                 document.getElementById("cnt-photos").innerText = d.fotos;
                 document.getElementById("cnt-videos").innerText = d.videos;
                 document.getElementById("rep-count").innerText = d.reputation;
                 document.getElementById("ref-count").innerText = d.referrals;
                 document.getElementById("vip-ratio").innerText = `${d.reputation}/20`;
-                document.getElementById("vip-fill").style.width = Math.min(100, (d.reputation / 20) * 100) + "%";
-
+                document.getElementById("vip-fill").style.width = Math.min(100, (d.reputation/20)*100) + "%";
                 renderTimer(d.time_left);
-
-                const radarList = document.getElementById("radar-list");
-                if (!d.online_users || d.online_users.length === 0) {
-                    radarList.innerHTML = '<p style="font-size:12px; color:var(--hint-color); text-align:center; padding:10px;">No hay otros usuarios en línea.</p>';
-                } else {
-                    radarList.innerHTML = d.online_users.map(u => `
+                const rList = document.getElementById("radar-list");
+                rList.innerHTML = (!d.online_users || d.online_users.length === 0) 
+                    ? '<p style="font-size:12px; color:var(--hint-color); text-align:center; padding:10px;">No hay otros usuarios en línea.</p>'
+                    : d.online_users.map(u => `
                         <div class="user-row">
-                            <div>
-                                <div style="font-weight:700; font-size:13px;">ID: ${u.id}</div>
-                                <span class="badge ${u.is_free ? 'badge-free' : 'badge-busy'}">${u.status}</span>
-                                <span style="font-size:11px; color:var(--hint-color); margin-left:6px;">⭐ ${u.rep}</span>
-                            </div>
+                            <div><div style="font-weight:700; font-size:13px;">ID: ${u.id}</div><span class="badge ${u.is_free ? 'badge-free' : 'badge-busy'}">${u.status}</span><span style="font-size:11px; margin-left:6px;">⭐ ${u.rep}</span></div>
                             ${u.is_free ? `<button class="btn-action btn-outline" style="width:auto; padding:6px 12px; font-size:12px;" onclick="connectUser('${u.id}')">Conectar</button>` : ''}
-                        </div>
-                    `).join('');
-                }
-
-                const lb = document.getElementById("leaderboard-list");
-                lb.innerHTML = d.leaderboard.map((u, i) => `
-                    <div class="user-row">
-                        <span><strong>#${i+1}</strong> ID: ${u.id}</span>
-                        <span style="font-weight:800; color:var(--accent-blue);">${u.rep} PTS</span>
-                    </div>
-                `).join('') || '<p style="color:var(--hint-color); font-size:12px;">Sin datos aún.</p>';
+                        </div>`).join('');
+                document.getElementById("leaderboard-list").innerHTML = d.leaderboard.map((u, i) => `
+                    <div class="user-row"><span><strong>#${i+1}</strong> ID: ${u.id}</span><span style="font-weight:800; color:var(--accent-blue);">${u.rep} PTS</span></div>`).join('') || '<p style="color:var(--hint-color); font-size:12px;">Sin datos aún.</p>';
             } catch (e) {}
         }
-
         async function claimChest() {
             if (!isBonusReady) return;
             try {
-                if (tg?.HapticFeedback?.impactOccurred) tg.HapticFeedback.impactOccurred('medium');
-            } catch(e) {}
-            
-            try {
-                const res = await fetch(`/api/bonus?bot_id=${botId}&id=${userId}&t=${Date.now()}`, { method: "POST", headers, body: "{}" });
+                const res = await fetch(`/api/bonus?bot_id=${botId}&id=${userId}`, { method: "POST", headers, body: "{}" });
                 const d = await res.json();
                 if (d.success) {
-                    try {
-                        confetti({ particleCount: 120, spread: 80, origin: { y: 0.6 } });
-                        if (tg?.HapticFeedback?.notificationOccurred) tg.HapticFeedback.notificationOccurred('success');
-                    } catch(e) {}
-                    if (tg?.showAlert) tg.showAlert(`🎉 ¡Ganaste +${d.bonus} Puntos de Reputación!`);
-                    else alert(`🎉 ¡Ganaste +${d.bonus} Puntos de Reputación!`);
-                    fetchData();
-                } else {
-                    if (tg?.showAlert) tg.showAlert("⚠️ Cooldown activo.");
-                    fetchData();
-                }
+                    confetti({ particleCount: 100, spread: 70, origin: { y: 0.6 } });
+                    alert(`🎉 ¡Ganaste +${d.bonus} Puntos de Reputación!`);
+                } else alert("⚠️ Cooldown activo.");
+                fetchData();
             } catch(e) {}
         }
-
-        function connectUser(targetId) {
-            try {
-                if (tg?.HapticFeedback?.impactOccurred) tg.HapticFeedback.impactOccurred('light');
-            } catch(e) {}
-            if (tg?.openTelegramLink) {
-                tg.openTelegramLink(`https://t.me/${botUsername}?start=connect_${targetId}`);
-            } else {
-                window.location.href = `https://t.me/${botUsername}?start=connect_${targetId}`;
-            }
-        }
-
+        function connectUser(tId) { window.location.href = `https://t.me/${botUsername}?start=connect_${tId}`; }
         function copyLink() {
-            try {
-                if (tg?.HapticFeedback?.notificationOccurred) tg.HapticFeedback.notificationOccurred('success');
-            } catch(e) {}
-            const link = `https://t.me/${botUsername}?start=${userId}`;
-            navigator.clipboard.writeText(link).then(() => {
-                if (tg?.showAlert) tg.showAlert("Enlace copiado al portapapeles.");
-                else alert("Enlace copiado.");
-            });
+            navigator.clipboard.writeText(`https://t.me/${botUsername}?start=${userId}`).then(() => alert("Enlace copiado."));
         }
-
         function wipeInventory() {
-            const confirmMsg = "¿Eliminar todos tus archivos de forma permanente?";
-            if (tg?.showConfirm) {
-                tg.showConfirm(confirmMsg, async (ok) => {
-                    if (ok) {
-                        await fetch(`/api/clear?bot_id=${botId}&id=${userId}`, { method: "POST", headers });
-                        try { if (tg?.HapticFeedback?.notificationOccurred) tg.HapticFeedback.notificationOccurred('warning'); } catch(e) {}
-                        fetchData();
-                    }
-                });
-            } else if (confirm(confirmMsg)) {
+            if (confirm("¿Eliminar todos tus archivos de forma permanente?")) {
                 fetch(`/api/clear?bot_id=${botId}&id=${userId}`, { method: "POST", headers }).then(fetchData);
             }
         }
-
         fetchData();
         setInterval(fetchData, 15000);
     </script>
 </body>
 </html>"""
-    return web.Response(
-        text=html_content, 
-        content_type="text/html",
-        headers={
-            "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
-            "Pragma": "no-cache",
-            "Expires": "0"
-        }
-    )
+    return web.Response(text=html_content, content_type="text/html")
 
 # =====================================================================
 # 4. CORE SAAS: DISPATCHER BOT HIJO
@@ -667,6 +487,7 @@ def get_new_child_dp(child_config: dict, child_db) -> Dispatcher:
     active_viewers = {}
     chat_threads = {}
     pending_notifications = {}
+    media_group_buffers = {}
     backup_queue = asyncio.Queue()
     
     dp["backup_queue"] = backup_queue
@@ -744,13 +565,10 @@ def get_new_child_dp(child_config: dict, child_db) -> Dispatcher:
 
             now = time.time()
             is_paid_vip = user.get("paid_vip_active", False) or user.get("vip_until", 0) > now
-            has_requirements = (user.get("referrals", 0) >= 3 or user.get("reputation", 0) >= 20 or is_paid_vip)
+            has_requirements = (user.get("referrals", 0) >= VIP_MIN_REFERRALS or user.get("reputation", 0) >= VIP_MIN_REPUTATION or is_paid_vip)
 
             if has_requirements and not user.get("notified_vip"):
-                invite = await bot.create_chat_invite_link(
-                    chat_id=VIP_GROUP_ID, 
-                    member_limit=1
-                )
+                invite = await bot.create_chat_invite_link(chat_id=VIP_GROUP_ID, member_limit=1)
                 lang = user.get("lang", "es")
                 btn = "🌟 Entrar al Grupo VIP" if lang == "es" else "🌟 Join VIP Group"
                 msg = (
@@ -758,44 +576,25 @@ def get_new_child_dp(child_config: dict, child_db) -> Dispatcher:
                     if lang == "es" else 
                     "🎉 <b>VIP Access Granted!</b> Exclusive link:"
                 )
-                kb = InlineKeyboardMarkup(inline_keyboard=[[
-                    InlineKeyboardButton(text=btn, url=invite.invite_link)
-                ]])
+                kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=btn, url=invite.invite_link)]])
                 await bot.send_message(user_id, msg, reply_markup=kb, parse_mode="HTML")
                 await save_user(user_id, {"notified_vip": True, "in_vip": True})
         except TelegramBadRequest as e:
-            logging.warning(f"⚠️ [check_vip_status] Telegram rechazó crear link en chat {VIP_GROUP_ID} para bot {bot.id}: {e}")
+            logging.warning(f"⚠️ Telegram rechazó crear link en chat {VIP_GROUP_ID} para bot {bot.id}: {e}")
         except Exception as e:
-            logging.error(f"❌ Error inesperado en check_vip_status para usuario {user_id}: {e}")
+            logging.error(f"❌ Error inesperado en check_vip_status: {e}")
 
     async def send_rating_request(user_id, target_id, bot: Bot):
         user = await get_user(user_id)
         lang = user.get("lang", "es")
         btn_g = "👍 Buen usuario" if lang == "es" else "👍 Good user"
         btn_b = "👎 Malo" if lang == "es" else "👎 Bad"
-        msg = "¿Deseas otorgarle un punto de reputación extra a tu compañero?" if lang == "es" else "Do you want to give a bonus reputation point to your partner?"
+        msg = "¿Deseas otorgarle un punto de reputación a tu compañero?" if lang == "es" else "Do you want to rate your partner?"
         kb = InlineKeyboardMarkup(inline_keyboard=[[
             InlineKeyboardButton(text=btn_g, callback_data=f"rate_good_{target_id}"),
             InlineKeyboardButton(text=btn_b, callback_data=f"rate_bad_{target_id}")
         ]])
         await bot.send_message(user_id, msg, reply_markup=kb)
-
-    async def send_delayed_notification(u_id, lang, bot: Bot):
-        await asyncio.sleep(2.5)
-        total = await child_db.inventory.count_documents({"user_id": u_id})
-        msg = (
-            f"📥 <b>Lote guardado en tu cofre.</b> (Total en inventario: <code>{total}</code>)\n\n"
-            f"⚠️ <b>IMPORTANTE:</b> ¡No elimines los mensajes que acabas de subir aquí! Si los borras del chat, el bot no podrá reenviarlos y tus intercambios fallarán."
-            if lang == "es" else
-            f"📥 <b>Batch saved to your vault.</b> (Total in inventory: <code>{total}</code>)\n\n"
-            f"⚠️ <b>IMPORTANT:</b> Do not delete uploaded messages from this chat! If deleted, the bot cannot forward them and your trades will fail."
-        )
-        try:
-            await bot.send_message(u_id, msg, parse_mode="HTML")
-        except Exception:
-            pass
-        finally:
-            pending_notifications.pop(u_id, None)
 
     async def get_inventory_stats_for_trade(sender_id: int, receiver_id: int, category: str = "mixed"):
         total_query = {"user_id": sender_id}
@@ -853,8 +652,8 @@ def get_new_child_dp(child_config: dict, child_db) -> Dispatcher:
         ) if lang == "es" else (
             "👋 <b>Welcome to the P2P Exchange Network!</b>\n\n"
             "⚠️ <b>CRITICAL RULE:</b> Upload videos or photos directly to this chat to load your private vault. "
-            "<b>Do not delete the files you upload here</b>; if deleted, the bot cannot forward them and your trades will fail.\n\n"
-            "💡 <i>New here? Tap the <b>User Guide</b> button below to learn how it works.</i>"
+            "<b>Do not delete uploaded media</b>; if deleted, your trades will fail.\n\n"
+            "💡 <i>Tap the <b>User Guide</b> button below to learn more.</i>"
         )
         await bot.send_message(chat_id=user_id, text=txt, reply_markup=kb, parse_mode="HTML")
 
@@ -865,41 +664,29 @@ def get_new_child_dp(child_config: dict, child_db) -> Dispatcher:
                 "1️⃣ <b>Cargar tu Cofre:</b>\n"
                 "• Envía fotos o videos a este chat privado con el bot.\n"
                 "• Quedarán guardados automáticamente en tu inventario.\n"
-                "• ⚠️ <b>ADVERTENCIA ESTRICTA:</b> Nunca borres los mensajes multimedia originales que subas. Si los eliminas del chat, el bot no podrá reenviarlos durante un trade y la transacción fallará.\n\n"
+                "• ⚠️ <b>ADVERTENCIA:</b> Nunca borres los mensajes originales que subas. Si los eliminas, la entrega fallará.\n\n"
                 "2️⃣ <b>Búsqueda de Chat:</b>\n"
-                "• Al presionar <b>«Buscar Chat»</b>, entras a una sala de espera.\n"
-                "• <i>Para que la conexión se concrete, otra persona debe presionar ese mismo botón o enviarte solicitud.</i> No te salgas, el bot te avisará cuando alguien conecte.\n"
-                "• Si conoces el ID de un amigo, usa <b>«Conectar ID»</b> para emparejarse directamente.\n\n"
-                "3️⃣ <b>Intercambios Seguros (Trades):</b>\n"
-                "• Dentro de un chat conectado, presiona <b>«🤝 Proponer Intercambio»</b>.\n"
-                "• El bot comprobará tu cofre y te dirá cuántos archivos tienes en total y cuántos son <b>únicos</b> (que tu compañero aún no ha recibido).\n"
+                "• Presiona <b>«Buscar Chat»</b> para entrar a la sala de espera.\n"
+                "• Para que se emparejen, otro usuario debe buscar o conectarse con tu ID.\n\n"
+                "3️⃣ <b>Intercambios Seguros:</b>\n"
+                "• En un chat activo, presiona <b>«🤝 Proponer Intercambio»</b>.\n"
                 "• Elige la categoría (fotos, videos o mixto) y la cantidad.\n"
-                "• Cuando ambos aceptan, el bot intercambia los archivos de manera 100% automatizada e imparcial.\n\n"
-                "4️⃣ <b>Reputación y Grupo VIP:</b>\n"
-                "• Cada intercambio exitoso suma +1 Reputación.\n"
-                "• Abre el Cofre en la Mini App cada 6 horas para ganar hasta +5 puntos gratis.\n"
-                "• Con <b>20 Puntos</b>, <b>3 Referidos</b> o <b>VIP Stars activo</b> desbloqueas acceso directo al <b>Grupo VIP Gratuito</b>."
+                "• El bot transferirá los archivos de forma 100% automatizada y anónima.\n\n"
+                "4️⃣ <b>Acceso VIP:</b>\n"
+                "• Desbloqueas el <b>Grupo VIP Gratuito</b> acumulando <b>20 Puntos</b>, <b>3 Referidos</b> o adquiriendo el pase Stars."
             )
         else:
             return (
                 "📖 <b>USER GUIDE — COMPLETE TUTORIAL</b>\n\n"
                 "1️⃣ <b>Loading your Vault:</b>\n"
-                "• Send photos or videos directly to this private chat.\n"
-                "• They will be automatically saved into your private inventory.\n"
-                "• ⚠️ <b>STRICT WARNING:</b> Never delete the original media messages you upload here! If you delete them, the bot won't be able to forward them during a trade and the exchange will fail.\n\n"
+                "• Send photos or videos to this private chat.\n"
+                "• Never delete uploaded messages or trades will fail.\n\n"
                 "2️⃣ <b>Finding a Chat:</b>\n"
-                "• When you tap <b>«Random Chat»</b>, you enter a waiting queue.\n"
-                "• <i>For the connection to happen, another user must also tap that button or send you a request.</i> Stay in the queue, the bot will notify you as soon as someone joins.\n"
-                "• If you know a friend's ID, use <b>«Connect ID»</b> to connect directly.\n\n"
-                "3️⃣ <b>Safe P2P Trading:</b>\n"
-                "• Once connected, tap <b>«🤝 Propose Trade»</b>.\n"
-                "• The bot will inspect your vault and display both your total files and <b>unique unrepeated files</b> for that specific partner.\n"
-                "• Select category (photos, videos, mixed) and quantity.\n"
-                "• Once both parties accept, delivery is executed automatically.\n\n"
-                "4️⃣ <b>Reputation & VIP Access:</b>\n"
-                "• Every completed trade awards +1 Reputation.\n"
-                "• Open the Reward Chest in the Mini App every 6 hours for up to +5 points.\n"
-                "• Reaching <b>20 Reputation</b>, <b>3 Referrals</b> or holding an <b>Active Stars VIP</b> grants full access to the <b>VIP Group</b>."
+                "• Tap <b>«Random Chat»</b> to enter queue or connect directly by ID.\n\n"
+                "3️⃣ <b>Trading:</b>\n"
+                "• Use <b>«🤝 Propose Trade»</b>, select category and amount.\n\n"
+                "4️⃣ <b>VIP Access:</b>\n"
+                "• Reach <b>20 Reputation</b>, <b>3 Referrals</b> or buy Stars VIP to unlock VIP Groups."
             )
 
     @dp.callback_query(F.data == "show_manual")
@@ -930,8 +717,8 @@ def get_new_child_dp(child_config: dict, child_db) -> Dispatcher:
         now = time.time()
         query = {
             "$or": [
-                {"referrals": {"$gte": 3}},
-                {"reputation": {"$gte": 20}},
+                {"referrals": {"$gte": VIP_MIN_REFERRALS}},
+                {"reputation": {"$gte": VIP_MIN_REPUTATION}},
                 {"paid_vip_active": True},
                 {"vip_until": {"$gt": now}}
             ]
@@ -941,9 +728,9 @@ def get_new_child_dp(child_config: dict, child_db) -> Dispatcher:
         total = len(qualifying_users)
 
         if total == 0:
-            return await status_msg.edit_text("ℹ️ No hay ningún usuario que cumpla los requisitos todavía.")
+            return await status_msg.edit_text("ℹ️ No hay ningún usuario calificado todavía.")
 
-        await status_msg.edit_text(f"🚀 Enviando enlaces VIP a <b>{total}</b> usuarios calificados...", parse_mode="HTML")
+        await status_msg.edit_text(f"🚀 Enviando enlaces VIP a <b>{total}</b> usuarios...", parse_mode="HTML")
 
         sent, blocked, failed = 0, 0, 0
         for u in qualifying_users:
@@ -952,13 +739,7 @@ def get_new_child_dp(child_config: dict, child_db) -> Dispatcher:
                 invite = await bot.create_chat_invite_link(chat_id=VIP_GROUP_ID, member_limit=1)
                 lang = u.get("lang", "es")
                 btn_txt = "🌟 Entrar al Grupo VIP" if lang == "es" else "🌟 Join VIP Group"
-                txt = (
-                    "🎉 <b>¡Tu acceso al Grupo VIP está listo!</b>\n\n"
-                    "Ya has alcanzado los requisitos (o tienes suscripción activa). Aquí tienes tu enlace exclusivo:"
-                    if lang == "es" else
-                    "🎉 <b>Your VIP Group access is ready!</b>\n\n"
-                    "You met the requirements or have an active pass. Here is your exclusive link:"
-                )
+                txt = "🎉 <b>¡Tu acceso al Grupo VIP está listo!</b>\n\nAquí tienes tu enlace exclusivo:"
                 kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=btn_txt, url=invite.invite_link)]])
                 await bot.send_message(chat_id=uid, text=txt, reply_markup=kb, parse_mode="HTML")
                 await child_db.users.update_one({"_id": uid}, {"$set": {"notified_vip": True, "in_vip": True}})
@@ -974,12 +755,33 @@ def get_new_child_dp(child_config: dict, child_db) -> Dispatcher:
 
         res_report = (
             f"✅ <b>Proceso completado</b>\n\n"
-            f"👥 Total calificados: <code>{total}</code>\n"
+            f"👥 Total: <code>{total}</code>\n"
             f"📩 Enviados con éxito: <code>{sent}</code>\n"
-            f"🚫 Bot bloqueado por usuario: <code>{blocked}</code>\n"
-            f"⚠️ Otros errores: <code>{failed}</code>"
+            f"🚫 Bloqueados: <code>{blocked}</code>\n"
+            f"⚠️ Errores: <code>{failed}</code>"
         )
         await message.answer(res_report, parse_mode="HTML")
+
+    @dp.message(Command("reinvitar"))
+    async def cmd_reinvitar(message: Message, bot: Bot):
+        """Reenvía específicamente el enlace al Grupo VIP Gratuito a un usuario determinado."""
+        if message.from_user.id not in SUPER_ADMIN_IDS and message.from_user.id != OWNER_ID:
+            return
+        args = message.text.split()
+        if len(args) < 2 or not args[1].isdigit():
+            return await message.answer("⚠️ Uso: <code>/reinvitar ID_DEL_USUARIO</code>", parse_mode="HTML")
+        if not VIP_GROUP_ID:
+            return await message.answer("❌ No hay un Grupo VIP configurado.")
+
+        target_uid = int(args[1])
+        try:
+            invite = await bot.create_chat_invite_link(chat_id=VIP_GROUP_ID, member_limit=1)
+            kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🌟 Entrar al Grupo VIP", url=invite.invite_link)]])
+            await bot.send_message(target_uid, "🎉 <b>Aquí tienes tu enlace exclusivo al Grupo VIP:</b>", reply_markup=kb, parse_mode="HTML")
+            await child_db.users.update_one({"_id": target_uid}, {"$set": {"in_vip": True, "notified_vip": True}}, upsert=True)
+            await message.answer(f"✅ Enlace del Grupo VIP enviado al usuario <code>{target_uid}</code>.", parse_mode="HTML")
+        except Exception as e:
+            await message.answer(f"❌ Error al generar la invitación: {e}")
 
     @dp.message(Command("enviar_vip"))
     async def cmd_enviar_vip(message: Message, bot: Bot):
@@ -991,16 +793,12 @@ def get_new_child_dp(child_config: dict, child_db) -> Dispatcher:
             return await message.answer("⚠️ Uso: <code>/enviar_vip ID_DEL_USUARIO</code>", parse_mode="HTML")
             
         target_uid = int(args[1])
-        if not PAID_VIP_CHANNEL_ID:
-            return await message.answer("❌ Este bot no tiene configurado un Canal VIP de pago.")
-            
         try:
             now = time.time()
             u_data = await child_db.users.find_one({"_id": target_uid}) or {}
             base_time = max(now, u_data.get("vip_until", 0))
-            new_vip_until = base_time + (7 * 86400)
+            new_vip_until = base_time + (VIP_DURATION_DAYS * 86400)
             
-            # Guardar pase VIP de pago y otorgar también estatus VIP para el grupo gratis
             await child_db.users.update_one(
                 {"_id": target_uid},
                 {"$set": {"vip_until": new_vip_until, "paid_vip_active": True, "in_vip": True, "notified_vip": True}},
@@ -1008,26 +806,24 @@ def get_new_child_dp(child_config: dict, child_db) -> Dispatcher:
             )
             
             buttons = []
-            # 1. Enlace Canal VIP de Pago
-            invite_p = await bot.create_chat_invite_link(
-                chat_id=PAID_VIP_CHANNEL_ID,
-                member_limit=1,
-                creates_join_request=False
-            )
-            buttons.append([InlineKeyboardButton(text="💎 Canal VIP Stars (7 Días)", url=invite_p.invite_link)])
+            if PAID_VIP_CHANNEL_ID:
+                try:
+                    invite_p = await bot.create_chat_invite_link(chat_id=PAID_VIP_CHANNEL_ID, member_limit=1)
+                    buttons.append([InlineKeyboardButton(text="💎 Canal VIP Stars (7 Días)", url=invite_p.invite_link)])
+                except Exception as e:
+                    logging.error(f"Error link canal pago: {e}")
             
-            # 2. Enlace Grupo VIP Gratuito (Bypass incluido)
             if VIP_GROUP_ID:
                 try:
                     invite_f = await bot.create_chat_invite_link(chat_id=VIP_GROUP_ID, member_limit=1)
                     buttons.append([InlineKeyboardButton(text="🌟 Grupo VIP de la Comunidad", url=invite_f.invite_link)])
                 except Exception as e:
-                    logging.error(f"Error generando link grupo gratis en /enviar_vip: {e}")
+                    logging.error(f"Error link grupo gratis: {e}")
             
             kb = InlineKeyboardMarkup(inline_keyboard=buttons)
             txt_user = (
                 "🎉 <b>¡Tu membresía VIP de 7 días ha sido activada!</b>\n\n"
-                "Como usuario VIP, dispones de acceso tanto al Canal VIP exclusivo como al Grupo VIP de la comunidad:"
+                "Tienes acceso tanto al Canal VIP exclusivo como al Grupo VIP comunitario:"
             )
             await bot.send_message(chat_id=target_uid, text=txt_user, reply_markup=kb, parse_mode="HTML")
             await message.answer(f"✅ Membresía VIP entregada exitosamente al usuario <code>{target_uid}</code>.", parse_mode="HTML")
@@ -1086,19 +882,22 @@ def get_new_child_dp(child_config: dict, child_db) -> Dispatcher:
 
     @dp.message(Command("broadcast"))
     async def cmd_broadcast(message: Message, bot: Bot):
+        """Difusión masiva procesando etiquetas HTML sin escapado destructivo."""
         if message.from_user.id not in SUPER_ADMIN_IDS: return
         text = message.text.replace("/broadcast", "").strip()
         if not text: return await message.answer("Escribe el mensaje tras el comando.")
-        await message.answer("⏳ Transmitiendo aviso...")
+        status_msg = await message.answer("⏳ Transmitiendo aviso...")
         count = 0
         async for u in child_db.users.find():
             try:
-                await bot.send_message(u["_id"], f"📢 <b>Aviso General:</b>\n\n{html.quote(text)}", parse_mode="HTML")
+                # Se envía text directamente para que Telegram renderice las etiquetas HTML
+                await bot.send_message(u["_id"], f"📢 <b>Aviso General:</b>\n\n{text}", parse_mode="HTML")
                 count += 1
                 await asyncio.sleep(0.05)
             except Exception:
                 pass
-        await message.answer(f"✅ Difusión completada a <code>{count}</code> usuarios.")
+        await status_msg.delete()
+        await message.answer(f"✅ Difusión completada a <code>{count}</code> usuarios.", parse_mode="HTML")
 
     @dp.message(Command("estadisticas"))
     async def cmd_stats(message: Message):
@@ -1210,7 +1009,7 @@ def get_new_child_dp(child_config: dict, child_db) -> Dispatcher:
         fotos = await child_db.inventory.count_documents({"user_id": u_id, "type": "photo"})
         videos = await child_db.inventory.count_documents({"user_id": u_id, "type": "video"})
         rep = user.get("reputation", 0)
-        prog_bar = format_progress_bar(rep, 20)
+        prog_bar = format_progress_bar(rep, VIP_MIN_REPUTATION)
         
         now = time.time()
         vip_expires = user.get("vip_until", 0)
@@ -1223,8 +1022,7 @@ def get_new_child_dp(child_config: dict, child_db) -> Dispatcher:
             [InlineKeyboardButton(text="🔄 Cambiar Modo", callback_data="toggle_mode")]
         ]
         
-        # Acceso al grupo VIP si cumple requisitos O si tiene VIP Stars activo
-        if VIP_GROUP_ID and (user.get("in_vip") or user.get("referrals", 0) >= 3 or rep >= 20 or is_paid_vip):
+        if VIP_GROUP_ID and (user.get("in_vip") or user.get("referrals", 0) >= VIP_MIN_REFERRALS or rep >= VIP_MIN_REPUTATION or is_paid_vip):
             try:
                 inv = await bot.create_chat_invite_link(chat_id=VIP_GROUP_ID, member_limit=1)
                 kb_list.insert(0, [InlineKeyboardButton(text="🌟 Grupo VIP Gratuito", url=inv.invite_link)])
@@ -1241,9 +1039,9 @@ def get_new_child_dp(child_config: dict, child_db) -> Dispatcher:
         txt = (
             f"👤 <b>Tu Perfil</b>\n\n"
             f"🆔 ID: <code>{u_id}</code>\n"
-            f"🌟 Reputación: <code>{rep}/20</code>\n"
+            f"🌟 Reputación: <code>{rep}/{VIP_MIN_REPUTATION}</code>\n"
             f"<code>[{prog_bar}]</code>\n"
-            f"👥 Referidos: <code>{user.get('referrals', 0)}/3</code>\n"
+            f"👥 Referidos: <code>{user.get('referrals', 0)}/{VIP_MIN_REFERRALS}</code>\n"
             f"⭐ VIP Stars: <b>{vip_txt}</b>\n"
             f"🎭 Modo: <b>{modo_txt}</b>\n\n"
             f"📦 Caja Fuerte: 📷 {fotos} | 🎥 {videos}"
@@ -1312,7 +1110,7 @@ def get_new_child_dp(child_config: dict, child_db) -> Dispatcher:
                            KeyboardButton(text="❌ Desconectar" if lng == "es" else "❌ Disconnect")]],
                 resize_keyboard=True
             )
-            await bot.send_message(uid, "✅ <b>¡Conexión establecida!</b>", reply_markup=kb, parse_mode="HTML")
+            await bot.send_message(uid, "✅ <b>¡Conexión establecida!</b> Ya pueden hablar o intercambiar.", reply_markup=kb, parse_mode="HTML")
         await callback.message.delete()
 
     @dp.callback_query(F.data.startswith("reject_id_"))
@@ -1359,10 +1157,10 @@ def get_new_child_dp(child_config: dict, child_db) -> Dispatcher:
             kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Cancelar Búsqueda" if lang == "es" else "❌ Cancel Queue", callback_data="leave_chat")]])
             txt = (
                 "🔍 <b>Buscando compañero de intercambio...</b>\n\n"
-                "⏳ <i>Estás en la sala de espera. Para que la conexión se complete, <b>otro usuario debe presionar «Buscar Chat»</b> o enviarte una solicitud directa. En cuanto alguien más entre, se emparejarán automáticamente.</i>"
+                "⏳ <i>Estás en la sala de espera. En cuanto otro usuario busque chat se conectarán al instante.</i>"
                 if lang == "es" else
                 "🔍 <b>Searching for trade partner...</b>\n\n"
-                "⏳ <i>You are now in the queue. For the connection to establish, <b>another user must also tap «Random Chat»</b> or send you a request. You will be paired automatically once someone joins.</i>"
+                "⏳ <i>You will be paired automatically once someone joins.</i>"
             )
             await callback.message.edit_text(txt, reply_markup=kb, parse_mode="HTML")
 
@@ -1392,7 +1190,32 @@ def get_new_child_dp(child_config: dict, child_db) -> Dispatcher:
             await bot.send_message(u_id, "Has salido de la sesión.", reply_markup=ReplyKeyboardRemove())
         await show_main_menu(u_id, bot)
 
-    # Ingesta multimedia
+    # Ingesta multimedia con Debounce de Álbumes
+    async def flush_album_buffer(buffer_key: str, bot: Bot):
+        await asyncio.sleep(1.2)
+        items = media_group_buffers.pop(buffer_key, [])
+        if not items:
+            return
+        uid = items[0]["user_id"]
+        to_insert = []
+        for item in items:
+            if not await child_db.inventory.find_one({"user_id": uid, "file_unique_id": item["file_unique_id"]}):
+                to_insert.append({
+                    "user_id": uid, "file_id": item["file_id"], "message_id": item["message_id"],
+                    "file_unique_id": item["file_unique_id"], "type": item["type"]
+                })
+        if to_insert:
+            await child_db.inventory.insert_many(to_insert)
+            total = await child_db.inventory.count_documents({"user_id": uid})
+            try:
+                await bot.send_message(
+                    uid, 
+                    f"📥 <b>Álbum guardado en tu cofre:</b> +{len(to_insert)} archivos. (Total: <code>{total}</code>)\n\n"
+                    f"⚠️ <i>No borres los mensajes del chat privado para no interrumpir tus trades.</i>",
+                    parse_mode="HTML"
+                )
+            except Exception: pass
+
     @dp.message(F.chat.type == "private", F.photo | F.video | F.document)
     async def handle_media(message: Message, bot: Bot):
         u_id = message.from_user.id
@@ -1407,16 +1230,30 @@ def get_new_child_dp(child_config: dict, child_db) -> Dispatcher:
             await child_db.global_files.insert_one({"_id": file_unique_id})
             await backup_queue.put({"file_id": file_id, "type": m_type, "user_id": u_id, "name": message.from_user.full_name})
 
+        # Si está en chat activo, reenvío anónimo directo
         if u_id in active_chats:
             target = active_chats[u_id]
             try:
-                await message.forward(target)
+                await bot.copy_message(chat_id=target, from_chat_id=u_id, message_id=message.message_id)
                 thread_id = await get_or_create_chat_topic(bot, u_id, target)
                 if thread_id and LOG_GROUP_ID:
                     await bot.send_message(chat_id=LOG_GROUP_ID, message_thread_id=thread_id, text=f"📎 <code>{u_id}</code> envió un archivo ({m_type}).", parse_mode="HTML")
             except Exception: pass
             return
 
+        # Acumular en buffer si pertenece a un álbum
+        if message.media_group_id:
+            b_key = f"{bot.id}_{message.media_group_id}"
+            if b_key not in media_group_buffers:
+                media_group_buffers[b_key] = []
+                asyncio.create_task(flush_album_buffer(b_key, bot))
+            media_group_buffers[b_key].append({
+                "user_id": u_id, "file_id": file_id, "message_id": message.message_id,
+                "file_unique_id": file_unique_id, "type": m_type
+            })
+            return
+
+        # Archivo suelto
         if not await child_db.inventory.find_one({"user_id": u_id, "file_unique_id": file_unique_id}):
             await child_db.inventory.insert_one({
                 "user_id": u_id, "file_id": file_id, "message_id": message.message_id,
@@ -1424,7 +1261,14 @@ def get_new_child_dp(child_config: dict, child_db) -> Dispatcher:
             })
             if u_id not in pending_notifications:
                 pending_notifications[u_id] = True
-                asyncio.create_task(send_delayed_notification(u_id, user.get("lang", "es"), bot))
+                async def notify_single():
+                    await asyncio.sleep(2.0)
+                    total = await child_db.inventory.count_documents({"user_id": u_id})
+                    try:
+                        await bot.send_message(u_id, f"📥 <b>Lote guardado en tu cofre.</b> (Total: <code>{total}</code>)\n\n⚠️ <i>No borres los mensajes originales del chat.</i>", parse_mode="HTML")
+                    except Exception: pass
+                    finally: pending_notifications.pop(u_id, None)
+                asyncio.create_task(notify_single())
 
     # Motor de Intercambios
     @dp.message(StateFilter(BotStates.chatting), F.text.in_(["🤝 Proponer Intercambio", "🤝 Propose Trade"]))
@@ -1443,13 +1287,8 @@ def get_new_child_dp(child_config: dict, child_db) -> Dispatcher:
             msg_no = (
                 f"⚠️ <b>Inventario agotado para este usuario:</b>\n\n"
                 f"• Total en tu cofre: <code>{tot}</code>\n"
-                f"• <b>Archivos únicos disponibles:</b> <code>0</code> (Ya le has transferido todos tus archivos o tu cofre está vacío).\n\n"
+                f"• <b>Archivos únicos disponibles:</b> <code>0</code>\n\n"
                 f"📥 <i>Sube más videos o fotos al bot para poder proponer un intercambio.</i>"
-                if lng == "es" else
-                f"⚠️ <b>No unrepeated files for this user:</b>\n\n"
-                f"• Total in vault: <code>{tot}</code>\n"
-                f"• <b>Unique files available:</b> <code>0</code> (All files have already been traded to this partner or your vault is empty).\n\n"
-                f"📥 <i>Upload more media to this chat to continue trading.</i>"
             )
             return await message.answer(msg_no, parse_mode="HTML")
 
@@ -1461,17 +1300,10 @@ def get_new_child_dp(child_config: dict, child_db) -> Dispatcher:
         ])
         
         msg = (
-            f"📊 <b>Estado de tu Inventario con este usuario:</b>\n"
+            f"📊 <b>Estado de tu Inventario:</b>\n"
             f"• Archivos totales en tu cofre: <code>{tot}</code>\n"
-            f"• <b>Archivos únicos listos para enviar:</b> <code>{unq}</code>\n\n"
-            f"⚠️ <i>Recuerda: Si eliminaste los mensajes originales del chat, no podrán reenviarse.</i>\n\n"
+            f"• <b>Archivos únicos disponibles:</b> <code>{unq}</code>\n\n"
             f"🎬 <b>¿Qué categoría deseas intercambiar?</b>"
-            if lng == "es" else
-            f"📊 <b>Your Inventory Status with this user:</b>\n"
-            f"• Total files in vault: <code>{tot}</code>\n"
-            f"• <b>Unique unrepeated files:</b> <code>{unq}</code>\n\n"
-            f"⚠️ <i>Remember: If you deleted original messages from the chat, delivery will fail.</i>\n\n"
-            f"🎬 <b>What category do you want to trade?</b>"
         )
         await message.answer(msg, reply_markup=kb, parse_mode="HTML")
 
@@ -1482,21 +1314,13 @@ def get_new_child_dp(child_config: dict, child_db) -> Dispatcher:
         if not t_id:
             return await callback.answer("Chat desconectado.", show_alert=True)
 
-        user = await get_user(u_id)
-        lng = user.get("lang", "es")
         t_type = callback.data.split("_")[1]
         await state.update_data(trade_type=t_type)
-        
         tot_cat, unq_cat = await get_inventory_stats_for_trade(u_id, t_id, t_type)
         await state.update_data(max_unique=unq_cat)
         
         if unq_cat == 0:
-            err_msg = (
-                f"⚠️ No tienes archivos únicos de categoría <b>{t_type}</b> disponibles para este usuario."
-                if lng == "es" else
-                f"⚠️ You don't have any unique <b>{t_type}</b> files available for this user."
-            )
-            return await callback.message.edit_text(err_msg, parse_mode="HTML")
+            return await callback.message.edit_text(f"⚠️ No tienes archivos únicos de categoría <b>{t_type}</b> disponibles.", parse_mode="HTML")
 
         await state.set_state(BotStates.waiting_trade_amount)
         kb = InlineKeyboardMarkup(inline_keyboard=[[
@@ -1506,13 +1330,9 @@ def get_new_child_dp(child_config: dict, child_db) -> Dispatcher:
         ]])
         
         msg = (
-            f"📁 Categoría seleccionada: <b>{t_type.capitalize()}</b>\n"
-            f"✨ Tienes <b>{unq_cat}</b> archivos únicos disponibles (de {tot_cat} totales en cofre).\n\n"
+            f"📁 Categoría: <b>{t_type.capitalize()}</b>\n"
+            f"✨ Tienes <b>{unq_cat}</b> archivos únicos disponibles (de {tot_cat} totales).\n\n"
             f"🔢 <b>¿Cuántos archivos deseas intercambiar?</b> Elige una opción o escribe un número:"
-            if lng == "es" else
-            f"📁 Selected category: <b>{t_type.capitalize()}</b>\n"
-            f"✨ You have <b>{unq_cat}</b> unique files available (out of {tot_cat} in vault).\n\n"
-            f"🔢 <b>How many files do you want to trade?</b> Choose an option or type a number:"
         )
         await callback.message.edit_text(msg, reply_markup=kb, parse_mode="HTML")
 
@@ -1525,15 +1345,7 @@ def get_new_child_dp(child_config: dict, child_db) -> Dispatcher:
         
         _, unq_available = await get_inventory_stats_for_trade(u_id, t_id, t_type)
         if amt > unq_available:
-            err_amt = (
-                f"⚠️ <b>Cantidad no disponible:</b>\n"
-                f"Has solicitado <b>{amt}</b> archivos, pero solo tienes <b>{unq_available}</b> archivos únicos sin repetir de esta categoría para este usuario.\n\n"
-                f"Por favor, elige una cantidad menor o sube más archivos."
-                if lang == "es" else
-                f"⚠️ <b>Amount not available:</b>\n"
-                f"You requested <b>{amt}</b> files, but you only have <b>{unq_available}</b> unrepeated unique files in this category.\n\n"
-                f"Please choose a smaller amount or upload more media."
-            )
+            err_amt = f"⚠️ <b>Cantidad no disponible:</b> Solicitaste <b>{amt}</b> pero solo tienes <b>{unq_available}</b> disponibles."
             return await send_func(err_amt, parse_mode="HTML")
 
         pending_trades[t_id] = {"sender": u_id, "amount": amt, "type": t_type}
@@ -1559,78 +1371,96 @@ def get_new_child_dp(child_config: dict, child_db) -> Dispatcher:
         await callback.message.delete()
         await execute_trade_proposal(callback.from_user.id, int(callback.data.split("_")[1]), data.get("trade_type", "mixed"), callback.message.answer, state, bot)
 
+    # Worker asíncrono para despachar trades de 10x10, 50x50 o 100x100 sin trabarse
+    async def run_fast_trade_worker(bot: Bot, child_db, sid: int, uid: int, files_s: list, files_r: list, amt: int, t_type: str):
+        async def copy_batch(sender_id: int, receiver_id: int, files: list):
+            sent = 0
+            chunk_size = 10
+            for i in range(0, min(len(files), amt), chunk_size):
+                chunk = files[i:i + chunk_size]
+                chunk_ids = [f["message_id"] for f in chunk]
+                # Intento 1: copy_messages (Sin cabecera de forward, 1 sola petición HTTP por lote de 10)
+                try:
+                    await bot.copy_messages(chat_id=receiver_id, from_chat_id=sender_id, message_ids=chunk_ids)
+                    now_dt = datetime.utcnow()
+                    for f in chunk:
+                        await child_db.exchange_history.insert_one({
+                            "sender_id": sender_id, "receiver_id": receiver_id, 
+                            "file_unique_id": f["file_unique_id"], "created_at": now_dt
+                        })
+                        sent += 1
+                    await asyncio.sleep(0.8)
+                except Exception:
+                    # Intento 2 (Fallback): si el usuario borró algún mensaje, enviar elemento por elemento
+                    for f in chunk:
+                        try:
+                            await bot.copy_message(chat_id=receiver_id, from_chat_id=sender_id, message_id=f["message_id"])
+                            await child_db.exchange_history.insert_one({
+                                "sender_id": sender_id, "receiver_id": receiver_id, 
+                                "file_unique_id": f["file_unique_id"], "created_at": datetime.utcnow()
+                            })
+                            sent += 1
+                            await asyncio.sleep(0.4)
+                        except TelegramRetryAfter as e:
+                            await asyncio.sleep(e.retry_after)
+                            try:
+                                await bot.copy_message(chat_id=receiver_id, from_chat_id=sender_id, message_id=f["message_id"])
+                                sent += 1
+                            except Exception: pass
+                        except Exception:
+                            await child_db.inventory.delete_one({"_id": f["_id"]})
+            return sent
+
+        try:
+            sent_s = await copy_batch(sid, uid, files_s)
+            sent_r = await copy_batch(uid, sid, files_r)
+
+            if sent_s == 0 and sent_r == 0:
+                fail_msg = "❌ <b>Intercambio cancelado:</b> Los mensajes originales fueron eliminados de Telegram por los usuarios."
+                await bot.send_message(uid, fail_msg, parse_mode="HTML")
+                await bot.send_message(sid, fail_msg, parse_mode="HTML")
+                return
+
+            thread_id = chat_threads.get(uid) or chat_threads.get(sid)
+            if thread_id and LOG_GROUP_ID:
+                rep_log = f"🔄 <b>Intercambio Finalizado</b>\n• Remitente 1: <code>{sid}</code> (Enviados: {sent_s})\n• Remitente 2: <code>{uid}</code> (Enviados: {sent_r})\n• Tipo: {t_type}"
+                try: await bot.send_message(chat_id=LOG_GROUP_ID, message_thread_id=thread_id, text=rep_log, parse_mode="HTML")
+                except Exception: pass
+
+            await child_db.users.update_one({"_id": uid}, {"$inc": {"reputation": 1}})
+            await child_db.users.update_one({"_id": sid}, {"$inc": {"reputation": 1}})
+            await check_vip_status(uid, bot)
+            await check_vip_status(sid, bot)
+
+            await bot.send_message(uid, f"🎉 <b>¡Trade completado!</b> Recibiste {sent_s} archivos. (+1 Reputación)", parse_mode="HTML")
+            await bot.send_message(sid, f"🎉 <b>¡Trade completado!</b> Recibiste {sent_r} archivos. (+1 Reputación)", parse_mode="HTML")
+
+            await send_rating_request(uid, sid, bot)
+            await send_rating_request(sid, uid, bot)
+        except Exception as e:
+            logging.error(f"Error procesando trade worker: {e}")
+
     @dp.callback_query(F.data == "accept_trade")
     async def accept_trade(callback: CallbackQuery, bot: Bot):
         u_id = callback.from_user.id
         trade = pending_trades.pop(u_id, None)
-        if not trade: return
+        if not trade: return await callback.answer("Propuesta expirada o ya procesada.", show_alert=True)
         s_id, amt, t_type = trade["sender"], trade["amount"], trade.get("type", "mixed")
         
-        await callback.message.edit_text("✅ <i>Comprobando inventarios en base de datos...</i>", parse_mode="HTML")
+        await callback.message.edit_text("🔍 <i>Comprobando inventarios disponibles...</i>", parse_mode="HTML")
         ok_s, files_s = await get_random_batch(s_id, u_id, t_type, amt)
         ok_r, files_r = await get_random_batch(u_id, s_id, t_type, amt)
         
         if not ok_s or not ok_r:
-            err = "⚠️ Uno de los dos usuarios no cuenta con suficientes archivos únicos para completar este trade."
+            err = "⚠️ Uno de los usuarios no tiene suficientes archivos únicos para este intercambio."
             await callback.message.edit_text(err)
             return await bot.send_message(s_id, err)
 
-        await callback.message.edit_text("✅ <i>Procesando intercambio seguro de archivos...</i>", parse_mode="HTML")
-        await bot.send_message(s_id, "✅ <i>Procesando intercambio seguro de archivos...</i>", parse_mode="HTML")
+        await callback.message.edit_text(f"🚀 <i>Transfiriendo {amt}x{amt} de forma rápida y segura...</i>", parse_mode="HTML")
+        await bot.send_message(s_id, f"🚀 <i>Transfiriendo {amt}x{amt} de forma rápida y segura...</i>", parse_mode="HTML")
 
-        sent_s, sent_r = 0, 0
-        iter_s, iter_r = iter(files_s), iter(files_r)
-        
-        for _ in range(amt):
-            success_s = False
-            for f in iter_s:
-                try:
-                    await bot.forward_message(chat_id=u_id, from_chat_id=s_id, message_id=f["message_id"])
-                    await child_db.exchange_history.insert_one({"sender_id": s_id, "receiver_id": u_id, "file_unique_id": f["file_unique_id"]})
-                    success_s = True
-                    break
-                except TelegramRetryAfter as e: await asyncio.sleep(e.retry_after)
-                except Exception: await child_db.inventory.delete_one({"_id": f["_id"]})
-            if not success_s: break
-
-            success_r = False
-            for f in iter_r:
-                try:
-                    await bot.forward_message(chat_id=s_id, from_chat_id=u_id, message_id=f["message_id"])
-                    await child_db.exchange_history.insert_one({"sender_id": u_id, "receiver_id": s_id, "file_unique_id": f["file_unique_id"]})
-                    success_r = True
-                    break
-                except TelegramRetryAfter as e: await asyncio.sleep(e.retry_after)
-                except Exception: await child_db.inventory.delete_one({"_id": f["_id"]})
-            if not success_r:
-                sent_s += 1
-                break
-                
-            sent_s += 1
-            sent_r += 1
-            await asyncio.sleep(0.2)
-
-        if sent_s == 0 and sent_r == 0:
-            fail = "❌ Intercambio fallido: Los mensajes originales fueron eliminados del chat por los usuarios."
-            await bot.send_message(u_id, fail)
-            return await bot.send_message(s_id, fail)
-
-        thread_id = chat_threads.get(u_id) or chat_threads.get(s_id)
-        if thread_id and LOG_GROUP_ID:
-            rep_log = f"🔄 <b>Intercambio Finalizado</b>\n• Remitente 1: <code>{s_id}</code> (Enviados: {sent_s})\n• Remitente 2: <code>{u_id}</code> (Enviados: {sent_r})\n• Tipo: {t_type}"
-            try: await bot.send_message(chat_id=LOG_GROUP_ID, message_thread_id=thread_id, text=rep_log, parse_mode="HTML")
-            except Exception: pass
-
-        await child_db.users.update_one({"_id": u_id}, {"$inc": {"reputation": 1}})
-        await child_db.users.update_one({"_id": s_id}, {"$inc": {"reputation": 1}})
-        await check_vip_status(u_id, bot)
-        await check_vip_status(s_id, bot)
-
-        await bot.send_message(u_id, f"🎉 <b>¡Trade completado con éxito!</b> Recibiste {sent_s} archivos. (+1 Reputación)", parse_mode="HTML")
-        await bot.send_message(s_id, f"🎉 <b>¡Trade completado con éxito!</b> Recibiste {sent_r} archivos. (+1 Reputación)", parse_mode="HTML")
-
-        await send_rating_request(u_id, s_id, bot)
-        await send_rating_request(s_id, u_id, bot)
+        # Despachado en segundo plano sin congelar la app ni bloquear al bot
+        asyncio.create_task(run_fast_trade_worker(bot, child_db, s_id, u_id, files_s, files_r, amt, t_type))
 
     @dp.callback_query(F.data == "reject_trade")
     async def reject_trade(callback: CallbackQuery, bot: Bot):
@@ -1649,7 +1479,7 @@ def get_new_child_dp(child_config: dict, child_db) -> Dispatcher:
             await check_vip_status(t_id, bot)
         await callback.message.edit_text("✅ Valoración registrada.")
 
-    # Retransmisión de texto
+    # Retransmisión de texto entre usuarios conectados
     @dp.message(StateFilter(BotStates.chatting), ~F.text.startswith("/"), ~F.text.in_(["🤝 Proponer Intercambio", "🤝 Propose Trade", "❌ Desconectar", "❌ Disconnect"]))
     async def relay_msg(message: Message, bot: Bot):
         u_id = message.from_user.id
@@ -1663,20 +1493,20 @@ def get_new_child_dp(child_config: dict, child_db) -> Dispatcher:
                     await bot.send_message(chat_id=LOG_GROUP_ID, message_thread_id=thread_id, text=f"💬 <code>{u_id}</code>: {html.quote(message.text)}", parse_mode="HTML")
             except Exception: pass
 
-    # Aprobación de entrada a grupo VIP (Permite tanto requisitos estándar como VIP Stars)
+    # Aprobación de entrada a grupo VIP
     @dp.chat_join_request()
     async def process_vip_join(join_req: ChatJoinRequest, bot: Bot):
         if VIP_GROUP_ID and join_req.chat.id == VIP_GROUP_ID:
             user = await get_user(join_req.from_user.id)
             now = time.time()
             is_paid_vip = user.get("paid_vip_active", False) or user.get("vip_until", 0) > now
-            if user.get("referrals", 0) >= 3 or user.get("reputation", 0) >= 20 or is_paid_vip:
+            if user.get("referrals", 0) >= VIP_MIN_REFERRALS or user.get("reputation", 0) >= VIP_MIN_REPUTATION or is_paid_vip:
                 await join_req.approve()
                 try: await bot.send_message(join_req.from_user.id, "🎉 ¡Tu solicitud al Grupo VIP ha sido aprobada!")
                 except Exception: pass
             else:
                 await join_req.decline()
-                try: await bot.send_message(join_req.from_user.id, "❌ No cumples los requisitos mínimos (3 referidos, 20 de reputación o VIP Stars activo).")
+                try: await bot.send_message(join_req.from_user.id, "❌ No cumples los requisitos mínimos para ingresar.")
                 except Exception: pass
 
     return dp
@@ -1780,8 +1610,14 @@ async def start_child_bot(config: dict) -> bool:
     if bot_id in active_bots_tasks: return True
     db_ver = config.get("db_version", "v1")
     child_db = master_db_client[f"child_{bot_id}_{db_ver}"]
+
+    # Índices TTL para no saturar los 512 MB de Mongo Atlas M0 en Render
+    try:
+        await child_db.exchange_history.create_index([("created_at", 1)], expireAfterSeconds=5184000)
+        await child_db.inventory.create_index([("user_id", 1), ("file_unique_id", 1)])
+    except Exception: pass
+
     dp = get_new_child_dp(config, child_db)
-    
     paid_channel_id = clean_chat_id(config.get("paid_vip_channel_id"))
     
     active_bots_tasks[bot_id] = {
@@ -1853,9 +1689,9 @@ async def process_successful_payment(message: Message):
         user = await child_db.users.find_one({"_id": user_id}) or {}
         now = time.time()
         base = max(now, user.get("vip_until", 0))
-        new_vip = base + (7 * 86400)
+        new_vip = base + (VIP_DURATION_DAYS * 86400)
         
-        # Activar VIP Stars y saltar requerimientos del grupo VIP gratis
+        # Activar pase VIP de pago y desbloquear grupo VIP gratis
         await child_db.users.update_one(
             {"_id": user_id}, 
             {"$set": {"vip_until": new_vip, "paid_vip_active": True, "in_vip": True, "notified_vip": True}}, 
@@ -1863,7 +1699,6 @@ async def process_successful_payment(message: Message):
         )
         
         buttons = []
-        # Enlace 1: Canal de Pago (Stars)
         if paid_ch:
             try:
                 inv_paid = await child_bot.create_chat_invite_link(chat_id=paid_ch, member_limit=1)
@@ -1871,7 +1706,6 @@ async def process_successful_payment(message: Message):
             except Exception as e:
                 logging.error(f"Error creando link canal pago: {e}")
 
-        # Enlace 2: Grupo VIP Gratuito (Acceso libre por comprar membresía)
         if free_vip_id:
             try:
                 inv_free = await child_bot.create_chat_invite_link(chat_id=free_vip_id, member_limit=1)
@@ -1881,7 +1715,7 @@ async def process_successful_payment(message: Message):
 
         txt_pago = (
             "🎉 <b>¡Pago con Estrellas confirmado con éxito!</b>\n\n"
-            "Tu membresía VIP de 7 días está activa. Al ser usuario VIP, también tienes <b>acceso completo al Grupo VIP de la comunidad</b> sin necesidad de referidos.\n\n"
+            "Tu membresía VIP de 7 días está activa. Tienes acceso tanto al <b>Canal VIP Stars</b> como al <b>Grupo VIP de la comunidad</b> sin requisitos de referidos.\n\n"
             "Únete a través de tus enlaces exclusivos:"
         )
 
@@ -2071,7 +1905,6 @@ async def web_server():
 
 async def main():
     global MASTER_BOT_USERNAME
-    logging.basicConfig(level=logging.INFO)
     
     if not MASTER_TOKEN or not MASTER_MONGO_URI:
         raise RuntimeError("Configura MASTER_TOKEN y MONGO_URI en tus variables de entorno.")
@@ -2093,7 +1926,7 @@ async def main():
         
     # 4. Monitoreo en segundo plano
     monitor_task = asyncio.create_task(health_check_monitor(master_bot))
-    print(f"🚀 SaaS Master (@{MASTER_BOT_USERNAME}) online en puerto {PORT}.")
+    logging.info(f"🚀 SaaS Master (@{MASTER_BOT_USERNAME}) online en puerto {PORT}.")
     
     try:
         await master_dp.start_polling(master_bot)
