@@ -136,7 +136,7 @@ async def notify_admins_alert(text: str):
             pass
 
 # =====================================================================
-# 2. MIDDLEWARE ANTI-SPAM (THROTTLING)
+# 2. MIDDLEWARE ANTI-SPAM (COMPATIBLE CON ÁLBUMES DE TELEGRAM)
 # =====================================================================
 class ThrottlingMiddleware(BaseMiddleware):
     def __init__(self, limit: float = 0.8):
@@ -144,6 +144,11 @@ class ThrottlingMiddleware(BaseMiddleware):
         self.cache = {}
 
     async def __call__(self, handler, event: TelegramObject, data: dict):
+        # Si el evento es parte de un álbum (media_group_id), omitir el rate-limit
+        # para que todas las fotos se capturen concurrentemente en el buffer
+        if isinstance(event, Message) and event.media_group_id:
+            return await handler(event, data)
+
         user = getattr(event, "from_user", None)
         if user and user.id not in SUPER_ADMIN_IDS:
             now = time.time()
@@ -258,7 +263,7 @@ async def api_get_data(request):
             continue
         u_data = await child_db.users.find_one({"_id": uid}) or {}
         
-        # Filtro de Radar Manual: solo se muestra a quienes activaron su visibilidad
+        # Filtro de Radar Manual: solo se muestra a quienes activaron su señal
         if not u_data.get("radar_visible", False):
             continue
 
@@ -1087,7 +1092,6 @@ def create_child_router(child_config: dict, child_db, ctx_vars: dict) -> Router:
         vip_txt = f"Hasta {datetime.fromtimestamp(vip_expires).strftime('%d/%m %H:%M')}" if is_paid_vip else "Inactivo ❌"
         modo_txt = "🕵️‍♂️ Anónimo" if user.get("mode") == "anon" else "👤 Público"
 
-        # Los pagos se dirigen siempre al Master Bot para unificar el balance de Stars
         kb_list = [
             [InlineKeyboardButton(text="⭐ Membresías VIP (Stars)", callback_data="menu_buy_vip")],
             [InlineKeyboardButton(text="🔄 Cambiar Modo", callback_data="toggle_mode")]
@@ -1121,7 +1125,6 @@ def create_child_router(child_config: dict, child_db, ctx_vars: dict) -> Router:
 
     @r.callback_query(F.data == "menu_buy_vip")
     async def menu_buy_vip(callback: CallbackQuery, bot: Bot):
-        # Enlaces directos al Master Bot que unifica el cobro
         kb = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="⭐ 1 Día (5 Stars)", url=f"https://t.me/{MASTER_BOT_USERNAME}?start=paystars_{bot.id}_1d")],
             [InlineKeyboardButton(text="⭐ 7 Días (25 Stars)", url=f"https://t.me/{MASTER_BOT_USERNAME}?start=paystars_{bot.id}_7d")],
@@ -1310,8 +1313,9 @@ def create_child_router(child_config: dict, child_db, ctx_vars: dict) -> Router:
             await bot.send_message(u_id, "Has salido de la sesión.", reply_markup=ReplyKeyboardRemove())
         await show_main_menu(u_id, bot)
 
+    # Ingesta multimedia con Debounce de Álbumes (1.8s de margen)
     async def flush_album_buffer(buffer_key: str, bot: Bot):
-        await asyncio.sleep(1.2)
+        await asyncio.sleep(1.8)
         items = media_group_buffers.pop(buffer_key, [])
         if not items:
             return
@@ -1670,7 +1674,7 @@ def create_vip_manager_router(config: dict) -> Router:
 
     @vr.callback_query(F.data == "vip_bot_plans")
     async def vip_bot_plans(callback: CallbackQuery, bot: Bot):
-        # Todos los botones abren la factura directamente en el Master Bot para centralizar los cobros
+        # Todos los cobros se dirigen centralmente al Master Bot
         kb = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="⭐ 1 Día (5 Stars)", url=f"https://t.me/{MASTER_BOT_USERNAME}?start=paystars_{bot.id}_1d")],
             [InlineKeyboardButton(text="⭐ 7 Días (25 Stars)", url=f"https://t.me/{MASTER_BOT_USERNAME}?start=paystars_{bot.id}_7d")],
