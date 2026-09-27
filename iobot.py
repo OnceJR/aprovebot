@@ -1581,50 +1581,65 @@ async def health_check_monitor(master_bot: Bot):
 async def child_polling_wrapper(dp: Dispatcher, bot: Bot, bot_id: int):
     try:
         await bot.delete_webhook(drop_pending_updates=True)
+        # Iniciar polling
         await dp.start_polling(bot, handle_signals=False)
     except TelegramUnauthorizedError:
-        logging.error(f"❌ [Bot {bot_id}] Token revocado o inválido durante polling.")
+        logging.error(f"❌ [Bot {bot_id}] Token revocado por Telegram. Aislándolo...")
         await isolate_and_cleanup_bot(bot_id, revoked=True)
     except asyncio.CancelledError:
-        logging.info(f"🛑 [Bot {bot_id}] Tarea de polling cancelada limpiamente.")
+        pass
     except Exception as e:
-        logging.critical(f"💥 [Bot {bot_id}] Error crítico inesperado en polling: {e}")
+        logging.critical(f"💥 [Bot {bot_id}] Error no controlado en polling: {e}")
         await isolate_and_cleanup_bot(bot_id, revoked=False)
     finally:
-        try:
-            if not bot.session.closed:
-                await bot.session.close()
-        except Exception:
-            pass
+        if not bot.session.closed:
+            await bot.session.close()
 
 async def start_child_bot(config: dict) -> bool:
     token = config["bot_token"]
     bot = Bot(token=token, default=DefaultBotProperties(parse_mode="HTML"))
+    
+    # Verificación preventiva: si el token no es válido, se marca revocado y se cancela
     try:
         me = await bot.get_me()
         bot_id = me.id
-    except Exception:
+    except (TelegramUnauthorizedError, Exception) as e:
+        logging.error(f"❌ No se pudo autenticar el token ({token[:10]}...): {e}")
         await bot.session.close()
+        # Desactivar en la base de datos automáticamente
+        await master_db.child_bots.update_one({"bot_token": token}, {"$set": {"status": "revoked"}})
         return False
 
-    if bot_id in active_bots_tasks: return True
+    if bot_id in active_bots_tasks:
+        await bot.session.close()
+        return True
+
     db_ver = config.get("db_version", "v1")
     child_db = master_db_client[f"child_{bot_id}_{db_ver}"]
 
-    # Índices TTL para no saturar los 512 MB de Mongo Atlas M0 en Render
+    # Configuración de Índices TTL e Inventario
     try:
         await child_db.exchange_history.create_index([("created_at", 1)], expireAfterSeconds=5184000)
         await child_db.inventory.create_index([("user_id", 1), ("file_unique_id", 1)])
-    except Exception: pass
-
-    dp = get_new_child_dp(config, child_db)
-    paid_channel_id = clean_chat_id(config.get("paid_vip_channel_id"))
+    except Exception:
+        pass
     
+    dp = Dispatcher(storage=MemoryStorage())
+    ctx_vars = {
+        "dp": dp,
+        "active_chats": {}, "waiting_list": [], "pending_trades": {},
+        "active_viewers": {}, "pending_notifications": {},
+        "backup_queue": asyncio.Queue(),
+        "media_group_buffers": {}
+    }
+    dp.include_router(create_child_router(config, child_db, ctx_vars))
+
+    paid_ch = clean_chat_id(config.get("paid_vip_channel_id"))
     active_bots_tasks[bot_id] = {
-        "bot": bot, "db": child_db, "dp": dp,
+        "bot": bot, "db": child_db, "dp": ctx_vars,
         "polling_task": asyncio.create_task(child_polling_wrapper(dp, bot, bot_id)),
         "worker_task": asyncio.create_task(child_message_worker(bot_id)),
-        "vip_cleaner_task": asyncio.create_task(background_vip_cleaner_runner(bot, child_db, paid_channel_id))
+        "vip_cleaner_task": asyncio.create_task(background_vip_cleaner_runner(bot, child_db, paid_ch))
     }
     return True
 
