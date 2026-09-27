@@ -5,13 +5,14 @@ import asyncio
 import logging
 import time
 import random
+import re
 from datetime import datetime
 from urllib.parse import parse_qsl
 import json
 from aiohttp import web
 from motor.motor_asyncio import AsyncIOMotorClient
 
-from aiogram import Bot, Dispatcher, Router, F, html
+from aiogram import Bot, Dispatcher, Router, BaseMiddleware, F, html
 from aiogram.client.default import DefaultBotProperties
 from aiogram.exceptions import (
     TelegramUnauthorizedError,
@@ -27,7 +28,7 @@ from aiogram.fsm.storage.base import StorageKey
 from aiogram.types import (
     Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, 
     ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove, WebAppInfo,
-    ChatJoinRequest, LabeledPrice, PreCheckoutQuery,
+    ChatJoinRequest, LabeledPrice, PreCheckoutQuery, TelegramObject,
     InputMediaPhoto, InputMediaVideo
 )
 
@@ -56,11 +57,22 @@ VIP_MIN_REPUTATION = 20
 VIP_DURATION_DAYS = 7
 BONUS_COOLDOWN_SECONDS = 6 * 3600
 
+# Planes VIP escalonados con Telegram Stars
+VIP_TIERS = {
+    "1d": {"days": 1, "stars": 5, "label": "Pase VIP 24 Horas"},
+    "7d": {"days": 7, "stars": 25, "label": "Pase VIP 7 Días"},
+    "30d": {"days": 30, "stars": 80, "label": "Pase VIP 30 Días"}
+}
+
+# Regex anti-enlaces y phishing para chats privados entre usuarios
+LINK_REGEX = re.compile(r'(https?://\S+|t\.me/\S+|@[a-zA-Z0-9_]{4,}|[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}(/\S*)?)', re.IGNORECASE)
+
 master_db_client = AsyncIOMotorClient(MASTER_MONGO_URI)
 master_db = master_db_client.saas_master_db
 active_bots_tasks = {}
 master_dp = Dispatcher()
 MASTER_BOT_USERNAME = ""
+GLOBAL_MASTER_BOT: Bot = None
 
 class CreateChildBot(StatesGroup):
     waiting_for_token = State()
@@ -108,8 +120,41 @@ def format_progress_bar(current: int, total: int, length: int = 10) -> str:
     filled = int(round(length * ratio))
     return "▰" * filled + "▱" * (length - filled)
 
+async def notify_admins_alert(text: str):
+    """Notifica diagnósticos o fallos a los administradores."""
+    if not GLOBAL_MASTER_BOT: return
+    for admin_id in SUPER_ADMIN_IDS:
+        try:
+            await GLOBAL_MASTER_BOT.send_message(chat_id=admin_id, text=f"🚨 <b>Alerta del Sistema:</b>\n{text}", parse_mode="HTML")
+        except Exception:
+            pass
+
 # =====================================================================
-# 2. SEGURIDAD DE WEBAPP & VALIDACIÓN TELEGRAM
+# 2. MIDDLEWARE ANTI-SPAM (THROTTLING)
+# =====================================================================
+class ThrottlingMiddleware(BaseMiddleware):
+    def __init__(self, limit: float = 0.8):
+        self.limit = limit
+        self.cache = {}
+
+    async def __call__(self, handler, event: TelegramObject, data: dict):
+        user = getattr(event, "from_user", None)
+        if user and user.id not in SUPER_ADMIN_IDS:
+            now = time.time()
+            last_time = self.cache.get(user.id, 0)
+            if now - last_time < self.limit:
+                if isinstance(event, CallbackQuery):
+                    try: await event.answer("⚠️ Espera un segundo antes de volver a pulsar.", show_alert=False)
+                    except Exception: pass
+                return
+            self.cache[user.id] = now
+            if len(self.cache) > 2000:
+                cutoff = now - 5.0
+                self.cache = {k: v for k, v in self.cache.items() if v > cutoff}
+        return await handler(event, data)
+
+# =====================================================================
+# 3. SEGURIDAD DE WEBAPP & VALIDACIÓN TELEGRAM
 # =====================================================================
 def validate_telegram_init_data(init_data: str, bot_token: str) -> dict | None:
     try:
@@ -171,7 +216,7 @@ async def authenticate_request(request):
     return user_id, bot_ctx["db"], bot_ctx["bot"]
 
 # =====================================================================
-# 3. ENDPOINTS API Y MINI APP
+# 4. ENDPOINTS API Y MINI APP
 # =====================================================================
 async def api_get_data(request):
     user_id, child_db, bot = await authenticate_request(request)
@@ -197,8 +242,9 @@ async def api_get_data(request):
             top_users.append({"id": u["_id"], "rep": u.get("reputation", 0)})
             
     waiting_list = dp["waiting_list"]
+    waiting_vip = dp.get("waiting_vip", [])
     active_chats = dp["active_chats"]
-    active_ids = set(active_viewers.keys()) | set(waiting_list) | set(active_chats.keys())
+    active_ids = set(active_viewers.keys()) | set(waiting_list) | set(waiting_vip) | set(active_chats.keys())
     
     online_users = []
     for uid in active_ids:
@@ -209,7 +255,7 @@ async def api_get_data(request):
         if uid in active_chats:
             status_txt = "Ocupado"
             is_free = False
-        elif uid in waiting_list:
+        elif uid in waiting_list or uid in waiting_vip:
             status_txt = "Buscando..."
             is_free = False
             
@@ -477,13 +523,16 @@ async def handle_webapp(request):
     return web.Response(text=html_content, content_type="text/html")
 
 # =====================================================================
-# 4. ENRUTADOR MODULAR DEL BOT HIJO (CHILD NODE)
+# 5. ENRUTADOR MODULAR DEL BOT HIJO (CHILD NODE)
 # =====================================================================
 def create_child_router(child_config: dict, child_db, ctx_vars: dict) -> Router:
     r = Router()
+    r.message.middleware(ThrottlingMiddleware(limit=0.8))
+    r.callback_query.middleware(ThrottlingMiddleware(limit=0.8))
 
     active_chats = ctx_vars["active_chats"]
     waiting_list = ctx_vars["waiting_list"]
+    waiting_vip = ctx_vars.setdefault("waiting_vip", [])
     pending_trades = ctx_vars["pending_trades"]
     pending_notifications = ctx_vars["pending_notifications"]
     media_group_buffers = ctx_vars["media_group_buffers"]
@@ -497,6 +546,21 @@ def create_child_router(child_config: dict, child_db, ctx_vars: dict) -> Router:
     LOG_GROUP_ID = clean_chat_id(child_config.get("log_group_id"))
     PAID_VIP_CHANNEL_ID = clean_chat_id(child_config.get("paid_vip_channel_id"))
     OWNER_ID = int(child_config.get("owner_id", 0)) if child_config.get("owner_id") else 0
+
+    # Persistencia de sesiones en MongoDB para sobrevivir a reinicios de Render
+    async def persist_rooms():
+        try:
+            await child_db.session_state.update_one(
+                {"_id": "rooms"},
+                {"$set": {
+                    "active_chats": {str(k): v for k, v in active_chats.items()},
+                    "waiting_list": waiting_list,
+                    "waiting_vip": waiting_vip
+                }},
+                upsert=True
+            )
+        except Exception as e:
+            logging.error(f"Error persistiendo salas de chat: {e}")
 
     async def get_or_create_chat_topic(bot: Bot, u_id: int, t_id: int):
         if not LOG_GROUP_ID:
@@ -635,7 +699,7 @@ def create_child_router(child_config: dict, child_db, ctx_vars: dict) -> Router:
 
         kb = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text=btn_panel, web_app=WebAppInfo(url=webapp_url))],
-            [InlineKeyboardButton(text=btn_rnd, callback_data="find_chat"), InlineKeyboardButton(text=btn_id, callback_data="connect_id")],
+            [InlineKeyboardButton(text=btn_rnd, callback_data="find_chat_menu"), InlineKeyboardButton(text=btn_id, callback_data="connect_id")],
             [InlineKeyboardButton(text=btn_manual, callback_data="show_manual"), InlineKeyboardButton(text=btn_prof, callback_data="my_profile")],
             [InlineKeyboardButton(text=btn_lang, callback_data="change_lang"), InlineKeyboardButton(text=btn_share, url=f"https://t.me/share/url?url={my_link}")]
         ])
@@ -760,6 +824,7 @@ def create_child_router(child_config: dict, child_db, ctx_vars: dict) -> Router:
 
     @r.message(Command("reinvitar"))
     async def cmd_reinvitar(message: Message, bot: Bot):
+        """Reenvía específicamente el enlace al Grupo VIP Gratuito a un usuario determinado."""
         if message.from_user.id not in SUPER_ADMIN_IDS and message.from_user.id != OWNER_ID:
             return
         args = message.text.split()
@@ -785,14 +850,15 @@ def create_child_router(child_config: dict, child_db, ctx_vars: dict) -> Router:
             
         args = message.text.split()
         if len(args) < 2 or not args[1].isdigit():
-            return await message.answer("⚠️ Uso: <code>/enviar_vip ID_DEL_USUARIO</code>", parse_mode="HTML")
+            return await message.answer("⚠️ Uso: <code>/enviar_vip ID_DEL_USUARIO [dias]</code>", parse_mode="HTML")
             
         target_uid = int(args[1])
+        days = int(args[2]) if len(args) > 2 and args[2].isdigit() else VIP_DURATION_DAYS
         try:
             now = time.time()
             u_data = await child_db.users.find_one({"_id": target_uid}) or {}
             base_time = max(now, u_data.get("vip_until", 0))
-            new_vip_until = base_time + (VIP_DURATION_DAYS * 86400)
+            new_vip_until = base_time + (days * 86400)
             
             await child_db.users.update_one(
                 {"_id": target_uid},
@@ -804,7 +870,7 @@ def create_child_router(child_config: dict, child_db, ctx_vars: dict) -> Router:
             if PAID_VIP_CHANNEL_ID:
                 try:
                     invite_p = await bot.create_chat_invite_link(chat_id=PAID_VIP_CHANNEL_ID, member_limit=1)
-                    buttons.append([InlineKeyboardButton(text="💎 Canal VIP Stars (7 Días)", url=invite_p.invite_link)])
+                    buttons.append([InlineKeyboardButton(text=f"💎 Canal VIP Stars ({days} Días)", url=invite_p.invite_link)])
                 except Exception as e:
                     logging.error(f"Error link canal pago: {e}")
             
@@ -817,11 +883,11 @@ def create_child_router(child_config: dict, child_db, ctx_vars: dict) -> Router:
             
             kb = InlineKeyboardMarkup(inline_keyboard=buttons)
             txt_user = (
-                "🎉 <b>¡Tu membresía VIP de 7 días ha sido activada!</b>\n\n"
+                f"🎉 <b>¡Tu membresía VIP de {days} días ha sido activada!</b>\n\n"
                 "Tienes acceso tanto al Canal VIP exclusivo como al Grupo VIP comunitario:"
             )
             await bot.send_message(chat_id=target_uid, text=txt_user, reply_markup=kb, parse_mode="HTML")
-            await message.answer(f"✅ Membresía VIP entregada exitosamente al usuario <code>{target_uid}</code>.", parse_mode="HTML")
+            await message.answer(f"✅ Membresía VIP por {days} días entregada a <code>{target_uid}</code>.", parse_mode="HTML")
         except TelegramBadRequest as e:
             await message.answer(f"❌ Error de Telegram (¿El bot es admin con permiso de invitar?): {e}")
         except Exception as e:
@@ -921,6 +987,7 @@ def create_child_router(child_config: dict, child_db, ctx_vars: dict) -> Router:
 
         await state.clear()
         if user_id in waiting_list: waiting_list.remove(user_id)
+        if user_id in waiting_vip: waiting_vip.remove(user_id)
         
         t_id = active_chats.pop(user_id, None)
         if t_id:
@@ -932,6 +999,7 @@ def create_child_router(child_config: dict, child_db, ctx_vars: dict) -> Router:
             except Exception: pass
             chat_threads.pop(user_id, None)
             chat_threads.pop(t_id, None)
+        await persist_rooms()
 
         user = await get_user(user_id)
         args = message.text.split(maxsplit=1)
@@ -942,7 +1010,7 @@ def create_child_router(child_config: dict, child_db, ctx_vars: dict) -> Router:
             target_str = args[1].split("_")[1]
             if target_str.isdigit():
                 t_id = int(target_str)
-                if t_id != user_id and t_id not in active_chats and t_id not in waiting_list:
+                if t_id != user_id and t_id not in active_chats and t_id not in waiting_list and t_id not in waiting_vip:
                     t_user = await get_user(t_id)
                     t_lang = t_user.get("lang", "es")
                     kb = InlineKeyboardMarkup(inline_keyboard=[[
@@ -1012,7 +1080,7 @@ def create_child_router(child_config: dict, child_db, ctx_vars: dict) -> Router:
         modo_txt = "🕵️‍♂️ Anónimo" if user.get("mode") == "anon" else "👤 Público"
 
         kb_list = [
-            [InlineKeyboardButton(text="⭐ Comprar VIP 7 Días (Stars)", url=f"https://t.me/{MASTER_BOT_USERNAME}?start=paystars_{bot.id}")],
+            [InlineKeyboardButton(text="⭐ Membresías VIP (Stars)", callback_data="menu_buy_vip")],
             [InlineKeyboardButton(text="🔄 Cambiar Modo", callback_data="toggle_mode")]
         ]
         
@@ -1042,6 +1110,24 @@ def create_child_router(child_config: dict, child_db, ctx_vars: dict) -> Router:
         )
         await callback.message.edit_text(txt, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_list), parse_mode="HTML")
 
+    # Menú de compra escalonada de Stars
+    @r.callback_query(F.data == "menu_buy_vip")
+    async def menu_buy_vip(callback: CallbackQuery, bot: Bot):
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="⭐ 1 Día (5 Stars)", url=f"https://t.me/{MASTER_BOT_USERNAME}?start=paystars_{bot.id}_1d")],
+            [InlineKeyboardButton(text="⭐ 7 Días (25 Stars)", url=f"https://t.me/{MASTER_BOT_USERNAME}?start=paystars_{bot.id}_7d")],
+            [InlineKeyboardButton(text="⭐ 30 Días (80 Stars)", url=f"https://t.me/{MASTER_BOT_USERNAME}?start=paystars_{bot.id}_30d")],
+            [InlineKeyboardButton(text="⬅️ Volver", callback_data="my_profile")]
+        ])
+        txt = (
+            "💎 <b>MEMBRESÍAS VIP CON TELEGRAM STARS</b>\n\n"
+            "Elige la duración que prefieras. El pago se procesa de forma nativa e instantánea:\n\n"
+            "• <b>24 Horas:</b> 5 Stars (Ideal para intercambios rápidos)\n"
+            "• <b>7 Días:</b> 25 Stars (Acceso estándar semanal)\n"
+            "• <b>30 Días:</b> 80 Stars (Pase mensual completo con descuento)"
+        )
+        await callback.message.edit_text(txt, reply_markup=kb, parse_mode="HTML")
+
     @r.callback_query(F.data == "toggle_mode")
     async def toggle_mode(callback: CallbackQuery, bot: Bot):
         u = await get_user(callback.from_user.id)
@@ -1069,7 +1155,7 @@ def create_child_router(child_config: dict, child_db, ctx_vars: dict) -> Router:
             return await message.answer("⚠️ Debe ser un ID numérico.")
         t_id = int(message.text)
         if t_id == u_id: return
-        if t_id in active_chats or t_id in waiting_list:
+        if t_id in active_chats or t_id in waiting_list or t_id in waiting_vip:
             return await message.answer("⚠️ El usuario está ocupado actualmente.")
         
         t_user = await get_user(t_id)
@@ -1095,6 +1181,7 @@ def create_child_router(child_config: dict, child_db, ctx_vars: dict) -> Router:
         active_chats[u_id], active_chats[t_id] = t_id, u_id
         await state.set_state(BotStates.chatting)
         await set_other_user_state(bot, t_id, BotStates.chatting)
+        await persist_rooms()
         
         for uid in (u_id, t_id):
             u_obj = await get_user(uid)
@@ -1115,27 +1202,53 @@ def create_child_router(child_config: dict, child_db, ctx_vars: dict) -> Router:
         except Exception: pass
         await callback.message.delete()
 
-    @r.callback_query(F.data == "find_chat")
-    async def find_chat(callback: CallbackQuery, state: FSMContext, bot: Bot):
+    # Menú de Búsqueda de Chat (Normal o Filtro VIP)
+    @r.callback_query(F.data.in_(["find_chat", "find_chat_menu"]))
+    async def find_chat_menu(callback: CallbackQuery, state: FSMContext, bot: Bot):
         u_id = callback.from_user.id
         if await is_blacklisted(u_id): return
-        if u_id in active_chats or u_id in waiting_list:
+        if u_id in active_chats or u_id in waiting_list or u_id in waiting_vip:
             return await callback.answer("Ya estás en una sesión o en espera.", show_alert=True)
 
         user = await get_user(u_id)
+        is_vip = user.get("paid_vip_active", False) or user.get("vip_until", 0) > time.time() or user.get("in_vip", False)
+
+        if is_vip:
+            kb = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🌟 Solo con VIPs", callback_data="start_search_vip")],
+                [InlineKeyboardButton(text="🌐 Búsqueda General", callback_data="start_search_gen")],
+                [InlineKeyboardButton(text="⬅️ Cancelar", callback_data="back_main")]
+            ])
+            await callback.message.edit_text("🔍 <b>Filtro de Búsqueda VIP</b>\n\n¿Con quién te gustaría emparejarte?", reply_markup=kb, parse_mode="HTML")
+        else:
+            await start_search(callback, state, bot, only_vip=False)
+
+    @r.callback_query(F.data.in_(["start_search_vip", "start_search_gen"]))
+    async def handle_search_choice(callback: CallbackQuery, state: FSMContext, bot: Bot):
+        only_vip = (callback.data == "start_search_vip")
+        await start_search(callback, state, bot, only_vip=only_vip)
+
+    async def start_search(callback: CallbackQuery, state: FSMContext, bot: Bot, only_vip: bool):
+        u_id = callback.from_user.id
+        user = await get_user(u_id)
         lang = user.get("lang", "es")
 
-        if waiting_list:
-            t_id = waiting_list.pop(0)
-            if t_id == u_id:
-                waiting_list.append(u_id)
-                return await callback.answer("Buscando...")
-                
-            active_chats[u_id], active_chats[t_id] = t_id, u_id
+        target_pool = waiting_vip if only_vip else waiting_list
+        alt_pool = waiting_vip if not only_vip and waiting_vip else None
+
+        matched_id = None
+        if target_pool:
+            matched_id = target_pool.pop(0)
+        elif alt_pool and not only_vip:
+            matched_id = alt_pool.pop(0)
+
+        if matched_id and matched_id != u_id:
+            active_chats[u_id], active_chats[matched_id] = matched_id, u_id
             await state.set_state(BotStates.chatting)
-            await set_other_user_state(bot, t_id, BotStates.chatting)
-            
-            for uid in (u_id, t_id):
+            await set_other_user_state(bot, matched_id, BotStates.chatting)
+            await persist_rooms()
+
+            for uid in (u_id, matched_id):
                 u_obj = await get_user(uid)
                 lng = u_obj.get("lang", "es")
                 kb = ReplyKeyboardMarkup(
@@ -1146,7 +1259,11 @@ def create_child_router(child_config: dict, child_db, ctx_vars: dict) -> Router:
                 await bot.send_message(uid, "✅ <b>¡Chat emparejado con éxito!</b> Ya pueden hablar o intercambiar.", reply_markup=kb, parse_mode="HTML")
             await callback.message.delete()
         else:
-            waiting_list.append(u_id)
+            if only_vip:
+                waiting_vip.append(u_id)
+            else:
+                waiting_list.append(u_id)
+            await persist_rooms()
             await state.set_state(BotStates.searching)
             kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Cancelar Búsqueda" if lang == "es" else "❌ Cancel Queue", callback_data="leave_chat")]])
             txt = (
@@ -1163,6 +1280,7 @@ def create_child_router(child_config: dict, child_db, ctx_vars: dict) -> Router:
     async def leave_chat(event, state: FSMContext, bot: Bot):
         u_id = event.from_user.id
         if u_id in waiting_list: waiting_list.remove(u_id)
+        if u_id in waiting_vip: waiting_vip.remove(u_id)
         t_id = active_chats.pop(u_id, None)
         
         if t_id:
@@ -1175,6 +1293,7 @@ def create_child_router(child_config: dict, child_db, ctx_vars: dict) -> Router:
             
         chat_threads.pop(u_id, None)
         if t_id: chat_threads.pop(t_id, None)
+        await persist_rooms()
         await state.set_state(BotStates.idle)
         
         if isinstance(event, Message):
@@ -1364,6 +1483,7 @@ def create_child_router(child_config: dict, child_db, ctx_vars: dict) -> Router:
         await callback.message.delete()
         await execute_trade_proposal(callback.from_user.id, int(callback.data.split("_")[1]), data.get("trade_type", "mixed"), callback.message.answer, state, bot)
 
+    # Worker asíncrono para despachar trades de 10x10, 50x50 o 100x100 sin trabarse
     async def run_fast_trade_worker(bot: Bot, child_db, sid: int, uid: int, files_s: list, files_r: list, amt: int, t_type: str):
         async def copy_batch(sender_id: int, receiver_id: int, files: list):
             sent = 0
@@ -1371,6 +1491,7 @@ def create_child_router(child_config: dict, child_db, ctx_vars: dict) -> Router:
             for i in range(0, min(len(files), amt), chunk_size):
                 chunk = files[i:i + chunk_size]
                 chunk_ids = [f["message_id"] for f in chunk]
+                # Intento 1: copy_messages (Sin cabecera de forward, 1 sola petición HTTP por lote de 10)
                 try:
                     await bot.copy_messages(chat_id=receiver_id, from_chat_id=sender_id, message_ids=chunk_ids)
                     now_dt = datetime.utcnow()
@@ -1382,6 +1503,7 @@ def create_child_router(child_config: dict, child_db, ctx_vars: dict) -> Router:
                         sent += 1
                     await asyncio.sleep(0.8)
                 except Exception:
+                    # Intento 2 (Fallback): si el usuario borró algún mensaje, enviar elemento por elemento
                     for f in chunk:
                         try:
                             await bot.copy_message(chat_id=receiver_id, from_chat_id=sender_id, message_id=f["message_id"])
@@ -1429,6 +1551,7 @@ def create_child_router(child_config: dict, child_db, ctx_vars: dict) -> Router:
             await send_rating_request(sid, uid, bot)
         except Exception as e:
             logging.error(f"Error procesando trade worker: {e}")
+            await notify_admins_alert(f"Error en trade worker ({sid} <-> {uid}): {e}")
 
     @r.callback_query(F.data == "accept_trade")
     async def accept_trade(callback: CallbackQuery, bot: Bot):
@@ -1449,6 +1572,7 @@ def create_child_router(child_config: dict, child_db, ctx_vars: dict) -> Router:
         await callback.message.edit_text(f"🚀 <i>Transfiriendo {amt}x{amt} de forma rápida y segura...</i>", parse_mode="HTML")
         await bot.send_message(s_id, f"🚀 <i>Transfiriendo {amt}x{amt} de forma rápida y segura...</i>", parse_mode="HTML")
 
+        # Despachado en segundo plano sin congelar la app ni bloquear al bot
         asyncio.create_task(run_fast_trade_worker(bot, child_db, s_id, u_id, files_s, files_r, amt, t_type))
 
     @r.callback_query(F.data == "reject_trade")
@@ -1468,10 +1592,16 @@ def create_child_router(child_config: dict, child_db, ctx_vars: dict) -> Router:
             await check_vip_status(t_id, bot)
         await callback.message.edit_text("✅ Valoración registrada.")
 
+    # Retransmisión de texto entre usuarios conectados (Con filtro Anti-Enlaces)
     @r.message(StateFilter(BotStates.chatting), ~F.text.startswith("/"), ~F.text.in_(["🤝 Proponer Intercambio", "🤝 Propose Trade", "❌ Desconectar", "❌ Disconnect"]))
     async def relay_msg(message: Message, bot: Bot):
         u_id = message.from_user.id
         if await is_blacklisted(u_id): return
+        
+        # Filtro de enlaces y nombres de usuario para prevenir spam y phishing
+        if LINK_REGEX.search(message.text or ""):
+            return await message.answer("🚫 <b>Mensaje bloqueado:</b> Por seguridad de la red no se permite compartir enlaces o menciones.", parse_mode="HTML")
+
         target = active_chats.get(u_id)
         if target:
             try:
@@ -1481,6 +1611,7 @@ def create_child_router(child_config: dict, child_db, ctx_vars: dict) -> Router:
                     await bot.send_message(chat_id=LOG_GROUP_ID, message_thread_id=thread_id, text=f"💬 <code>{u_id}</code>: {html.quote(message.text)}", parse_mode="HTML")
             except Exception: pass
 
+    # Aprobación de entrada a grupo VIP
     @r.chat_join_request()
     async def process_vip_join(join_req: ChatJoinRequest, bot: Bot):
         if VIP_GROUP_ID and join_req.chat.id == VIP_GROUP_ID:
@@ -1499,7 +1630,7 @@ def create_child_router(child_config: dict, child_db, ctx_vars: dict) -> Router:
     return r
 
 # =====================================================================
-# 5. WATCHDOGS Y WORKERS EN SEGUNDO PLANO
+# 6. WATCHDOGS Y WORKERS EN SEGUNDO PLANO
 # =====================================================================
 async def child_message_worker(bot_id: int):
     bot = active_bots_tasks[bot_id]["bot"]
@@ -1586,7 +1717,7 @@ async def background_vip_cleaner_runner(bot: Bot, child_db, PAID_VIP_CHANNEL_ID:
                     try:
                         await bot.ban_chat_member(PAID_VIP_CHANNEL_ID, uid)
                         await bot.unban_chat_member(PAID_VIP_CHANNEL_ID, uid)
-                        await bot.send_message(uid, "⚠️ Tu membresía Stars de 7 días ha finalizado.")
+                        await bot.send_message(uid, "⚠️ Tu membresía VIP Stars ha finalizado.")
                     except Exception: pass
                 await child_db.users.update_one({"_id": uid}, {"$set": {"paid_vip_active": False, "vip_until": 0}})
         except Exception as e: logging.error(f"Error en limpiador VIP: {e}")
@@ -1625,6 +1756,7 @@ async def child_polling_wrapper(dp: Dispatcher, bot: Bot, bot_id: int):
         pass
     except Exception as e:
         logging.critical(f"💥 [Bot {bot_id}] Error no controlado en polling: {e}")
+        await notify_admins_alert(f"Error crítico en polling bot {bot_id}: {e}")
         await isolate_and_cleanup_bot(bot_id, revoked=False)
     finally:
         if not bot.session.closed:
@@ -1661,12 +1793,22 @@ async def start_child_bot(config: dict) -> bool:
     dp = Dispatcher(storage=MemoryStorage())
     ctx_vars = {
         "dp": dp,
-        "active_chats": {}, "waiting_list": [], "pending_trades": {},
+        "active_chats": {}, "waiting_list": [], "waiting_vip": [], "pending_trades": {},
         "active_viewers": {}, "pending_notifications": {},
         "chat_threads": {},
         "backup_queue": asyncio.Queue(),
         "media_group_buffers": {}
     }
+
+    # Restaurar estado previo de salas desde MongoDB (Sobrevive a reinicios)
+    try:
+        saved_state = await child_db.session_state.find_one({"_id": "rooms"})
+        if saved_state:
+            ctx_vars["active_chats"].update({int(k): int(v) for k, v in saved_state.get("active_chats", {}).items()})
+            ctx_vars["waiting_list"].extend([int(x) for x in saved_state.get("waiting_list", [])])
+            ctx_vars["waiting_vip"].extend([int(x) for x in saved_state.get("waiting_vip", [])])
+    except Exception: pass
+
     dp.include_router(create_child_router(config, child_db, ctx_vars))
 
     paid_ch = clean_chat_id(config.get("paid_vip_channel_id"))
@@ -1679,23 +1821,27 @@ async def start_child_bot(config: dict) -> bool:
     return True
 
 # =====================================================================
-# 6. HANDLERS MASTER BOT (WIZARD 7 PASOS Y STARS)
+# 7. HANDLERS MASTER BOT (WIZARD 7 PASOS Y STARS ESCALONADAS)
 # =====================================================================
 @master_dp.message(CommandStart())
 async def cmd_start_master(message: Message, state: FSMContext, bot: Bot):
     args = message.text.split(maxsplit=1)
     
     if len(args) > 1 and args[1].startswith("paystars_"):
-        target_bot_id_str = args[1].replace("paystars_", "")
-        if target_bot_id_str.isdigit():
+        parts = args[1].split("_")
+        target_bot_id_str = parts[1]
+        tier_key = parts[2] if len(parts) > 2 else "7d"
+        
+        if target_bot_id_str.isdigit() and tier_key in VIP_TIERS:
             target_bot_id = int(target_bot_id_str)
-            prices = [LabeledPrice(label="Pase VIP 7 Días", amount=25)]
-            payload = f"vip_stars_{target_bot_id}_{message.from_user.id}"
+            tier_info = VIP_TIERS[tier_key]
+            prices = [LabeledPrice(label=tier_info["label"], amount=tier_info["stars"])]
+            payload = f"vip_stars_{target_bot_id}_{message.from_user.id}_{tier_key}"
             try:
                 await bot.send_invoice(
                     chat_id=message.from_user.id,
-                    title="Pase VIP 7 Días (Canal de Pago)",
-                    description="Acceso exclusivo por 1 semana procesado centralmente por el Master.",
+                    title=f"💎 {tier_info['label']}",
+                    description=f"Acceso VIP exclusivo por {tier_info['days']} día(s).",
                     payload=payload,
                     provider_token="",
                     currency="XTR",
@@ -1726,6 +1872,10 @@ async def process_successful_payment(message: Message):
     if payload.startswith("vip_stars_"):
         parts = payload.split("_")
         target_bot_id, user_id = int(parts[2]), int(parts[3])
+        tier_key = parts[4] if len(parts) > 4 else "7d"
+        tier_info = VIP_TIERS.get(tier_key, VIP_TIERS["7d"])
+        days = tier_info["days"]
+
         child_info = active_bots_tasks.get(target_bot_id)
         if not child_info:
             return await message.answer("✅ Pago recibido. Contacta a soporte si tarda en activarse.")
@@ -1739,7 +1889,7 @@ async def process_successful_payment(message: Message):
         user = await child_db.users.find_one({"_id": user_id}) or {}
         now = time.time()
         base = max(now, user.get("vip_until", 0))
-        new_vip = base + (VIP_DURATION_DAYS * 86400)
+        new_vip = base + (days * 86400)
         
         await child_db.users.update_one(
             {"_id": user_id}, 
@@ -1751,7 +1901,7 @@ async def process_successful_payment(message: Message):
         if paid_ch:
             try:
                 inv_paid = await child_bot.create_chat_invite_link(chat_id=paid_ch, member_limit=1)
-                buttons.append([InlineKeyboardButton(text="💎 Canal VIP Stars (7 Días)", url=inv_paid.invite_link)])
+                buttons.append([InlineKeyboardButton(text=f"💎 Canal VIP Stars ({days} Días)", url=inv_paid.invite_link)])
             except Exception as e:
                 logging.error(f"Error creando link canal pago: {e}")
 
@@ -1763,9 +1913,8 @@ async def process_successful_payment(message: Message):
                 logging.error(f"Error creando link grupo gratis: {e}")
 
         txt_pago = (
-            "🎉 <b>¡Pago con Estrellas confirmado con éxito!</b>\n\n"
-            "Tu membresía VIP de 7 días está activa. Tienes acceso tanto al <b>Canal VIP Stars</b> como al <b>Grupo VIP de la comunidad</b> sin requisitos de referidos.\n\n"
-            "Únete a través de tus enlaces exclusivos:"
+            f"🎉 <b>¡Pago con Estrellas confirmado! ({tier_info['label']})</b>\n\n"
+            f"Tu membresía VIP de <b>{days} días</b> está activa. Tienes acceso completo a ambos espacios:\n"
         )
 
         if buttons:
@@ -1937,7 +2086,7 @@ async def cb_stop_bot(callback: CallbackQuery):
     await cb_master_panel(callback)
 
 # =====================================================================
-# 7. INICIO Y SERVIDOR WEB
+# 8. INICIO Y SERVIDOR WEB
 # =====================================================================
 async def web_server():
     app = web.Application()
@@ -1953,12 +2102,13 @@ async def web_server():
     return runner
 
 async def main():
-    global MASTER_BOT_USERNAME
+    global MASTER_BOT_USERNAME, GLOBAL_MASTER_BOT
     
     if not MASTER_TOKEN or not MASTER_MONGO_URI:
         raise RuntimeError("Configura MASTER_TOKEN y MONGO_URI en tus variables de entorno.")
         
     master_bot = Bot(token=MASTER_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
+    GLOBAL_MASTER_BOT = master_bot
     me = await master_bot.get_me()
     MASTER_BOT_USERNAME = me.username
     
