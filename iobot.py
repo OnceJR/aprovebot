@@ -11,7 +11,7 @@ import json
 from aiohttp import web
 from motor.motor_asyncio import AsyncIOMotorClient
 
-from aiogram import Bot, Dispatcher, F, html
+from aiogram import Bot, Dispatcher, Router, F, html
 from aiogram.client.default import DefaultBotProperties
 from aiogram.exceptions import (
     TelegramUnauthorizedError,
@@ -27,7 +27,8 @@ from aiogram.fsm.storage.base import StorageKey
 from aiogram.types import (
     Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, 
     ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove, WebAppInfo,
-    ChatJoinRequest, LabeledPrice, PreCheckoutQuery
+    ChatJoinRequest, LabeledPrice, PreCheckoutQuery,
+    InputMediaPhoto, InputMediaVideo
 )
 
 # =====================================================================
@@ -476,24 +477,19 @@ async def handle_webapp(request):
     return web.Response(text=html_content, content_type="text/html")
 
 # =====================================================================
-# 4. CORE SAAS: DISPATCHER BOT HIJO
+# 4. ENRUTADOR MODULAR DEL BOT HIJO (CHILD NODE)
 # =====================================================================
-def get_new_child_dp(child_config: dict, child_db) -> Dispatcher:
-    dp = Dispatcher(storage=MemoryStorage())
-    
-    active_chats = {}
-    waiting_list = []
-    pending_trades = {}
-    active_viewers = {}
-    chat_threads = {}
-    pending_notifications = {}
-    media_group_buffers = {}
-    backup_queue = asyncio.Queue()
-    
-    dp["backup_queue"] = backup_queue
-    dp["active_viewers"] = active_viewers
-    dp["active_chats"] = active_chats
-    dp["waiting_list"] = waiting_list
+def create_child_router(child_config: dict, child_db, ctx_vars: dict) -> Router:
+    r = Router()
+
+    active_chats = ctx_vars["active_chats"]
+    waiting_list = ctx_vars["waiting_list"]
+    pending_trades = ctx_vars["pending_trades"]
+    pending_notifications = ctx_vars["pending_notifications"]
+    media_group_buffers = ctx_vars["media_group_buffers"]
+    backup_queue = ctx_vars["backup_queue"]
+    chat_threads = ctx_vars.setdefault("chat_threads", {})
+    dp_storage = ctx_vars["dp"].storage
 
     FORCE_SUB_CHANNEL_ID = clean_chat_id(child_config.get("force_sub_id"))
     FORCE_SUB_CHANNEL_LINK = child_config.get("force_sub_link", "")
@@ -521,7 +517,7 @@ def get_new_child_dp(child_config: dict, child_db) -> Dispatcher:
 
     async def set_other_user_state(bot: Bot, chat_id: int, state: State):
         key = StorageKey(bot_id=bot.id, chat_id=chat_id, user_id=chat_id)
-        await FSMContext(storage=dp.storage, key=key).set_state(state)
+        await FSMContext(storage=dp_storage, key=key).set_state(state)
 
     async def get_user(user_id):
         user = await child_db.users.find_one({"_id": user_id})
@@ -689,7 +685,7 @@ def get_new_child_dp(child_config: dict, child_db) -> Dispatcher:
                 "• Reach <b>20 Reputation</b>, <b>3 Referrals</b> or buy Stars VIP to unlock VIP Groups."
             )
 
-    @dp.callback_query(F.data == "show_manual")
+    @r.callback_query(F.data == "show_manual")
     async def cb_manual(callback: CallbackQuery):
         user = await get_user(callback.from_user.id)
         lang = user.get("lang", "es")
@@ -697,7 +693,7 @@ def get_new_child_dp(child_config: dict, child_db) -> Dispatcher:
         kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Volver al Menú" if lang == "es" else "⬅️ Back to Menu", callback_data="back_main")]])
         await callback.message.edit_text(txt, reply_markup=kb, parse_mode="HTML")
 
-    @dp.message(Command("manual"))
+    @r.message(Command("manual"))
     async def cmd_manual(message: Message):
         user = await get_user(message.from_user.id)
         lang = user.get("lang", "es")
@@ -705,7 +701,7 @@ def get_new_child_dp(child_config: dict, child_db) -> Dispatcher:
         await message.answer(txt, parse_mode="HTML")
 
     # ---- Comandos Administrativos del Bot Hijo ----
-    @dp.message(Command("recuperar_vip"))
+    @r.message(Command("recuperar_vip"))
     async def cmd_recuperar_vip(message: Message, bot: Bot):
         if message.from_user.id not in SUPER_ADMIN_IDS and message.from_user.id != OWNER_ID:
             return
@@ -762,9 +758,8 @@ def get_new_child_dp(child_config: dict, child_db) -> Dispatcher:
         )
         await message.answer(res_report, parse_mode="HTML")
 
-    @dp.message(Command("reinvitar"))
+    @r.message(Command("reinvitar"))
     async def cmd_reinvitar(message: Message, bot: Bot):
-        """Reenvía específicamente el enlace al Grupo VIP Gratuito a un usuario determinado."""
         if message.from_user.id not in SUPER_ADMIN_IDS and message.from_user.id != OWNER_ID:
             return
         args = message.text.split()
@@ -783,7 +778,7 @@ def get_new_child_dp(child_config: dict, child_db) -> Dispatcher:
         except Exception as e:
             await message.answer(f"❌ Error al generar la invitación: {e}")
 
-    @dp.message(Command("enviar_vip"))
+    @r.message(Command("enviar_vip"))
     async def cmd_enviar_vip(message: Message, bot: Bot):
         if message.from_user.id not in SUPER_ADMIN_IDS and message.from_user.id != OWNER_ID:
             return
@@ -832,7 +827,7 @@ def get_new_child_dp(child_config: dict, child_db) -> Dispatcher:
         except Exception as e:
             await message.answer(f"❌ Error al enviar acceso: {e}")
 
-    @dp.message(Command("add_receiver"))
+    @r.message(Command("add_receiver"))
     async def cmd_add_receiver(message: Message):
         if message.from_user.id not in SUPER_ADMIN_IDS: return
         try:
@@ -842,7 +837,7 @@ def get_new_child_dp(child_config: dict, child_db) -> Dispatcher:
         except Exception:
             await message.answer("Uso: <code>/add_receiver ID</code>")
 
-    @dp.message(Command("del_receiver"))
+    @r.message(Command("del_receiver"))
     async def cmd_del_receiver(message: Message):
         if message.from_user.id not in SUPER_ADMIN_IDS: return
         try:
@@ -852,7 +847,7 @@ def get_new_child_dp(child_config: dict, child_db) -> Dispatcher:
         except Exception:
             await message.answer("Uso: <code>/del_receiver ID</code>")
 
-    @dp.message(Command("mantenimiento"))
+    @r.message(Command("mantenimiento"))
     async def cmd_maintenance(message: Message):
         if message.from_user.id not in SUPER_ADMIN_IDS: return
         cfg = await child_db.settings.find_one({"_id": "config"})
@@ -860,7 +855,7 @@ def get_new_child_dp(child_config: dict, child_db) -> Dispatcher:
         await child_db.settings.update_one({"_id": "config"}, {"$set": {"maintenance": new_state}}, upsert=True)
         await message.answer(f"🛠️ Mantenimiento: <b>{'Activado 🔴' if new_state else 'Desactivado 🟢'}</b>")
 
-    @dp.message(Command("blacklist"))
+    @r.message(Command("blacklist"))
     async def cmd_blacklist(message: Message):
         if message.from_user.id not in SUPER_ADMIN_IDS: return
         try:
@@ -870,7 +865,7 @@ def get_new_child_dp(child_config: dict, child_db) -> Dispatcher:
         except Exception:
             await message.answer("Uso: <code>/blacklist ID</code>")
 
-    @dp.message(Command("unblacklist"))
+    @r.message(Command("unblacklist"))
     async def cmd_unblacklist(message: Message):
         if message.from_user.id not in SUPER_ADMIN_IDS: return
         try:
@@ -880,7 +875,7 @@ def get_new_child_dp(child_config: dict, child_db) -> Dispatcher:
         except Exception:
             await message.answer("Uso: <code>/unblacklist ID</code>")
 
-    @dp.message(Command("broadcast"))
+    @r.message(Command("broadcast"))
     async def cmd_broadcast(message: Message, bot: Bot):
         """Difusión masiva procesando etiquetas HTML sin escapado destructivo."""
         if message.from_user.id not in SUPER_ADMIN_IDS: return
@@ -890,7 +885,6 @@ def get_new_child_dp(child_config: dict, child_db) -> Dispatcher:
         count = 0
         async for u in child_db.users.find():
             try:
-                # Se envía text directamente para que Telegram renderice las etiquetas HTML
                 await bot.send_message(u["_id"], f"📢 <b>Aviso General:</b>\n\n{text}", parse_mode="HTML")
                 count += 1
                 await asyncio.sleep(0.05)
@@ -899,7 +893,7 @@ def get_new_child_dp(child_config: dict, child_db) -> Dispatcher:
         await status_msg.delete()
         await message.answer(f"✅ Difusión completada a <code>{count}</code> usuarios.", parse_mode="HTML")
 
-    @dp.message(Command("estadisticas"))
+    @r.message(Command("estadisticas"))
     async def cmd_stats(message: Message):
         if message.from_user.id not in SUPER_ADMIN_IDS: return
         users = await child_db.users.count_documents({})
@@ -918,7 +912,7 @@ def get_new_child_dp(child_config: dict, child_db) -> Dispatcher:
         await message.answer(txt, parse_mode="HTML")
 
     # ---- Flujos Principales ----
-    @dp.message(CommandStart(), StateFilter("*"))
+    @r.message(CommandStart(), StateFilter("*"))
     async def cmd_start(message: Message, state: FSMContext, bot: Bot):
         user_id = message.from_user.id
         if await is_blacklisted(user_id): return
@@ -983,7 +977,7 @@ def get_new_child_dp(child_config: dict, child_db) -> Dispatcher:
         await show_main_menu(user_id, bot)
         await state.set_state(BotStates.idle)
 
-    @dp.callback_query(F.data == "verify_sub")
+    @r.callback_query(F.data == "verify_sub")
     async def verify_sub(callback: CallbackQuery, bot: Bot):
         if await is_blacklisted(callback.from_user.id): return
         if await check_force_sub(callback.from_user.id, bot):
@@ -992,7 +986,7 @@ def get_new_child_dp(child_config: dict, child_db) -> Dispatcher:
         else:
             await callback.answer("⚠️ No se ha detectado tu suscripción.", show_alert=True)
 
-    @dp.callback_query(F.data == "change_lang")
+    @r.callback_query(F.data == "change_lang")
     async def change_lang(callback: CallbackQuery, bot: Bot):
         u = await get_user(callback.from_user.id)
         new_lang = "en" if u.get("lang") == "es" else "es"
@@ -1001,7 +995,7 @@ def get_new_child_dp(child_config: dict, child_db) -> Dispatcher:
         await callback.message.delete()
         await show_main_menu(callback.from_user.id, bot)
 
-    @dp.callback_query(F.data == "my_profile")
+    @r.callback_query(F.data == "my_profile")
     async def show_profile(callback: CallbackQuery, bot: Bot):
         u_id = callback.from_user.id
         await check_vip_status(u_id, bot)
@@ -1048,27 +1042,27 @@ def get_new_child_dp(child_config: dict, child_db) -> Dispatcher:
         )
         await callback.message.edit_text(txt, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_list), parse_mode="HTML")
 
-    @dp.callback_query(F.data == "toggle_mode")
+    @r.callback_query(F.data == "toggle_mode")
     async def toggle_mode(callback: CallbackQuery, bot: Bot):
         u = await get_user(callback.from_user.id)
         new_mode = "public" if u.get("mode") == "anon" else "anon"
         await save_user(callback.from_user.id, {"mode": new_mode})
         await show_profile(callback, bot)
 
-    @dp.callback_query(F.data == "back_main")
+    @r.callback_query(F.data == "back_main")
     async def back_main(callback: CallbackQuery, state: FSMContext, bot: Bot):
         await state.set_state(BotStates.idle)
         await callback.message.delete()
         await show_main_menu(callback.from_user.id, bot)
 
     # Conexión manual por ID
-    @dp.callback_query(F.data == "connect_id")
+    @r.callback_query(F.data == "connect_id")
     async def ask_for_id(callback: CallbackQuery, state: FSMContext):
         await state.set_state(BotStates.waiting_for_id)
         kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Cancelar", callback_data="back_main")]])
         await callback.message.edit_text("✏️ Escribe el <b>ID numérico</b> del usuario:", reply_markup=kb, parse_mode="HTML")
 
-    @dp.message(StateFilter(BotStates.waiting_for_id), ~F.text.startswith("/"))
+    @r.message(StateFilter(BotStates.waiting_for_id), ~F.text.startswith("/"))
     async def process_connect_id(message: Message, state: FSMContext, bot: Bot):
         u_id = message.from_user.id
         if not message.text.isdigit():
@@ -1091,7 +1085,7 @@ def get_new_child_dp(child_config: dict, child_db) -> Dispatcher:
             await message.answer("❌ No se pudo entregar la solicitud.")
         await state.set_state(BotStates.idle)
 
-    @dp.callback_query(F.data.startswith("accept_id_"))
+    @r.callback_query(F.data.startswith("accept_id_"))
     async def accept_id_conn(callback: CallbackQuery, state: FSMContext, bot: Bot):
         t_id = int(callback.data.split("_")[2])
         u_id = callback.from_user.id
@@ -1113,7 +1107,7 @@ def get_new_child_dp(child_config: dict, child_db) -> Dispatcher:
             await bot.send_message(uid, "✅ <b>¡Conexión establecida!</b> Ya pueden hablar o intercambiar.", reply_markup=kb, parse_mode="HTML")
         await callback.message.delete()
 
-    @dp.callback_query(F.data.startswith("reject_id_"))
+    @r.callback_query(F.data.startswith("reject_id_"))
     async def reject_id_conn(callback: CallbackQuery, bot: Bot):
         req_id = int(callback.data.split("_")[2])
         try:
@@ -1121,7 +1115,7 @@ def get_new_child_dp(child_config: dict, child_db) -> Dispatcher:
         except Exception: pass
         await callback.message.delete()
 
-    @dp.callback_query(F.data == "find_chat")
+    @r.callback_query(F.data == "find_chat")
     async def find_chat(callback: CallbackQuery, state: FSMContext, bot: Bot):
         u_id = callback.from_user.id
         if await is_blacklisted(u_id): return
@@ -1164,8 +1158,8 @@ def get_new_child_dp(child_config: dict, child_db) -> Dispatcher:
             )
             await callback.message.edit_text(txt, reply_markup=kb, parse_mode="HTML")
 
-    @dp.message(F.text.in_(["❌ Desconectar", "❌ Disconnect"]))
-    @dp.callback_query(F.data == "leave_chat")
+    @r.message(F.text.in_(["❌ Desconectar", "❌ Disconnect"]))
+    @r.callback_query(F.data == "leave_chat")
     async def leave_chat(event, state: FSMContext, bot: Bot):
         u_id = event.from_user.id
         if u_id in waiting_list: waiting_list.remove(u_id)
@@ -1216,11 +1210,10 @@ def get_new_child_dp(child_config: dict, child_db) -> Dispatcher:
                 )
             except Exception: pass
 
-    @dp.message(F.chat.type == "private", F.photo | F.video | F.document)
+    @r.message(F.chat.type == "private", F.photo | F.video | F.document)
     async def handle_media(message: Message, bot: Bot):
         u_id = message.from_user.id
         if await is_blacklisted(u_id): return
-        user = await get_user(u_id)
         
         media = message.photo[-1] if message.photo else (message.video or message.document)
         file_id, file_unique_id = media.file_id, media.file_unique_id
@@ -1271,7 +1264,7 @@ def get_new_child_dp(child_config: dict, child_db) -> Dispatcher:
                 asyncio.create_task(notify_single())
 
     # Motor de Intercambios
-    @dp.message(StateFilter(BotStates.chatting), F.text.in_(["🤝 Proponer Intercambio", "🤝 Propose Trade"]))
+    @r.message(StateFilter(BotStates.chatting), F.text.in_(["🤝 Proponer Intercambio", "🤝 Propose Trade"]))
     async def btn_propose(message: Message, state: FSMContext):
         u_id = message.from_user.id
         t_id = active_chats.get(u_id)
@@ -1307,7 +1300,7 @@ def get_new_child_dp(child_config: dict, child_db) -> Dispatcher:
         )
         await message.answer(msg, reply_markup=kb, parse_mode="HTML")
 
-    @dp.callback_query(StateFilter(BotStates.waiting_trade_type), F.data.startswith("settype_"))
+    @r.callback_query(StateFilter(BotStates.waiting_trade_type), F.data.startswith("settype_"))
     async def process_trade_type(callback: CallbackQuery, state: FSMContext):
         u_id = callback.from_user.id
         t_id = active_chats.get(u_id)
@@ -1360,18 +1353,17 @@ def get_new_child_dp(child_config: dict, child_db) -> Dispatcher:
         await send_func(f"⏳ Propuesta de trade <b>{amt}x{amt}</b> ({t_type}) enviada. Esperando confirmación...", parse_mode="HTML")
         await bot.send_message(t_id, f"🤝 <b>¡Oferta de Trade Recibida!</b>\nPropuesta: <b>{amt}x{amt}</b> ({t_type}). ¿Aceptas?", reply_markup=kb, parse_mode="HTML")
 
-    @dp.message(StateFilter(BotStates.waiting_trade_amount), F.text.regexp(r'^\d+$'))
+    @r.message(StateFilter(BotStates.waiting_trade_amount), F.text.regexp(r'^\d+$'))
     async def process_manual_trade_offer(message: Message, state: FSMContext, bot: Bot):
         data = await state.get_data()
         await execute_trade_proposal(message.from_user.id, int(message.text), data.get("trade_type", "mixed"), message.answer, state, bot)
 
-    @dp.callback_query(StateFilter(BotStates.waiting_trade_amount), F.data.startswith("trade_"))
+    @r.callback_query(StateFilter(BotStates.waiting_trade_amount), F.data.startswith("trade_"))
     async def process_button_trade_offer(callback: CallbackQuery, state: FSMContext, bot: Bot):
         data = await state.get_data()
         await callback.message.delete()
         await execute_trade_proposal(callback.from_user.id, int(callback.data.split("_")[1]), data.get("trade_type", "mixed"), callback.message.answer, state, bot)
 
-    # Worker asíncrono para despachar trades de 10x10, 50x50 o 100x100 sin trabarse
     async def run_fast_trade_worker(bot: Bot, child_db, sid: int, uid: int, files_s: list, files_r: list, amt: int, t_type: str):
         async def copy_batch(sender_id: int, receiver_id: int, files: list):
             sent = 0
@@ -1379,7 +1371,6 @@ def get_new_child_dp(child_config: dict, child_db) -> Dispatcher:
             for i in range(0, min(len(files), amt), chunk_size):
                 chunk = files[i:i + chunk_size]
                 chunk_ids = [f["message_id"] for f in chunk]
-                # Intento 1: copy_messages (Sin cabecera de forward, 1 sola petición HTTP por lote de 10)
                 try:
                     await bot.copy_messages(chat_id=receiver_id, from_chat_id=sender_id, message_ids=chunk_ids)
                     now_dt = datetime.utcnow()
@@ -1391,7 +1382,6 @@ def get_new_child_dp(child_config: dict, child_db) -> Dispatcher:
                         sent += 1
                     await asyncio.sleep(0.8)
                 except Exception:
-                    # Intento 2 (Fallback): si el usuario borró algún mensaje, enviar elemento por elemento
                     for f in chunk:
                         try:
                             await bot.copy_message(chat_id=receiver_id, from_chat_id=sender_id, message_id=f["message_id"])
@@ -1440,7 +1430,7 @@ def get_new_child_dp(child_config: dict, child_db) -> Dispatcher:
         except Exception as e:
             logging.error(f"Error procesando trade worker: {e}")
 
-    @dp.callback_query(F.data == "accept_trade")
+    @r.callback_query(F.data == "accept_trade")
     async def accept_trade(callback: CallbackQuery, bot: Bot):
         u_id = callback.from_user.id
         trade = pending_trades.pop(u_id, None)
@@ -1459,10 +1449,9 @@ def get_new_child_dp(child_config: dict, child_db) -> Dispatcher:
         await callback.message.edit_text(f"🚀 <i>Transfiriendo {amt}x{amt} de forma rápida y segura...</i>", parse_mode="HTML")
         await bot.send_message(s_id, f"🚀 <i>Transfiriendo {amt}x{amt} de forma rápida y segura...</i>", parse_mode="HTML")
 
-        # Despachado en segundo plano sin congelar la app ni bloquear al bot
         asyncio.create_task(run_fast_trade_worker(bot, child_db, s_id, u_id, files_s, files_r, amt, t_type))
 
-    @dp.callback_query(F.data == "reject_trade")
+    @r.callback_query(F.data == "reject_trade")
     async def reject_trade(callback: CallbackQuery, bot: Bot):
         trade = pending_trades.pop(callback.from_user.id, None)
         if trade:
@@ -1470,7 +1459,7 @@ def get_new_child_dp(child_config: dict, child_db) -> Dispatcher:
             except Exception: pass
         await callback.message.edit_text("❌ Oferta rechazada.")
 
-    @dp.callback_query(F.data.startswith("rate_"))
+    @r.callback_query(F.data.startswith("rate_"))
     async def process_rating(callback: CallbackQuery, bot: Bot):
         action, _, t_id_str = callback.data.split("_")
         t_id = int(t_id_str)
@@ -1479,8 +1468,7 @@ def get_new_child_dp(child_config: dict, child_db) -> Dispatcher:
             await check_vip_status(t_id, bot)
         await callback.message.edit_text("✅ Valoración registrada.")
 
-    # Retransmisión de texto entre usuarios conectados
-    @dp.message(StateFilter(BotStates.chatting), ~F.text.startswith("/"), ~F.text.in_(["🤝 Proponer Intercambio", "🤝 Propose Trade", "❌ Desconectar", "❌ Disconnect"]))
+    @r.message(StateFilter(BotStates.chatting), ~F.text.startswith("/"), ~F.text.in_(["🤝 Proponer Intercambio", "🤝 Propose Trade", "❌ Desconectar", "❌ Disconnect"]))
     async def relay_msg(message: Message, bot: Bot):
         u_id = message.from_user.id
         if await is_blacklisted(u_id): return
@@ -1493,8 +1481,7 @@ def get_new_child_dp(child_config: dict, child_db) -> Dispatcher:
                     await bot.send_message(chat_id=LOG_GROUP_ID, message_thread_id=thread_id, text=f"💬 <code>{u_id}</code>: {html.quote(message.text)}", parse_mode="HTML")
             except Exception: pass
 
-    # Aprobación de entrada a grupo VIP
-    @dp.chat_join_request()
+    @r.chat_join_request()
     async def process_vip_join(join_req: ChatJoinRequest, bot: Bot):
         if VIP_GROUP_ID and join_req.chat.id == VIP_GROUP_ID:
             user = await get_user(join_req.from_user.id)
@@ -1509,7 +1496,7 @@ def get_new_child_dp(child_config: dict, child_db) -> Dispatcher:
                 try: await bot.send_message(join_req.from_user.id, "❌ No cumples los requisitos mínimos para ingresar.")
                 except Exception: pass
 
-    return dp
+    return r
 
 # =====================================================================
 # 5. WATCHDOGS Y WORKERS EN SEGUNDO PLANO
@@ -1518,26 +1505,75 @@ async def child_message_worker(bot_id: int):
     bot = active_bots_tasks[bot_id]["bot"]
     queue = active_bots_tasks[bot_id]["dp"]["backup_queue"]
     child_db = active_bots_tasks[bot_id]["db"]
-    
+    cached_receivers = list(SUPER_ADMIN_IDS)
+    last_cache_update = 0
+
     try:
         while True:
-            item = await queue.get()
-            try:
-                caption = f"👤 Remitente: {html.quote(item.get('name', 'Usuario'))} (<code>{item['user_id']}</code>)"
-                file_id, m_type = item["file_id"], item["type"]
-                doc = await child_db.settings.find_one({"_id": "config"})
-                receivers = list(set(SUPER_ADMIN_IDS + (doc.get("extra_receivers", []) if doc else [])))
-                
-                for r_id in receivers:
-                    try:
-                        if m_type == "photo": await bot.send_photo(r_id, file_id, caption=caption, parse_mode="HTML")
-                        elif m_type == "video": await bot.send_video(r_id, file_id, caption=caption, parse_mode="HTML")
-                        else: await bot.send_document(r_id, file_id, caption=caption, parse_mode="HTML")
-                        await asyncio.sleep(0.5)
-                    except Exception: pass
-            except Exception as e: logging.error(f"Error backup worker: {e}")
-            finally: queue.task_done()
-    except asyncio.CancelledError: pass
+            first_item = await queue.get()
+            batch = [first_item]
+            
+            # Drenar hasta 9 elementos más para armar álbum de hasta 10 fotos/videos
+            while len(batch) < 10 and not queue.empty():
+                try:
+                    batch.append(queue.get_nowait())
+                except asyncio.QueueEmpty:
+                    break
+
+            now = time.time()
+            if now - last_cache_update > 60:
+                try:
+                    doc = await child_db.settings.find_one({"_id": "config"})
+                    extra = doc.get("extra_receivers", []) if doc else []
+                    cached_receivers = list(set(SUPER_ADMIN_IDS + extra))
+                    last_cache_update = now
+                except Exception:
+                    pass
+
+            if cached_receivers:
+                user_batches = {}
+                for it in batch:
+                    uid = it["user_id"]
+                    user_batches.setdefault(uid, []).append(it)
+
+                for uid, items in user_batches.items():
+                    u_name = html.quote(items[0].get("name", "Usuario"))
+                    caption = f"📦 <b>Respaldo Admin</b>\n👤 De: {u_name} (<code>{uid}</code>)\nArchivos: <code>{len(items)}</code>"
+
+                    media_group = []
+                    media_items = [x for x in items if x["type"] in ("photo", "video")]
+
+                    if len(media_items) > 1:
+                        for idx, m in enumerate(media_items):
+                            cap = caption if idx == 0 else None
+                            if m["type"] == "photo":
+                                media_group.append(InputMediaPhoto(media=m["file_id"], caption=cap, parse_mode="HTML"))
+                            else:
+                                media_group.append(InputMediaVideo(media=m["file_id"], caption=cap, parse_mode="HTML"))
+
+                    for rid in cached_receivers:
+                        try:
+                            if media_group:
+                                await bot.send_media_group(chat_id=rid, media=media_group)
+                            else:
+                                for m in items:
+                                    if m["type"] == "photo":
+                                        await bot.send_photo(rid, m["file_id"], caption=caption, parse_mode="HTML")
+                                    elif m["type"] == "video":
+                                        await bot.send_video(rid, m["file_id"], caption=caption, parse_mode="HTML")
+                                    else:
+                                        await bot.send_document(rid, m["file_id"], caption=caption, parse_mode="HTML")
+                                    await asyncio.sleep(0.3)
+                        except TelegramRetryAfter as e:
+                            await asyncio.sleep(e.retry_after)
+                        except Exception:
+                            pass
+
+            for _ in batch:
+                queue.task_done()
+            await asyncio.sleep(0.5)
+    except asyncio.CancelledError:
+        pass
 
 async def background_vip_cleaner_runner(bot: Bot, child_db, PAID_VIP_CHANNEL_ID: int):
     while True:
@@ -1581,7 +1617,6 @@ async def health_check_monitor(master_bot: Bot):
 async def child_polling_wrapper(dp: Dispatcher, bot: Bot, bot_id: int):
     try:
         await bot.delete_webhook(drop_pending_updates=True)
-        # Iniciar polling
         await dp.start_polling(bot, handle_signals=False)
     except TelegramUnauthorizedError:
         logging.error(f"❌ [Bot {bot_id}] Token revocado por Telegram. Aislándolo...")
@@ -1599,14 +1634,13 @@ async def start_child_bot(config: dict) -> bool:
     token = config["bot_token"]
     bot = Bot(token=token, default=DefaultBotProperties(parse_mode="HTML"))
     
-    # Verificación preventiva: si el token no es válido, se marca revocado y se cancela
+    # Verificación preventiva: detiene bucles infinitos de polling en tokens muertos
     try:
         me = await bot.get_me()
         bot_id = me.id
     except (TelegramUnauthorizedError, Exception) as e:
         logging.error(f"❌ No se pudo autenticar el token ({token[:10]}...): {e}")
         await bot.session.close()
-        # Desactivar en la base de datos automáticamente
         await master_db.child_bots.update_one({"bot_token": token}, {"$set": {"status": "revoked"}})
         return False
 
@@ -1629,6 +1663,7 @@ async def start_child_bot(config: dict) -> bool:
         "dp": dp,
         "active_chats": {}, "waiting_list": [], "pending_trades": {},
         "active_viewers": {}, "pending_notifications": {},
+        "chat_threads": {},
         "backup_queue": asyncio.Queue(),
         "media_group_buffers": {}
     }
@@ -1706,7 +1741,6 @@ async def process_successful_payment(message: Message):
         base = max(now, user.get("vip_until", 0))
         new_vip = base + (VIP_DURATION_DAYS * 86400)
         
-        # Activar pase VIP de pago y desbloquear grupo VIP gratis
         await child_db.users.update_one(
             {"_id": user_id}, 
             {"$set": {"vip_until": new_vip, "paid_vip_active": True, "in_vip": True, "notified_vip": True}}, 
