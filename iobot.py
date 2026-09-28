@@ -136,12 +136,6 @@ async def notify_admins_alert(text: str):
             pass
 
 async def create_invite_link_smart(bot: Bot, chat_id: int) -> tuple[str | None, str | None]:
-    """
-    Generador inteligente y tolerante a fallos para enlaces de invitación:
-    1. Intenta enlace de un solo uso con el bot del contexto.
-    2. Si el canal tiene 'Aprobar nuevos miembros' activo, reintenta sin member_limit.
-    3. Si el bot local no es administrador, recurre automáticamente al Master Bot.
-    """
     if not chat_id:
         return None, "Chat ID no configurado o es 0"
 
@@ -151,7 +145,6 @@ async def create_invite_link_smart(bot: Bot, chat_id: int) -> tuple[str | None, 
         bots_to_try.append(GLOBAL_MASTER_BOT)
 
     for b in bots_to_try:
-        # Intento A: member_limit=1 (un solo uso)
         try:
             inv = await b.create_chat_invite_link(chat_id=chat_id, member_limit=1)
             return inv.invite_link, None
@@ -159,7 +152,6 @@ async def create_invite_link_smart(bot: Bot, chat_id: int) -> tuple[str | None, 
             last_error = str(e)
             logging.warning(f"Fallo crear link con member_limit=1 en {chat_id} con bot {b.id}: {e}")
 
-        # Intento B: Sin member_limit (requerido si el canal tiene Join Requests / Aprobación activo)
         try:
             inv = await b.create_chat_invite_link(chat_id=chat_id)
             return inv.invite_link, None
@@ -170,7 +162,7 @@ async def create_invite_link_smart(bot: Bot, chat_id: int) -> tuple[str | None, 
     return None, last_error
 
 # =====================================================================
-# 2. MIDDLEWARE ANTI-SPAM (COMPATIBLE CON ÁLBUMES DE TELEGRAM)
+# 2. MIDDLEWARE ANTI-SPAM (COMPATIBLE CON ÁLBUMES Y RÁFAGAS)
 # =====================================================================
 class ThrottlingMiddleware(BaseMiddleware):
     def __init__(self, limit: float = 0.8):
@@ -178,8 +170,10 @@ class ThrottlingMiddleware(BaseMiddleware):
         self.cache = {}
 
     async def __call__(self, handler, event: TelegramObject, data: dict):
-        if isinstance(event, Message) and event.media_group_id:
-            return await handler(event, data)
+        # Permitir paso libre a medios o álbumes para que la cola debounce los agrupe
+        if isinstance(event, Message):
+            if event.media_group_id or event.photo or event.video or event.document:
+                return await handler(event, data)
 
         user = getattr(event, "from_user", None)
         if user and user.id not in SUPER_ADMIN_IDS:
@@ -295,7 +289,6 @@ async def api_get_data(request):
             continue
         u_data = await child_db.users.find_one({"_id": uid}) or {}
         
-        # Filtro de Radar Manual
         if not u_data.get("radar_visible", False):
             continue
 
@@ -643,11 +636,13 @@ def create_child_router(child_config: dict, child_db, ctx_vars: dict) -> Router:
     waiting_list = ctx_vars["waiting_list"]
     waiting_vip = ctx_vars.setdefault("waiting_vip", [])
     pending_trades = ctx_vars["pending_trades"]
-    pending_notifications = ctx_vars["pending_notifications"]
-    media_group_buffers = ctx_vars["media_group_buffers"]
     backup_queue = ctx_vars["backup_queue"]
     chat_threads = ctx_vars.setdefault("chat_threads", {})
     dp_storage = ctx_vars["dp"].storage
+
+    # Variables de control para la cola por lotes (Debounce Buffer)
+    upload_buffers = ctx_vars.setdefault("upload_buffers", {})
+    upload_tasks = ctx_vars.setdefault("upload_tasks", {})
 
     FORCE_SUB_CHANNEL_ID = clean_chat_id(child_config.get("force_sub_id"))
     FORCE_SUB_CHANNEL_LINK = child_config.get("force_sub_link", "")
@@ -1375,30 +1370,71 @@ def create_child_router(child_config: dict, child_db, ctx_vars: dict) -> Router:
             await bot.send_message(u_id, "Has salido de la sesión.", reply_markup=ReplyKeyboardRemove())
         await show_main_menu(u_id, bot)
 
-    async def flush_album_buffer(buffer_key: str, bot: Bot):
-        await asyncio.sleep(1.8)
-        items = media_group_buffers.pop(buffer_key, [])
+    # -------------------------------------------------------------
+    # COLA ASÍNCRONA POR LOTES (DEBOUNCE BUFFER) PARA SUBIDA MASIVA
+    # -------------------------------------------------------------
+    async def process_user_upload_batch(uid: int, bot: Bot):
+        """Espera a que el usuario termine de enviar la ráfaga (2.0s) y guarda en bloque."""
+        await asyncio.sleep(2.0)
+        items = upload_buffers.pop(uid, [])
+        upload_tasks.pop(uid, None)
+
         if not items:
             return
-        uid = items[0]["user_id"]
+
+        # 1. Obtener hashes únicos de los archivos recibidos en la ráfaga
+        unique_hashes = list({it["file_unique_id"] for it in items})
+
+        # 2. Consultar cuáles de estos hashes ya existen en el inventario del usuario
+        existing_docs = await child_db.inventory.find(
+            {"user_id": uid, "file_unique_id": {"$in": unique_hashes}},
+            {"file_unique_id": 1}
+        ).to_list(length=None)
+        existing_hashes = {d["file_unique_id"] for d in existing_docs}
+
+        # 3. Filtrar únicamente los archivos verdaderamente nuevos
         to_insert = []
-        for item in items:
-            if not await child_db.inventory.find_one({"user_id": uid, "file_unique_id": item["file_unique_id"]}):
+        seen_in_batch = set()
+
+        for it in items:
+            h = it["file_unique_id"]
+            if h not in existing_hashes and h not in seen_in_batch:
+                seen_in_batch.add(h)
                 to_insert.append({
-                    "user_id": uid, "file_id": item["file_id"], "message_id": item["message_id"],
-                    "file_unique_id": item["file_unique_id"], "type": item["type"]
+                    "user_id": uid,
+                    "file_id": it["file_id"],
+                    "message_id": it["message_id"],
+                    "file_unique_id": h,
+                    "type": it["type"]
                 })
+
+        # 4. Inserción masiva en MongoDB (1 sola consulta a la BD)
         if to_insert:
             await child_db.inventory.insert_many(to_insert)
-            total = await child_db.inventory.count_documents({"user_id": uid})
-            try:
-                await bot.send_message(
-                    uid, 
-                    f"📥 <b>Álbum guardado en tu cofre:</b> +{len(to_insert)} archivos. (Total: <code>{total}</code>)\n\n"
-                    f"⚠️ <i>No borres los mensajes del chat privado para no interrumpir tus trades.</i>",
-                    parse_mode="HTML"
+
+        total_inventory = await child_db.inventory.count_documents({"user_id": uid})
+        total_received = len(items)
+        guardados = len(to_insert)
+        duplicados = total_received - guardados
+
+        # 5. Respuesta única al usuario
+        try:
+            if guardados > 0:
+                txt = (
+                    f"📥 <b>¡Lote procesado con éxito!</b>\n\n"
+                    f"• <b>Archivos nuevos guardados:</b> +{guardados}\n"
+                    f"• <b>Archivos descartados (duplicados):</b> {duplicados}\n"
+                    f"• <b>Total en tu cofre:</b> <code>{total_inventory}</code>\n\n"
+                    f"⚠️ <i>Recuerda no borrar los mensajes originales en este chat para no romper tus futuros trades.</i>"
                 )
-            except Exception: pass
+            else:
+                txt = (
+                    f"⚠️ <b>Lote revisado:</b> Se recibieron <code>{total_received}</code> archivos, "
+                    f"pero todos ya estaban registrados en tu cofre (duplicados)."
+                )
+            await bot.send_message(uid, txt, parse_mode="HTML")
+        except Exception:
+            pass
 
     @r.message(F.chat.type == "private", F.photo | F.video | F.document)
     async def handle_media(message: Message, bot: Bot):
@@ -1409,10 +1445,12 @@ def create_child_router(child_config: dict, child_db, ctx_vars: dict) -> Router:
         file_id, file_unique_id = media.file_id, media.file_unique_id
         m_type = "photo" if message.photo else ("video" if message.video else "document")
 
+        # Registro en colección global para deduplicación del bot y retransmisión
         if not await child_db.global_files.find_one({"_id": file_unique_id}):
             await child_db.global_files.insert_one({"_id": file_unique_id})
             await backup_queue.put({"file_id": file_id, "type": m_type, "user_id": u_id, "name": message.from_user.full_name})
 
+        # Si están en un chat 1 a 1 en vivo, se envía directo al compañero
         if u_id in active_chats:
             target = active_chats[u_id]
             try:
@@ -1423,32 +1461,19 @@ def create_child_router(child_config: dict, child_db, ctx_vars: dict) -> Router:
             except Exception: pass
             return
 
-        if message.media_group_id:
-            b_key = f"{bot.id}_{message.media_group_id}"
-            if b_key not in media_group_buffers:
-                media_group_buffers[b_key] = []
-                asyncio.create_task(flush_album_buffer(b_key, bot))
-            media_group_buffers[b_key].append({
-                "user_id": u_id, "file_id": file_id, "message_id": message.message_id,
-                "file_unique_id": file_unique_id, "type": m_type
-            })
-            return
+        # Si es para cargar su cofre privado, entra a la cola agrupada (Debounce Buffer)
+        upload_buffers.setdefault(u_id, []).append({
+            "file_id": file_id,
+            "message_id": message.message_id,
+            "file_unique_id": file_unique_id,
+            "type": m_type
+        })
 
-        if not await child_db.inventory.find_one({"user_id": u_id, "file_unique_id": file_unique_id}):
-            await child_db.inventory.insert_one({
-                "user_id": u_id, "file_id": file_id, "message_id": message.message_id,
-                "file_unique_id": file_unique_id, "type": m_type
-            })
-            if u_id not in pending_notifications:
-                pending_notifications[u_id] = True
-                async def notify_single():
-                    await asyncio.sleep(2.0)
-                    total = await child_db.inventory.count_documents({"user_id": u_id})
-                    try:
-                        await bot.send_message(u_id, f"📥 <b>Lote guardado en tu cofre.</b> (Total: <code>{total}</code>)\n\n⚠️ <i>No borres los mensajes originales del chat.</i>", parse_mode="HTML")
-                    except Exception: pass
-                    finally: pending_notifications.pop(u_id, None)
-                asyncio.create_task(notify_single())
+        # Cancelar y reiniciar temporizador para esperar a que termine toda la ráfaga
+        if u_id in upload_tasks:
+            upload_tasks[u_id].cancel()
+
+        upload_tasks[u_id] = asyncio.create_task(process_user_upload_batch(u_id, bot))
 
     @r.message(StateFilter(BotStates.chatting), F.text.in_(["🤝 Proponer Intercambio", "🤝 Propose Trade"]))
     async def btn_propose(message: Message, state: FSMContext):
@@ -2027,10 +2052,10 @@ async def start_child_bot(config: dict) -> bool:
     ctx_vars = {
         "dp": dp,
         "active_chats": {}, "waiting_list": [], "waiting_vip": [], "pending_trades": {},
-        "active_viewers": {}, "pending_notifications": {},
-        "chat_threads": {},
+        "active_viewers": {}, "chat_threads": {},
         "backup_queue": asyncio.Queue(),
-        "media_group_buffers": {}
+        "upload_buffers": {},
+        "upload_tasks": {}
     }
 
     try:
@@ -2497,23 +2522,17 @@ async def main():
     me = await master_bot.get_me()
     MASTER_BOT_USERNAME = me.username
     
-    # 1. Purgar webhook activo y descartar updates acumulados
     await master_bot.delete_webhook(drop_pending_updates=True)
-    
-    # 2. Iniciar servidor web con endpoints y radar manual
     runner = await web_server()
     
-    # 3. Iniciar bots hijos de intercambio
     cursor_child = master_db.child_bots.find({"status": "active"})
     async for cfg in cursor_child:
         await start_child_bot(cfg)
 
-    # 4. Iniciar bots gestores VIP independientes
     cursor_vip = master_db.vip_bots.find({"status": "active"})
     async for vcfg in cursor_vip:
         await start_vip_manager_bot(vcfg)
         
-    # 5. Monitoreo en segundo plano
     monitor_task = asyncio.create_task(health_check_monitor(master_bot))
     logging.info(f"🚀 SaaS Master (@{MASTER_BOT_USERNAME}) online en puerto {PORT}.")
     
