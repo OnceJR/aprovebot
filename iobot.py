@@ -170,7 +170,6 @@ class ThrottlingMiddleware(BaseMiddleware):
         self.cache = {}
 
     async def __call__(self, handler, event: TelegramObject, data: dict):
-        # Permitir paso libre a medios o álbumes para que la cola debounce los agrupe
         if isinstance(event, Message):
             if event.media_group_id or event.photo or event.video or event.document:
                 return await handler(event, data)
@@ -1976,48 +1975,81 @@ async def background_central_vip_cleaner(bot: Bot, PAID_VIP_CHANNEL_ID: int):
         await asyncio.sleep(3600)
 
 async def isolate_and_cleanup_bot(bot_id: int, revoked: bool = False):
+    token = None
     if bot_id in active_bots_tasks:
         tasks = active_bots_tasks.pop(bot_id)
+        token = tasks["bot"].token
         for k in ["polling_task", "worker_task", "vip_cleaner_task"]:
             if k in tasks: tasks[k].cancel()
-        await tasks["bot"].session.close()
-        if revoked:
-            await master_db.child_bots.update_one({"bot_token": tasks["bot"].token}, {"$set": {"status": "revoked"}})
+        try:
+            await tasks["bot"].session.close()
+        except Exception:
+            pass
 
     if bot_id in active_vip_bots_tasks:
         vtasks = active_vip_bots_tasks.pop(bot_id)
+        token = token or vtasks["bot"].token
         for k in ["polling_task", "cleaner_task"]:
             if k in vtasks: vtasks[k].cancel()
-        await vtasks["bot"].session.close()
-        if revoked:
-            await master_db.vip_bots.update_one({"bot_token": vtasks["bot"].token}, {"$set": {"status": "revoked"}})
+        try:
+            await vtasks["bot"].session.close()
+        except Exception:
+            pass
+
+    if revoked:
+        query = {"$or": [{"bot_token": token} if token else {}, {"bot_token": {"$regex": f"^{bot_id}:"}}]}
+        if query["$or"][0] == {}:
+            query["$or"].pop(0)
+        await master_db.child_bots.update_many(query, {"$set": {"status": "revoked"}})
+        await master_db.vip_bots.update_many(query, {"$set": {"status": "revoked"}})
+        logging.info(f"🔒 [Bot {bot_id}] Desactivado permanentemente y marcado como 'revoked' en MongoDB.")
 
 async def health_check_monitor(master_bot: Bot):
     while True:
-        await asyncio.sleep(600)
+        await asyncio.sleep(60)
+        # Revisión periódica de bots hijos
         for b_id, d in list(active_bots_tasks.items()):
             try:
                 await d["bot"].get_me()
-            except TelegramUnauthorizedError:
-                await isolate_and_cleanup_bot(b_id, revoked=True)
-                for admin_id in SUPER_ADMIN_IDS:
-                    try: await master_bot.send_message(admin_id, f"🚨 <b>Alerta Anti-Ban:</b> Bot con ID <code>{b_id}</code> revocado.")
-                    except Exception: pass
-            except Exception: pass
+            except (TelegramUnauthorizedError, Exception) as e:
+                if isinstance(e, TelegramUnauthorizedError) or "unauthorized" in str(e).lower():
+                    logging.warning(f"⚠️ HealthCheck detectó token muerto en bot hijo {b_id}. Limpiando...")
+                    await isolate_and_cleanup_bot(b_id, revoked=True)
+                    for admin_id in SUPER_ADMIN_IDS:
+                        try: await master_bot.send_message(admin_id, f"🚨 <b>Alerta Anti-Ban:</b> Bot hijo con ID <code>{b_id}</code> revocado y desactivado.")
+                        except Exception: pass
+
+        # Revisión periódica de bots VIP
+        for vb_id, vd in list(active_vip_bots_tasks.items()):
+            try:
+                await vd["bot"].get_me()
+            except (TelegramUnauthorizedError, Exception) as e:
+                if isinstance(e, TelegramUnauthorizedError) or "unauthorized" in str(e).lower():
+                    logging.warning(f"⚠️ HealthCheck detectó token muerto en bot VIP {vb_id}. Limpiando...")
+                    await isolate_and_cleanup_bot(vb_id, revoked=True)
+                    for admin_id in SUPER_ADMIN_IDS:
+                        try: await master_bot.send_message(admin_id, f"🚨 <b>Alerta Anti-Ban:</b> Bot VIP con ID <code>{vb_id}</code> revocado y desactivado.")
+                        except Exception: pass
 
 async def child_polling_wrapper(dp: Dispatcher, bot: Bot, bot_id: int):
     try:
+        # Validación activa antes de iniciar el polling
+        await bot.get_me()
         await bot.delete_webhook(drop_pending_updates=True)
         await dp.start_polling(bot, handle_signals=False)
-    except TelegramUnauthorizedError:
-        logging.error(f"❌ [Bot {bot_id}] Token revocado por Telegram. Aislándolo...")
+    except (TelegramUnauthorizedError, TelegramForbiddenError):
+        logging.error(f"❌ [Bot {bot_id}] Token revocado detectado. Aislándolo...")
         await isolate_and_cleanup_bot(bot_id, revoked=True)
     except asyncio.CancelledError:
         pass
     except Exception as e:
-        logging.critical(f"💥 [Bot {bot_id}] Error no controlado en polling: {e}")
-        await notify_admins_alert(f"Error crítico en polling bot {bot_id}: {e}")
-        await isolate_and_cleanup_bot(bot_id, revoked=False)
+        if "Unauthorized" in str(e) or "unauthorized" in str(e).lower():
+            logging.error(f"❌ [Bot {bot_id}] Token revocado durante la ejecución. Desactivándolo...")
+            await isolate_and_cleanup_bot(bot_id, revoked=True)
+        else:
+            logging.critical(f"💥 [Bot {bot_id}] Error no controlado en polling: {e}")
+            await notify_admins_alert(f"Error crítico en polling bot {bot_id}: {e}")
+            await isolate_and_cleanup_bot(bot_id, revoked=False)
     finally:
         if not bot.session.closed:
             await bot.session.close()
@@ -2030,8 +2062,9 @@ async def start_child_bot(config: dict) -> bool:
         me = await bot.get_me()
         bot_id = me.id
     except (TelegramUnauthorizedError, Exception) as e:
-        logging.error(f"❌ No se pudo autenticar el token ({token[:10]}...): {e}")
+        logging.error(f"❌ Token inválido o revocado ({token[:10]}...): {e}")
         await bot.session.close()
+        # Marcar inmediatamente como revocado en MongoDB
         await master_db.child_bots.update_one({"bot_token": token}, {"$set": {"status": "revoked"}})
         return False
 
@@ -2089,8 +2122,8 @@ async def start_vip_manager_bot(config: dict) -> bool:
     try:
         me = await bot.get_me()
         bot_id = me.id
-    except Exception as e:
-        logging.error(f"❌ Error al iniciar Bot Gestor VIP ({token[:10]}...): {e}")
+    except (TelegramUnauthorizedError, Exception) as e:
+        logging.error(f"❌ Token VIP inválido o revocado ({token[:10]}...): {e}")
         await bot.session.close()
         await master_db.vip_bots.update_one({"bot_token": token}, {"$set": {"status": "revoked"}})
         return False
@@ -2325,7 +2358,7 @@ async def step7_final(message: Message, state: FSMContext):
         await message.answer(summary, reply_markup=kb, parse_mode="HTML")
     else:
         kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔄 Reintentar", callback_data="master_crear")]])
-        await message.answer("❌ Error: Token inválido o problema al iniciar sesión.", reply_markup=kb, parse_mode="HTML")
+        await message.answer("❌ Error: Token inválido o revocado en Telegram.", reply_markup=kb, parse_mode="HTML")
     await state.clear()
 
 # ---- Wizard 2: Crear Bot Gestor VIP Independiente ----
@@ -2377,7 +2410,7 @@ async def vip_wizard_final(message: Message, state: FSMContext):
         kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="📊 Volver al Panel", callback_data="master_panel")]])
         await message.answer(txt, reply_markup=kb, parse_mode="HTML")
     else:
-        await message.answer("❌ Error al iniciar el Bot VIP. Verifica que el token sea correcto.")
+        await message.answer("❌ Error al iniciar el Bot VIP. Verifica que el token no haya sido revocado.")
     await state.clear()
 
 # ---- Panel de Supervisión y Control ----
@@ -2406,7 +2439,7 @@ async def cb_master_panel(callback: CallbackQuery):
             txt += f"• @{me.username} (ID: <code>{me.id}</code>)\n"
             keyboard.append([InlineKeyboardButton(text=f"⚙️ Intercambio: @{me.username}", callback_data=f"manage_bot_{me.id}")])
         except Exception:
-            txt += "• <i>Bot Inaccesible</i>\n"
+            txt += "• <i>Bot Inaccesible / Revocado</i>\n"
         finally:
             await temp_b.session.close()
 
@@ -2483,7 +2516,7 @@ async def cb_stop_bot(callback: CallbackQuery):
     if callback.from_user.id not in SUPER_ADMIN_IDS: return
     bot_id = int(callback.data.split("_")[2])
     await isolate_and_cleanup_bot(bot_id, revoked=True)
-    await callback.answer("Bot detenido.", show_alert=True)
+    await callback.answer("Bot detenido y marcado como revocado.", show_alert=True)
     await cb_master_panel(callback)
 
 @master_dp.callback_query(F.data.startswith("stop_vip_"))
@@ -2491,7 +2524,7 @@ async def cb_stop_vip_bot(callback: CallbackQuery):
     if callback.from_user.id not in SUPER_ADMIN_IDS: return
     bot_id = int(callback.data.split("_")[2])
     await isolate_and_cleanup_bot(bot_id, revoked=True)
-    await callback.answer("Bot VIP detenido.", show_alert=True)
+    await callback.answer("Bot VIP detenido y marcado como revocado.", show_alert=True)
     await cb_master_panel(callback)
 
 # =====================================================================
