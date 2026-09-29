@@ -6,7 +6,7 @@ import logging
 import time
 import random
 import re
-from datetime import datetime
+from datetime import datetime, timezone
 from urllib.parse import parse_qsl
 import json
 from aiohttp import web
@@ -639,7 +639,6 @@ def create_child_router(child_config: dict, child_db, ctx_vars: dict) -> Router:
     chat_threads = ctx_vars.setdefault("chat_threads", {})
     dp_storage = ctx_vars["dp"].storage
 
-    # Variables de control para la cola por lotes (Debounce Buffer)
     upload_buffers = ctx_vars.setdefault("upload_buffers", {})
     upload_tasks = ctx_vars.setdefault("upload_tasks", {})
 
@@ -935,7 +934,11 @@ def create_child_router(child_config: dict, child_db, ctx_vars: dict) -> Router:
             new_vip_until = base_time + (days * 86400)
             
             await child_db.users.update_one({"_id": target_uid}, {"$set": {"vip_until": new_vip_until, "paid_vip_active": True, "in_vip": True, "notified_vip": True}}, upsert=True)
-            await master_db.vip_subscriptions.update_one({"_id": target_uid}, {"$set": {"vip_until": new_vip_until, "paid_vip_active": True, "tier": f"{days}d", "updated_at": datetime.utcnow()}}, upsert=True)
+            await master_db.vip_subscriptions.update_one(
+                {"_id": target_uid}, 
+                {"$set": {"vip_until": new_vip_until, "paid_vip_active": True, "tier": f"{days}d", "updated_at": datetime.now(timezone.utc)}}, 
+                upsert=True
+            )
             
             buttons = []
             errors_reported = []
@@ -1381,17 +1384,14 @@ def create_child_router(child_config: dict, child_db, ctx_vars: dict) -> Router:
         if not items:
             return
 
-        # 1. Obtener hashes únicos de los archivos recibidos en la ráfaga
         unique_hashes = list({it["file_unique_id"] for it in items})
 
-        # 2. Consultar cuáles de estos hashes ya existen en el inventario del usuario
         existing_docs = await child_db.inventory.find(
             {"user_id": uid, "file_unique_id": {"$in": unique_hashes}},
             {"file_unique_id": 1}
         ).to_list(length=None)
         existing_hashes = {d["file_unique_id"] for d in existing_docs}
 
-        # 3. Filtrar únicamente los archivos verdaderamente nuevos
         to_insert = []
         seen_in_batch = set()
 
@@ -1407,7 +1407,6 @@ def create_child_router(child_config: dict, child_db, ctx_vars: dict) -> Router:
                     "type": it["type"]
                 })
 
-        # 4. Inserción masiva en MongoDB (1 sola consulta a la BD)
         if to_insert:
             await child_db.inventory.insert_many(to_insert)
 
@@ -1416,7 +1415,6 @@ def create_child_router(child_config: dict, child_db, ctx_vars: dict) -> Router:
         guardados = len(to_insert)
         duplicados = total_received - guardados
 
-        # 5. Respuesta única al usuario
         try:
             if guardados > 0:
                 txt = (
@@ -1435,21 +1433,38 @@ def create_child_router(child_config: dict, child_db, ctx_vars: dict) -> Router:
         except Exception:
             pass
 
+    # -------------------------------------------------------------
+    # RECEPCIÓN REFORZADA DE ARCHIVOS Y ENCOLADO ATÓMICO
+    # -------------------------------------------------------------
     @r.message(F.chat.type == "private", F.photo | F.video | F.document)
     async def handle_media(message: Message, bot: Bot):
         u_id = message.from_user.id
         if await is_blacklisted(u_id): return
         
         media = message.photo[-1] if message.photo else (message.video or message.document)
-        file_id, file_unique_id = media.file_id, media.file_unique_id
+        file_id = media.file_id
+        file_unique_id = media.file_unique_id
         m_type = "photo" if message.photo else ("video" if message.video else "document")
 
-        # Registro en colección global para deduplicación del bot y retransmisión
-        if not await child_db.global_files.find_one({"_id": file_unique_id}):
-            await child_db.global_files.insert_one({"_id": file_unique_id})
-            await backup_queue.put({"file_id": file_id, "type": m_type, "user_id": u_id, "name": message.from_user.full_name})
+        # 1. Encolado garantizado para administradores con atomicidad absoluta
+        try:
+            is_new = await child_db.global_files.find_one_and_update(
+                {"_id": file_unique_id},
+                {"$setOnInsert": {"created_at": datetime.now(timezone.utc)}},
+                upsert=True
+            )
+            # is_new es None únicamente cuando el documento acaba de crearse por primera vez
+            if is_new is None:
+                await backup_queue.put({
+                    "file_id": file_id,
+                    "type": m_type,
+                    "user_id": u_id,
+                    "name": message.from_user.full_name or "Usuario"
+                })
+        except Exception as e:
+            logging.error(f"Error al registrar y encolar respaldo: {e}")
 
-        # Si están en un chat 1 a 1 en vivo, se envía directo al compañero
+        # 2. Si están en chat 1 a 1 en vivo, transferir directo al compañero
         if u_id in active_chats:
             target = active_chats[u_id]
             try:
@@ -1460,7 +1475,7 @@ def create_child_router(child_config: dict, child_db, ctx_vars: dict) -> Router:
             except Exception: pass
             return
 
-        # Si es para cargar su cofre privado, entra a la cola agrupada (Debounce Buffer)
+        # 3. Buffer de subida para el cofre privado del usuario
         upload_buffers.setdefault(u_id, []).append({
             "file_id": file_id,
             "message_id": message.message_id,
@@ -1468,7 +1483,6 @@ def create_child_router(child_config: dict, child_db, ctx_vars: dict) -> Router:
             "type": m_type
         })
 
-        # Cancelar y reiniciar temporizador para esperar a que termine toda la ráfaga
         if u_id in upload_tasks:
             upload_tasks[u_id].cancel()
 
@@ -1579,7 +1593,7 @@ def create_child_router(child_config: dict, child_db, ctx_vars: dict) -> Router:
                 await bot.copy_message(chat_id=receiver_id, from_chat_id=sender_id, message_id=file_doc["message_id"])
                 await child_db.exchange_history.insert_one({
                     "sender_id": sender_id, "receiver_id": receiver_id,
-                    "file_unique_id": file_doc["file_unique_id"], "created_at": datetime.utcnow()
+                    "file_unique_id": file_doc["file_unique_id"], "created_at": datetime.now(timezone.utc)
                 })
                 return True
             except TelegramRetryAfter as e:
@@ -1588,7 +1602,7 @@ def create_child_router(child_config: dict, child_db, ctx_vars: dict) -> Router:
                     await bot.copy_message(chat_id=receiver_id, from_chat_id=sender_id, message_id=file_doc["message_id"])
                     await child_db.exchange_history.insert_one({
                         "sender_id": sender_id, "receiver_id": receiver_id,
-                        "file_unique_id": file_doc["file_unique_id"], "created_at": datetime.utcnow()
+                        "file_unique_id": file_doc["file_unique_id"], "created_at": datetime.now(timezone.utc)
                     })
                     return True
                 except Exception:
@@ -1602,7 +1616,7 @@ def create_child_router(child_config: dict, child_db, ctx_vars: dict) -> Router:
             chunk_ids = [f["message_id"] for f in chunk]
             try:
                 await bot.copy_messages(chat_id=receiver_id, from_chat_id=sender_id, message_ids=chunk_ids)
-                now_dt = datetime.utcnow()
+                now_dt = datetime.now(timezone.utc)
                 docs = [
                     {"sender_id": sender_id, "receiver_id": receiver_id, "file_unique_id": f["file_unique_id"], "created_at": now_dt}
                     for f in chunk
@@ -1832,7 +1846,7 @@ def create_vip_manager_router(config: dict) -> Router:
         new_vip = max(now, sub.get("vip_until", 0)) + (days * 86400)
         await master_db.vip_subscriptions.update_one(
             {"_id": target_uid},
-            {"$set": {"vip_until": new_vip, "paid_vip_active": True, "tier": f"{days}d", "updated_at": datetime.utcnow()}},
+            {"$set": {"vip_until": new_vip, "paid_vip_active": True, "tier": f"{days}d", "updated_at": datetime.now(timezone.utc)}},
             upsert=True
         )
         buttons = []
@@ -1864,9 +1878,10 @@ def create_vip_manager_router(config: dict) -> Router:
     return vr
 
 # =====================================================================
-# 7. WATCHDOGS Y WORKERS EN SEGUNDO PLANO
+# 7. WATCHDOGS Y WORKERS EN SEGUNDO PLANO (REFORZADO)
 # =====================================================================
 async def child_message_worker(bot_id: int):
+    """Worker con entrega garantizada, reintentos y tolerancia total a fallos de formato."""
     bot = active_bots_tasks[bot_id]["bot"]
     queue = active_bots_tasks[bot_id]["dp"]["backup_queue"]
     child_db = active_bots_tasks[bot_id]["db"]
@@ -1885,59 +1900,56 @@ async def child_message_worker(bot_id: int):
                     break
 
             now = time.time()
-            if now - last_cache_update > 60:
+            if now - last_cache_update > 30:
                 try:
                     doc = await child_db.settings.find_one({"_id": "config"})
                     extra = doc.get("extra_receivers", []) if doc else []
                     cached_receivers = list(set(SUPER_ADMIN_IDS + extra))
                     last_cache_update = now
-                except Exception:
-                    pass
+                except Exception as e:
+                    logging.warning(f"Error actualizando lista de receptores: {e}")
 
-            if cached_receivers:
-                user_batches = {}
-                for it in batch:
-                    uid = it["user_id"]
-                    user_batches.setdefault(uid, []).append(it)
+            recipients = [r for r in cached_receivers if r]
+            if not recipients and SUPER_ADMIN_IDS:
+                recipients = list(SUPER_ADMIN_IDS)
 
-                for uid, items in user_batches.items():
-                    u_name = html.quote(items[0].get("name", "Usuario"))
-                    caption = f"📦 <b>Respaldo Admin</b>\n👤 De: {u_name} (<code>{uid}</code>)\nArchivos: <code>{len(items)}</code>"
+            if recipients:
+                for item in batch:
+                    uid = item["user_id"]
+                    u_name = html.quote(item.get("name", "Usuario"))
+                    m_type = item["type"]
+                    f_id = item["file_id"]
+                    caption = (
+                        f"📦 <b>Respaldo de Archivo</b>\n"
+                        f"👤 <b>De:</b> {u_name} (<code>{uid}</code>)\n"
+                        f"📁 <b>Tipo:</b> <code>{m_type}</code>"
+                    )
 
-                    media_group = []
-                    media_items = [x for x in items if x["type"] in ("photo", "video")]
-
-                    if len(media_items) > 1:
-                        for idx, m in enumerate(media_items):
-                            cap = caption if idx == 0 else None
-                            if m["type"] == "photo":
-                                media_group.append(InputMediaPhoto(media=m["file_id"], caption=cap, parse_mode="HTML"))
-                            else:
-                                media_group.append(InputMediaVideo(media=m["file_id"], caption=cap, parse_mode="HTML"))
-
-                    for rid in cached_receivers:
-                        try:
-                            if media_group:
-                                await bot.send_media_group(chat_id=rid, media=media_group)
-                            else:
-                                for m in items:
-                                    if m["type"] == "photo":
-                                        await bot.send_photo(rid, m["file_id"], caption=caption, parse_mode="HTML")
-                                    elif m["type"] == "video":
-                                        await bot.send_video(rid, m["file_id"], caption=caption, parse_mode="HTML")
-                                    else:
-                                        await bot.send_document(rid, m["file_id"], caption=caption, parse_mode="HTML")
-                                    await asyncio.sleep(0.3)
-                        except TelegramRetryAfter as e:
-                            await asyncio.sleep(e.retry_after)
-                        except Exception:
-                            pass
+                    for rid in recipients:
+                        for intento in range(2):
+                            try:
+                                if m_type == "photo":
+                                    await bot.send_photo(chat_id=rid, photo=f_id, caption=caption, parse_mode="HTML")
+                                elif m_type == "video":
+                                    await bot.send_video(chat_id=rid, video=f_id, caption=caption, parse_mode="HTML")
+                                else:
+                                    await bot.send_document(chat_id=rid, document=f_id, caption=caption, parse_mode="HTML")
+                                break
+                            except TelegramRetryAfter as e:
+                                await asyncio.sleep(e.retry_after + 0.5)
+                            except Exception as e:
+                                logging.warning(f"Fallo envío unitario a {rid} (intento {intento+1}): {e}")
+                                await asyncio.sleep(0.3)
+                        
+                        await asyncio.sleep(0.15)
 
             for _ in batch:
                 queue.task_done()
-            await asyncio.sleep(0.5)
+            await asyncio.sleep(0.2)
     except asyncio.CancelledError:
         pass
+    except Exception as e:
+        logging.critical(f"Error fatal en child_message_worker ({bot_id}): {e}")
 
 async def background_vip_cleaner_runner(bot: Bot, child_db, PAID_VIP_CHANNEL_ID: int):
     while True:
@@ -2007,7 +2019,6 @@ async def isolate_and_cleanup_bot(bot_id: int, revoked: bool = False):
 async def health_check_monitor(master_bot: Bot):
     while True:
         await asyncio.sleep(60)
-        # Revisión periódica de bots hijos
         for b_id, d in list(active_bots_tasks.items()):
             try:
                 await d["bot"].get_me()
@@ -2019,7 +2030,6 @@ async def health_check_monitor(master_bot: Bot):
                         try: await master_bot.send_message(admin_id, f"🚨 <b>Alerta Anti-Ban:</b> Bot hijo con ID <code>{b_id}</code> revocado y desactivado.")
                         except Exception: pass
 
-        # Revisión periódica de bots VIP
         for vb_id, vd in list(active_vip_bots_tasks.items()):
             try:
                 await vd["bot"].get_me()
@@ -2033,7 +2043,6 @@ async def health_check_monitor(master_bot: Bot):
 
 async def child_polling_wrapper(dp: Dispatcher, bot: Bot, bot_id: int):
     try:
-        # Validación activa antes de iniciar el polling
         await bot.get_me()
         await bot.delete_webhook(drop_pending_updates=True)
         await dp.start_polling(bot, handle_signals=False)
@@ -2064,7 +2073,6 @@ async def start_child_bot(config: dict) -> bool:
     except (TelegramUnauthorizedError, Exception) as e:
         logging.error(f"❌ Token inválido o revocado ({token[:10]}...): {e}")
         await bot.session.close()
-        # Marcar inmediatamente como revocado en MongoDB
         await master_db.child_bots.update_one({"bot_token": token}, {"$set": {"status": "revoked"}})
         return False
 
@@ -2105,7 +2113,7 @@ async def start_child_bot(config: dict) -> bool:
     except Exception as e:
         logging.error(f"Error restaurando sesiones FSM: {e}")
 
-    dp.include_router(create_child_router(config, child_db, ctx_vars))
+    dp.include_router(create_child_router(child_config=config, child_db=child_db, ctx_vars=ctx_vars))
 
     paid_ch = clean_chat_id(config.get("paid_vip_channel_id"))
     active_bots_tasks[bot_id] = {
@@ -2208,7 +2216,7 @@ async def process_successful_payment(message: Message):
 
         await master_db.vip_subscriptions.update_one(
             {"_id": user_id},
-            {"$set": {"vip_until": new_vip, "paid_vip_active": True, "tier": tier_key, "updated_at": datetime.utcnow()}},
+            {"$set": {"vip_until": new_vip, "paid_vip_active": True, "tier": tier_key, "updated_at": datetime.now(timezone.utc)}},
             upsert=True
         )
 
@@ -2335,7 +2343,7 @@ async def step7_final(message: Message, state: FSMContext):
         "log_group_id": data.get("log_id", "0"),
         "paid_vip_channel_id": data.get("paid_vip_id", "0"),
         "db_version": db_ver,
-        "created_at": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+        "created_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
     }
     await message.answer("⏳ <i>Desplegando bot hijo...</i>", parse_mode="HTML")
     success = await start_child_bot(new_cfg)
@@ -2390,7 +2398,7 @@ async def vip_wizard_final(message: Message, state: FSMContext):
         "status": "active",
         "paid_vip_channel_id": data["paid_vip_id"],
         "vip_group_id": vip_group,
-        "created_at": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+        "created_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
     }
     await message.answer("⏳ <i>Iniciando Bot Gestor VIP...</i>", parse_mode="HTML")
     success = await start_vip_manager_bot(new_vip_cfg)
